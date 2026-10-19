@@ -67,6 +67,16 @@ int main(int argc, char** argv) {
     cfg.tickMs        = 50;
     cfg.idleTimeoutMs = 600000;   // nothing here may be reclaimed mid-measurement
 
+    // BENCH_WBUF_KB overrides the per-connection write buffer, which is what
+    // per-connection RSS is really made of. Unset or 0 keeps the header default.
+    if (const char* w = std::getenv("BENCH_WBUF_KB")) {
+        const int kb = std::atoi(w);
+        if (kb > 0) {
+            cfg.wbufCapacity    = static_cast<size_t>(kb) * 1024;
+            cfg.maxPendingBytes = cfg.wbufCapacity;
+        }
+    }
+
     MultiReactorServer server(cfg);
     server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
     if (!server.start()) return 2;
@@ -90,10 +100,11 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     const long after = rssKb();
-    std::printf("rss connections=%zu delta_kb=%ld per_conn_kb=%.1f\n",
+    std::printf("rss connections=%zu delta_kb=%ld per_conn_kb=%.1f wbuf=%zu\n",
                 server.connectionCount(), after - before,
                 fds.empty() ? 0.0
-                            : static_cast<double>(after - before) / fds.size());
+                            : static_cast<double>(after - before) / fds.size(),
+                cfg.wbufCapacity / 1024);
 
     server.stop();
     for (int fd : fds) ::close(fd);

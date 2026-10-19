@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -59,6 +60,15 @@ int main(int argc, char** argv) {
     cfg.tickMs        = 500;
     cfg.idleTimeoutMs = 600000;
 
+    if (const char* w = std::getenv("BENCH_WBUF_KB")) {
+        const int kb = std::atoi(w);
+        if (kb > 0) {
+            cfg.wbufCapacity    = static_cast<size_t>(kb) * 1024;
+            cfg.maxPendingBytes = cfg.wbufCapacity;
+        }
+    }
+    const size_t wbufKb = cfg.wbufCapacity / 1024;
+
     MultiReactorServer server(cfg);
     server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
     if (!server.start()) return 2;
@@ -75,36 +85,89 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> batch;
     for (int i = 0; i < 64; ++i) batch.insert(batch.end(), frame.begin(), frame.end());
 
+    // Two ways to generate the load, and the difference decides what the number
+    // means. In the same process the generator competes with the server for
+    // cores, so the figure is a floor for both halves combined. With
+    // BENCH_CLIENT_FORK=1 the clients live in a child process and the server
+    // gets the machine to itself -- the only way to tell a reactor limit from a
+    // generator limit.
+    const char* forkEnv = std::getenv("BENCH_CLIENT_FORK");
+    const bool wantFork = forkEnv != nullptr && forkEnv[0] != '0';
+
     std::atomic<bool> go{false};
     std::atomic<bool> stop{false};
     std::atomic<long long> sent{0};
 
-    std::vector<std::thread> clients;
-    for (int t = 0; t < threads; ++t) {
-        clients.emplace_back([&] {
-            const int fd = connectTo(port);
-            if (fd < 0) return;
-            while (!go.load()) {}
-            while (!stop.load()) {
-                const ssize_t k = ::send(fd, batch.data(), batch.size(), MSG_NOSIGNAL);
-                if (k <= 0) break;
-                sent.fetch_add(k);
+    int startPipe[2] = {-1, -1};
+    pid_t child = -1;
+    if (wantFork && ::pipe(startPipe) == 0) {
+        child = ::fork();
+        if (child == 0) {
+            ::close(startPipe[1]);
+            char goByte = 0;
+            const ssize_t got = ::read(startPipe[0], &goByte, 1);
+            ::close(startPipe[0]);
+            if (got != 1) ::_exit(1);
+            std::vector<std::thread> cs;
+            for (int t = 0; t < threads; ++t) {
+                cs.emplace_back([&] {
+                    const int fd = connectTo(port);
+                    if (fd < 0) return;
+                    const auto deadline = std::chrono::steady_clock::now() +
+                                          std::chrono::seconds(seconds);
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        const ssize_t k = ::send(fd, batch.data(), batch.size(), MSG_NOSIGNAL);
+                        if (k <= 0) break;
+                    }
+                    ::close(fd);
+                });
             }
-            ::close(fd);
-        });
+            for (auto& c : cs) c.join();
+            ::_exit(0);
+        }
+        ::close(startPipe[0]);
+    }
+    const bool forked = child > 0;
+
+    std::vector<std::thread> clients;
+    if (!forked) {
+        for (int t = 0; t < threads; ++t) {
+            clients.emplace_back([&] {
+                const int fd = connectTo(port);
+                if (fd < 0) return;
+                while (!go.load()) {}
+                while (!stop.load()) {
+                    const ssize_t k = ::send(fd, batch.data(), batch.size(), MSG_NOSIGNAL);
+                    if (k <= 0) break;
+                    sent.fetch_add(k);
+                }
+                ::close(fd);
+            });
+        }
     }
 
     // Let the connections register before the clock starts, or the first batch
     // measures accept rather than ingest.
-    for (int i = 0; i < 200 && server.connectionCount() < clients.size(); ++i) {
+    const size_t want = static_cast<size_t>(threads);
+    for (int i = 0; i < 400 && server.connectionCount() < want; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     const uint64_t before = server.stats().bytesRecv.load();
-    go.store(true);
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
-    stop.store(true);
-    for (auto& c : clients) c.join();
+    if (forked) {
+        const char goByte = 1;
+        const ssize_t wrote = ::write(startPipe[1], &goByte, 1);
+        (void)wrote;   // the child times out on its own if this never lands
+        ::close(startPipe[1]);
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        int status = 0;
+        ::waitpid(child, &status, 0);
+    } else {
+        go.store(true);
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        stop.store(true);
+        for (auto& c : clients) c.join();
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     const uint64_t after = server.stats().bytesRecv.load();
 
@@ -114,7 +177,7 @@ int main(int argc, char** argv) {
                         static_cast<double>(seconds);
     const double kfps = static_cast<double>(after - before) / 64.0 /
                         static_cast<double>(seconds) / 1000.0;
-    std::printf("ingest reactors=%d clients=%d mb_per_s=%.1f kframes_per_s=%.0f\n",
-                reactors, threads, mbps, kfps);
+    std::printf("ingest reactors=%d clients=%d mb_per_s=%.1f kframes_per_s=%.0f wbuf=%zu mode=%s\n",
+                reactors, threads, mbps, kfps, wbufKb, forked ? "fork" : "same");
     return 0;
 }

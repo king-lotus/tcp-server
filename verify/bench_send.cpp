@@ -81,6 +81,16 @@ int main(int argc, char** argv) {
     cfg.tickMs        = 500;
     cfg.idleTimeoutMs = 600000;
 
+    // Same knob as bench_rss: the write buffer sizes the reply path, so it has
+    // to move with it or the send numbers stop being comparable.
+    if (const char* w = std::getenv("BENCH_WBUF_KB")) {
+        const int kb = std::atoi(w);
+        if (kb > 0) {
+            cfg.wbufCapacity    = static_cast<size_t>(kb) * 1024;
+            cfg.maxPendingBytes = cfg.wbufCapacity;
+        }
+    }
+
     MultiReactorServer server(cfg);
     gServer.store(&server);
 
@@ -137,7 +147,7 @@ int main(int argc, char** argv) {
     const double p99 = static_cast<double>(ns[ns.size() * 99 / 100]) / 1000.0;
     const double mean = static_cast<double>(
         std::accumulate(ns.begin(), ns.end(), uint64_t{0})) / ns.size() / 1000.0;
-    std::printf("send messages=%zu payload=%d p50_us=%.1f p99_us=%.1f mean_us=%.1f\n",
-                ns.size(), gPayload.load(), p50, p99, mean);
+    std::printf("send messages=%zu payload=%d p50_us=%.1f p99_us=%.1f mean_us=%.1f wbuf=%zu\n",
+                ns.size(), gPayload.load(), p50, p99, mean, cfg.wbufCapacity / 1024);
     return 0;
 }

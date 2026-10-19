@@ -67,7 +67,8 @@ for line in open(sys.argv[1], encoding="utf-8"):
     kind = fields[0]
     kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
     key = (kind, tuple(sorted((k, v) for k, v in kv.items()
-                              if k in ("connections", "reactors", "clients", "payload"))))
+                              if k in ("connections", "reactors", "clients", "payload",
+                                       "wbuf", "mode"))))
     for name, value in kv.items():
         if name in ("connections", "reactors", "clients", "payload"):
             continue
