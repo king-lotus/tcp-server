@@ -185,6 +185,20 @@ class RingBuffer {
         return r;
     }
 
+    // Room at the write end, for a caller that fills the buffer in place
+    // instead of copying through a stack buffer first. Only the contiguous part
+    // is offered; a ring that has wrapped has a second piece at buf_[0].
+    uint8_t* writePtr() noexcept {
+        if (cap_ == 0) return nullptr;
+        return buf_.data() + ((head_ + size_) % cap_);
+    }
+    size_t writeSpan() const noexcept {
+        if (cap_ == 0) return 0;
+        const size_t tail = (head_ + size_) % cap_;
+        return std::min(cap_ - size_, cap_ - tail);
+    }
+    void commit(size_t n) noexcept { size_ += std::min(n, writable()); }
+
     void consume(size_t n) noexcept {
         size_t r = std::min(n, size_);
         if (r == 0) return;    // also covers the uninitialised cap_ == 0 case
@@ -1371,7 +1385,6 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
     constexpr int kReadBudget  = 64 * 1024;
     constexpr int kFrameBudget = 256;
     int bytesLeft = kReadBudget, framesLeft = kFrameBudget;
-    uint8_t tmp[16 * 1024];
     // Frames this call handed to the handler. Every exit reports it, because
     // "the peer asked nothing more" and "the peer asked, and answers for it are
     // now queued behind whichever task called us" are not distinguishable from
@@ -1395,11 +1408,17 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             return dispatched();
         }
 
-        size_t want = std::min({sizeof(tmp), c->rbuf.writable(),
-                                static_cast<size_t>(bytesLeft)});
-        ssize_t n = ::recv(c->fd, tmp, want, 0);
+        size_t want = std::min(c->rbuf.writeSpan(),
+                               static_cast<size_t>(bytesLeft));
+        if (want == 0) {
+            // The ring has wrapped and its tail is full: come back after a
+            // round has consumed something.
+            scheduleRead(c);
+            return dispatched();
+        }
+        ssize_t n = ::recv(c->fd, c->rbuf.writePtr(), want, 0);
         if (n > 0) {
-            c->rbuf.write(tmp, static_cast<size_t>(n));
+            c->rbuf.commit(static_cast<size_t>(n));
             bytesLeft -= static_cast<int>(n);
             // Only ever read by drainInputThenClose(), which zeroes it first:
             // it has to know how much of what this call served was input that
