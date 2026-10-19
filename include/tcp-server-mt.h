@@ -552,6 +552,13 @@ class SubReactor {
     Conn* readHead_ = nullptr;
     Conn* readTail_ = nullptr;
 
+    // Frames parsed since the last publish, on its own cache line. Publishing
+    // the shared atomic once per frame measured 18.5% of throughput when it was
+    // removed (2198 -> 2605 MB/s). The alignment is not decoration: a counter
+    // sharing a line with this reactor's other hot fields puts the bouncing
+    // back at a different address, which is what the first attempt at this did.
+    alignas(64) uint64_t framesRecvLocal_ = 0;
+
     int                 idx_;
     MultiReactorServer* server_;
 
@@ -1701,7 +1708,7 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
         // that already arrived. It also cost 18% of this reactor's CPU:
         // clock_gettime showed up as a fifth of parseFrames in perf, because
         // at 20M frames/s it is one call per 64 bytes.
-        server_->statsRef().framesRecv.fetch_add(1, std::memory_order_relaxed);
+        ++framesRecvLocal_;
         --framesLeft;
 
         if (type == FrameType::PING) {
@@ -2286,6 +2293,11 @@ inline void SubReactor::loop() noexcept {
                 auto c = it->second;
                 handleRead(c.get());
             }
+            if (framesRecvLocal_ != 0) {
+                server_->statsRef().framesRecv.fetch_add(
+                    framesRecvLocal_, std::memory_order_relaxed);
+                framesRecvLocal_ = 0;
+            }
             int n = ::epoll_wait(epollFd_, events.data(),
                                  static_cast<int>(events.size()),
                                  readHead_ ? 0 : tickMs);
@@ -2343,6 +2355,11 @@ inline void SubReactor::loop() noexcept {
                 lastTick = now;
                 doTick();
             }
+        }
+        if (framesRecvLocal_ != 0) {
+            server_->statsRef().framesRecv.fetch_add(
+                framesRecvLocal_, std::memory_order_relaxed);
+            framesRecvLocal_ = 0;
         }
     } catch (...) {
         server_->statsRef().reactorFailures.fetch_add(
