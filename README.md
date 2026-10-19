@@ -59,10 +59,49 @@ against numbers taken on the same machine minutes earlier -- which is why none
 of them are written down here. Each change that moves them records the before
 and after in its commit message, where the date and the machine are attached.
 
+## Performance
+
+Three changes in the ingest path took this from about 1.3 to 2.8 GB/s on the
+development VM, and the same run from 1.42 to 0.83 cores of the eight available.
+Faster and cheaper at once is what finding wasted work on the critical path
+looks like; an optimisation of the algorithm would have kept the cores.
+
+- **The idle clock was read once per frame.** `parseFrames` stamped
+  `lastRecvMs`, and `handleRead` already stamps it when the bytes arrive.
+  `perf` put `clock_gettime` at 18% of the reactor and `parseFrames` at 62%;
+  removing the per-frame read was worth 62% of throughput.
+- **The frame counter was a shared atomic, once per frame.** It is now a
+  per-reactor count published once per loop iteration, `alignas(64)`. The
+  alignment is the difference between +18% and -32%: a counter sharing a cache
+  line with the reactor's other hot fields bounces exactly like the atomic it
+  replaced.
+- **`recv()` fills `rbuf` in place.** The 16KB stack buffer and the copy
+  through it are gone; the ring hands out its contiguous writable span, and the
+  read is rescheduled when the tail is full.
+
+Two things about how these were found are worth keeping.
+
+A measurement outlives its conditions. The counter and the in-place read were
+both measured *before* the clock fix, and came out neutral and 44% worse.
+Re-measured afterwards they were +18% and +9.8%. A verdict recorded against code
+that has since changed is not evidence, and it will be wrong in either direction.
+
+`perf` decided which of them was worth doing. Guessing cost four rejected
+attempts -- frame budget, read size, a `Spans` struct more expensive than the
+memcpy it replaced, and a header fast path worth 0.6%. One profile named
+`clock_gettime` immediately.
+
+At 4KB batches the server now reaches what `verify/bench_floor.cpp` -- the same
+socket shape with nothing in between -- manages with the same client, so the read
+path is no longer where the remaining difference lives. At 2.8 GB/s it uses 0.83
+of 8 cores: it is waiting, not computing. What is left is in the kernel and in
+the generator. `__memmove` still accounts for 20% of a profile whose total keeps
+shrinking; that one is open.
+
 ## Layout
 
 ```
-include/tcp-server-mt.h   the only deliverable, 2937 lines
+include/tcp-server-mt.h   the only deliverable, 2988 lines
 verify/                   runtime suites + one-off evidence probes
 docs/review/              eight rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
