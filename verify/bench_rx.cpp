@@ -82,8 +82,15 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> frame(64);
     industrial::encodeFrameInto(frame.data(), FrameType::DATA,
                                 payload.data(), payload.size());
+    // BENCH_BATCH is how many frames one send() carries. 64 frames of 64 bytes
+    // is 4KB, and 4KB is where the syscall count stops being free: the same
+    // machine's bare-wire floor goes from 1.8GB/s at 4KB to 6.6GB/s at 256KB.
+    // A server that does not follow that curve is byte-bound, not syscall-bound.
+    const char* batchEnv = std::getenv("BENCH_BATCH");
+    const int batchFrames = batchEnv ? std::atoi(batchEnv) : 64;
     std::vector<uint8_t> batch;
-    for (int i = 0; i < 64; ++i) batch.insert(batch.end(), frame.begin(), frame.end());
+    batch.reserve(static_cast<size_t>(batchFrames) * frame.size());
+    for (int i = 0; i < batchFrames; ++i) batch.insert(batch.end(), frame.begin(), frame.end());
 
     // Two ways to generate the load, and the difference decides what the number
     // means. In the same process the generator competes with the server for
