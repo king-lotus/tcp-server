@@ -61,6 +61,16 @@ build() {
 run_all() {
     local label="$1"
     local failed=0
+    local launcher=()
+    # TSan reserves a fixed shadow region and cannot cope with a randomised
+    # address space on kernels that hand out high vm.mmap_rnd_bits (Ubuntu 24.04
+    # and later): every binary dies with "FATAL: ThreadSanitizer: unexpected
+    # memory mapping" before main(). Starting the process with ASLR off is the
+    # fix that does not need root -- the sanitizer still runs, it just knows
+    # where it is.
+    if [ "$label" = "tsan" ]; then
+        launcher=(setarch "$(uname -m)" -R)
+    fi
     echo "---- running [$label] ----"
 
     for attempt in "close_semantics, default reactors:/tmp/close_semantics" \
@@ -76,7 +86,7 @@ run_all() {
         local cmd="${attempt#*:}"
         local rc=0
         # A bounded run: a hang has to present as a failure, not as a long coffee.
-        timeout 180 bash -c "$cmd" || rc=$?
+        timeout 180 "${launcher[@]}" bash -c "$cmd" || rc=$?
         echo "   [$label] $name -> rc=$rc"
         [ "$rc" -eq 0 ] || failed=1
     done
