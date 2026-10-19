@@ -10,8 +10,8 @@ industrial::MultiReactorServer server(cfg);
 
 No `.cpp`, no build scripts, no third-party dependencies. To use it, copy
 `include/tcp-server-mt.h` into your project. It needs Linux (`epoll` +
-`eventfd`), so it cannot be linked into a running binary on the Windows machine
-this was developed on -- hence the two kinds of checking described below.
+`eventfd`), so the machine that can compile it is also the machine that has to
+run it -- `verify/` is that machine.
 
 ## Shape of it
 
@@ -28,32 +28,27 @@ this was developed on -- hence the two kinds of checking described below.
 
 ## Verifying
 
-This project has no "just run it and see" position. Two checks cover two halves:
+This project has no "just run it and see" position. Everything is settled by
+building and running it on Linux:
 
 ```bash
-# Windows/MSYS side: hand the header to a real compiler. 21 translation units,
-# nothing linked, nothing executed.
-bash verify/build.sh
-
-# Linux/WSL side: actually run it. Seven suites, nine runs per configuration --
-# two of them run twice, at different reactor counts -- over {plain, asan+ubsan,
-# tsan}: 27 configurations, cpplint included.
-wsl env ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run-in-wsl.sh
+# Seven suites, nine runs per configuration -- two of them run twice, at
+# different reactor counts -- over {plain, asan+ubsan, tsan}: 27 configurations,
+# cpplint included.
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh
 ```
 
-The environment variables have to go through `wsl env`. Writing
-`ENABLE_ASAN=1 wsl ...` fails in silence and leaves you with output that looks
-green having run plain only. That is a trap someone walked into, not a style
-choice.
+Each configuration is a separate build: ASan and TSan cannot be linked into the
+same binary, and a run under either is slow enough that folding it into the
+default pass would stop people running it.
 
-`build.sh` catches types, templates, `const`-correctness and every warning. It
-cannot catch runtime behaviour at all. That is what the racing, sanitizer and
-semantic cases inside `run-in-wsl.sh` are for. Neither half is optional.
+Nothing here is checkable by a compiler alone. The racing, sanitizer and
+semantic cases inside `verify/run.sh` are the only way this file's runtime
+behaviour gets asserted -- which is why the suites compile it everywhere, not
+just the trivial translation unit.
 
-CI runs the Linux half on every push and pull request -- see
-`.github/workflows/c-cpp.yml`. It deliberately does not run `build.sh`, which
-exists because this particular desk is not Linux, not because Linux lacks
-anything.
+CI runs the same suite on every push and pull request -- see
+`.github/workflows/c-cpp.yml`.
 
 `verify/bench.sh` is the third kind of check, and it is deliberately not in CI:
 it measures resident memory per idle connection, ingest rate at one, two and
@@ -68,7 +63,7 @@ and after in its commit message, where the date and the machine are attached.
 
 ```
 include/tcp-server-mt.h   the only deliverable, 2937 lines
-verify/                   compile check + runtime suites + one-off evidence probes
+verify/                   runtime suites + one-off evidence probes
 docs/review/              eight rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
 ```

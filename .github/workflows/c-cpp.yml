@@ -1,23 +1,21 @@
 # What this job can claim, and what it cannot.
 #
-# verify/run-in-wsl.sh is the real gate: the suite compiled and run under plain,
+# verify/run.sh is the real gate: the suite compiled and run under plain,
 # asan+ubsan and tsan, plus cpplint on the header. All of it is Linux work, so an
-# ubuntu-latest runner covers the interesting half of the project. The counts are
-# left out on purpose -- reactor_spread alone doubled one of them, and a number
-# in a comment is a number that goes stale without anything failing.
+# ubuntu-latest runner covers the whole project. The counts are left out on
+# purpose -- reactor_spread alone doubled one of them, and a number in a comment
+# is a number that goes stale without anything failing.
 #
-# verify/build.sh is deliberately absent. It type-checks the header against a
-# hand-written POSIX shim on Windows -- that check exists because this desk
-# cannot produce a real Linux binary, not because Linux lacks anything, and the
-# compile below already carries the same warning set. Putting a Windows runner
-# behind it would mainly buy new ways to fail for MSYS reasons.
+# There is no second, host-side check to run beside it: the header needs epoll
+# and eventfd, so a host that cannot run it cannot check it either.
 #
 # One thing this job does that no local run has managed: GitHub's runner has a
 # real kernel. send_results' hup/err case asks the host whether EPOLLHUP|EPOLLERR
-# are actually delivered and prints [SKIP] when they are not. On WSL they are
-# not -- an aborted connection arrives as an ordinary FIN -- so that case sat
-# unexecuted through three review rounds. Here it runs and asserts. The last
-# step files the verdict, per configuration, where anyone can read it back.
+# are actually delivered and prints [SKIP] when they are not. On the old WSL
+# host they were not -- an aborted connection arrives as an ordinary FIN -- so
+# that case sat unexecuted through three review rounds. Here it runs and
+# asserts. The last step files the verdict, per configuration, where anyone can
+# read it back.
 name: verify
 
 on:
@@ -61,7 +59,7 @@ jobs:
         run: |
           # pipefail so the tee cannot launder a failing suite into a green job.
           set -o pipefail
-          bash verify/run-in-wsl.sh 2>&1 | tee /tmp/verify-run.log
+          bash verify/run.sh 2>&1 | tee /tmp/verify-run.log
 
       # Three reasons this exists, and the second one is why the first version
       # of it was not enough.
@@ -97,7 +95,7 @@ jobs:
           #
           # The pattern is anchored, and had to be. The suite's skip() helper puts
           # the marker first on the line, but the closing notes of
-          # verify/run-in-wsl.sh quote the same word in prose ("A [SKIP] line is
+          # verify/run.sh quote the same word in prose ("A [SKIP] line is
           # a case that asked the machine a question first ...") -- as free text
           # anywhere in the line, that paragraph counted itself as one case too,
           # and reported a decline nobody had made.

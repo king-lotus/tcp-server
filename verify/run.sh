@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Run the tcp-server verification suite inside WSL (Linux).
+# Run the tcp-server verification suite. Linux only.
 #
-# Executed from the Linux side. Windows paths are reached through drvfs, so the
-# project does not have to be copied into the WSL filesystem first:
+#     bash verify/run.sh
 #
-#     bash /mnt/c/Users/root/WorkBuddy/Claw/tcp-server/verify/run-in-wsl.sh
+# There is no second, host-side check any more: the header needs epoll and
+# eventfd, so the machine that can compile it is the machine that has to run
+# it. Everything this project claims is settled by building and running it
+# here, on a kernel that can express the states the suites ask about.
 #
 # Optional switches (each can be combined):
 #   ENABLE_ASAN=1   rebuild under AddressSanitizer + UndefinedBehaviorSanitizer,
@@ -16,13 +18,6 @@
 # Both are separate configurations rather than one combined build: ASan and TSan
 # cannot be linked into the same binary, and a run under either is slow enough
 # that folding it into the default pass would stop people running it.
-#
-# Not included here, and it cannot be: verify/build.sh type-checks the header
-# against verify/stub/ with the native Windows toolchain. A Windows binary
-# started from Linux gets no Windows environment, so its g++ fails to launch
-# cc1plus at all. Run it from a Windows shell (bash verify/build.sh) -- it is a
-# different compiler over a different surface, and it has already caught a class
-# of defect this suite cannot see (a POSIX symbol the shim never declared).
 #
 # Idempotent: safe to rerun; the toolchain install is skipped once g++ exists.
 set -euo pipefail
@@ -136,18 +131,6 @@ run_cpplint() {
 
 run_cpplint || overall=1
 echo
-#
-# Every verdict below reads one. Handing a command to WSL as an inline string
-# (`bash -lc '...'`) reports $? = 0 for `false`, for `(exit 3)` and for a
-# program compiled to return 7 -- the success path and the failure path become
-# indistinguishable, and a suite whose outcome no longer depends on the outcome
-# is decoration. Through a script file it travels correctly. This probe states
-# which situation we are in before anything is trusted, rather than after.
-if ! timeout 300 bash verify/probe_exit_code.sh; then
-    echo "!! exit codes are not crossing into Linux correctly; results below are meaningless"
-    exit 2
-fi
-echo
 
 build "plain"
 run_all "plain" || overall=1
@@ -202,10 +185,8 @@ cat <<EOF
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as
-    an ordinary FIN (WSL's 4.4 kernel does): EPOLLHUP|EPOLLERR is then never
-    delivered, so the branch cannot be reached from there.
-  - This run says nothing about verify/build.sh: that check is Windows-side only
-    and has to be run separately, from a Windows shell.
+    an ordinary FIN: EPOLLHUP|EPOLLERR is then never delivered, so the branch
+    cannot be reached from there.
 
  If a case fails, paste the whole output back -- first without CS_REACTORS, then
  with it.

@@ -1,72 +1,38 @@
-# verify/ — 宿主侧编译检查
+# verify/ — Linux 验证套件
 
-这个目录只做一件事：**在不具备 Linux 工具链的机器上，让 `tcp-server-mt.h` 真正被编译器解析一遍**。
+这个目录只做一件事：**在真 Linux 上把 `tcp-server-mt.h` 编译出来并跑起来**。没有第二套
+「宿主侧编译检查」：头文件依赖 `epoll` + `eventfd`，能编译它的机器就是能运行它的机器。
 
 ```bash
-bash verify/build.sh      # 0=干净, 1=有诊断, 2=缺工具链
+bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加配置
 ```
 
 ## 能验证什么
 
-- 语法、类型、模板实例化、`const` 正确性
-- `-Wall -Wextra -Wpedantic -Wshadow` 下的全部警告
-- 头文件被两个翻译单元包含时的 ODR/重复定义问题
+- **运行时行为**：关闭语义、背压、空闲判定、故障注入、`sendTo` 的每一种回答
+- race 与内存错误：ASan + UBSan、TSan 各跑一整套
+- 头文件被多个翻译单元包含时的 ODR/重复定义问题
 
 ## 不能验证什么
 
-- **任何运行时行为**：没有链接、没有执行，`epoll_wait` 的时序、竞态、回调重入都测不到
-- 真实 Linux 头文件差异：`stub/` 是按 POSIX 语义手写的声明层
-- 内存错误：需要 Linux 上的 `-fsanitize=address,undefined`
+- **这台内核造不出的状态**：内核不投递 `EPOLLHUP|EPOLLERR`、或把 `SO_LINGER{on,0}` 变成干净 FIN 时，
+  相关用例只能打印 `[SKIP]` 并写明理由 —— 跳过不等于通过
+- 跨内核差异：结论只对跑它的那台机器成立
 
-真机验收仍需：
-
-```bash
-g++ -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined \
-    -DINDUSTRIAL_TCP_TESTING test.cpp -pthread -o test && ./test
-```
-
-## 实现要点（两个坑）
-
-1. **`cc1plus` 需要 `ucrt64/bin` 在 PATH 上。**
-   只用绝对路径调用 `g++.exe` 时，`cc1plus.exe` 找不到自己的 DLL，进程直接退出码 1，
-   **且不产生任何诊断信息**——看上去和「编译干净」一模一样。`build.sh` 显式导出了 PATH。
-   本项目的编译检查最初就在这里拿到了假阴性。
-
-2. **`g++` 是原生 Windows 程序，不认 `/c/...`。**
-   路径必须转成 `C:/...`，`build.sh` 用 `cygpath -m` 处理。
-
-## 检查器自身的可信度
-
-添加时用注入法验证过：往头文件里插一个未声明标识符 → 报出精确行号并 exit 1；
-移除后 → exit 0。不做这一步的话，「通过」这个结论本身就没有意义。
-
-**2026-10-17 重新验证时踩到同一个坑的第二种形态**：把探针追加到文件**末尾**（`} // namespace industrial`
-之后）时，`build.sh` 依然报 OK。原因不是编译器，而是探针在命名空间外部、又只被 `inline`
-修饰——没有调用者就不会生成代码，语法与名字查找都没被触发。**注入必须在命名空间内部，
-且最好直接在已有函数体里引用未声明符号**，否则会得到另一个假阴性。
-
-**第三种形态：流水线本身没在编译。** 宿主 shell 的 PATH 会被上层包装脚本弄坏（`ls` / `tr` / `head`
-全部 command not found），此时 `build.sh` 会先走到「no C++ compiler」分支——这一层还算诚实，给了 exit 2。
-但一旦为了绕开它而换用别的调用方式，“输出为空”和“零诊断”就长得一模一样，
-而屏幕上照样没有报错。**做法：只要调用方式变了、或距上次成功过了很久，
-就先编译一个故意写错的对照文件**，确认它报出精确行号且 exit 1。
-这一轮正是因为先跑了对照，才敢相信头文件那两个 rc=0 是真的。
-
-## 在 WSL 里跑全套
+## 跑全套
 
 ```bash
-bash verify/run-in-wsl.sh                      # 默认配置（2 / 1 reactor 各一轮 + 故障注入）
-ENABLE_ASAN=1 bash verify/run-in-wsl.sh        # 另跑一轮 ASan + UBSan
-ENABLE_TSAN=1 bash verify/run-in-wsl.sh        # 另跑一轮 TSan
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run-in-wsl.sh
+bash verify/run.sh                             # 默认配置（2 / 1 reactor 各一轮 + 故障注入）
+ENABLE_ASAN=1 bash verify/run.sh               # 另跑一轮 ASan + UBSan
+ENABLE_TSAN=1 bash verify/run.sh               # 另跑一轮 TSan
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh # 全都要
 ```
 
-Windows 路径走 drvfs 直接访问，不必把项目复制进 WSL 文件系统。三个配置是**分别**构建的：
-ASan 与 TSan 不能链进同一个二进制，而且两者都慢到足以让人不再愿意跑第三个。
+三个配置是**分别**构建的：ASan 与 TSan 不能链进同一个二进制，而且两者都慢到足以让人不再愿意跑第三个。
 
 ## `close_semantics.cpp` —— 断言线上可见的关闭行为
 
-`close_semantics.cpp` 与 `compile_check.cpp` 不同：它断言的是**线上可见的行为**，编译器看不见。
+`close_semantics.cpp` 断言的是**线上可见的行为**，编译器看不见。
 
 ```bash
 # 只能在 Linux 上跑
@@ -147,7 +113,7 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 压的是硬限制而不是软限制——`start()` 会把软限制往硬限制抬，抬得上去的 ceiling 不是 ceiling。
 
 `hup/err` 分支（`EPOLLHUP|EPOLLERR` → `closeConn(c, "hup/err", false)`）同样补了用例，但它是
-**先问后测**：先用一对裸 socket 问内核"被中止的连接在 epoll 上是否可见"。本机（WSL1，4.4.0）
+**先问后测**：先用一对裸 socket 问内核"被中止的连接在 epoll 上是否可见"。早期开发机（4.4 内核）
 把它报成干净 FIN，`EPOLLHUP|EPOLLERR` 永远不会被投递，于是该分支在这里**无法到达**，用例打印
 `[SKIP]` 并说明它问了什么。**跳过不等于通过**；换到真内核上那条断言自动生效。
 
@@ -159,6 +125,9 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 > 更新：现在是八种。第 8 条是关于 **cpplint 的退出码** —— 见本节末尾。
 
 前面三形态是**检查器自身**失效；后面几条是**测试自身**在骗人，更隐蔽，因为它们有输出、有绿色。
+
+> 第 1–3 条描述的是已删除的宿主侧编译检查（`build.sh` + `stub/`），保留作为历史记录：
+> 它们讲的是「编译器根本没跑、却报告干净」这一类陷阱，在 Linux 上同样值得警惕。
 
 1. **`cc1plus` 的 DLL 不在 PATH** → 编译器退出码 1 且零诊断，看上去和"干净"一模一样。
 2. **探针追加到文件末尾** → 探针在命名空间外、只被 `inline` 修饰，没有调用者就不生成代码，
@@ -176,23 +145,21 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 6. **时序决定成败。** B 用例先写两个请求再立刻 `closeConnection`，请求到达与否取决于网络栈，
    约五把里输一把。现在等 `bytesRecv` —— 把用例锚定到它真正要测的那一刻（字节已抵达、
    reactor 是否读过仍未定），而不是把断言放松。
-7. **退出码没有过桥。** 本套件的每条结论都读自 `$?`。但把命令以内联字符串的形式交给 Linux
-   （`wsl.exe -- bash -lc 'false; echo $?'`）时，`$?` **恒为 0**：`(exit 3)`、一个编译出来
-   `return 7` 的程序，全都报 0。于是走这条路的脚本会输出"全部通过"，而这里的"通过"与"失败"
+7. **退出码没有过桥。** 本套件的每条结论都读自 `$?`。早期这套件是从 Windows 把内联字符串
+   交给 Linux 执行的（`bash -lc '...'`），那时 `$?` **恒为 0**：`(exit 3)`、一个编译出来
+   `return 7` 的程序，全都报 0。于是脚本会输出"全部通过"，而这里的"通过"与"失败"
    长得完全一样 —— 这是最难挽回的一种形态，因为它连"有异常发生"这个信号都不给。
-   走**脚本文件**（`bash verify/run-in-wsl.sh`）退出码是完好的，本套件一直走这条路，以往结论不受影响。
-   现在这件事本身成了断言：`verify/probe_exit_code.sh` 最先跑，把管道不成立的情况直接判死，
-   并说明它问了什么。
+   现在套件只以**脚本文件**的方式在 Linux 上执行（`bash verify/run.sh`），退出码天然完好。
 8. **cpplint 无论有没有发现东西都返回 0。** 实测：一个只有 `int x = (size_t)y;` 的文件会打印
    `Total errors found: 2`，退出码照样是 0。所以结论只能从输出里解析，问 `$?` 等于让这个检查
    永远通过。更细的一层：`Total errors found:` 这行**只在非零时打印**，文件干净时除
    `Done processing` 外什么都不输出 —— 于是"干净"和"根本没跑"的输出长得也一样。
-   因此 `run-in-wsl.sh` 每次先 lint 一个必定报错的对照文件，它不报错就不接受后面的"干净"结果。
+   因此 `run.sh` 每次先 lint 一个必定报错的对照文件，它不报错就不接受后面的"干净"结果。
 
 ## 一处 TSan 误报（此机器上）
 
-`backpressure.cpp` 要扣住 worker，最自然的写法是 mutex + `condition_variable`。本机（WSL1 /
-Ubuntu 的 g++ 11.4）的 ThreadSanitizer 会对此报 **double lock of a mutex**，紧接着报"同时被
+`backpressure.cpp` 要扣住 worker，最自然的写法是 mutex + `condition_variable`。早期开发机
+（g++ 11.4）的 ThreadSanitizer 会对此报 **double lock of a mutex**，紧接着报"同时被
 这把锁保护着"的标志量有 data race —— 而 **`verify/probe_tsan_condvar.sh` 里那段不含服务端、
 不含套接字的标准握手，报的是完全一样的两种错**。也就是说这是库/平台的性质。
 
@@ -205,25 +172,12 @@ Ubuntu 的 g++ 11.4）的 ThreadSanitizer 会对此报 **double lock of a mutex*
 
 ## 一处无法断言的地方（不是缺陷）
 
-本机内核（WSL1，4.4.0-19041-Microsoft）**不把 `SO_LINGER{on,0}` 变成 RST**：用一对裸 socket
+早期开发机的内核（4.4）**不把 `SO_LINGER{on,0}` 变成 RST**：用一对裸 socket
 验证过，设了零 linger 再 close，对端收到的是干净 FIN。这是机器的性质，不是服务端的。
 
 所以 C 用例会先自己问内核一次（`kernelHonoursZeroLinger()`），把结论打印出来：支持就断言 RST，
 不支持就打印 `[SKIP]` 并改为断言服务端侧的证据（`parseErrors` / `aborted`）。**跳过会写明理由，
 不等于通过。** 换到真正的 Linux 内核上，那条断言自动恢复生效。
-`build.sh` 会**编译**（不链接、不运行）这个文件，用于捕捉公开接口漂移——例如 `closeConnection`
-改名这类 `compile_check.cpp` 完全发现不了的问题。为此还需要 `stub/posix_shim.h` 提供
-`sockaddr_in` / `htons` / `send` / `getsockname` / `SO_RCVTIMEO` 等测试端要用的声明。
-
-## stub 的边界
-
-`stub/posix_shim.h` 只声明类型和函数原型，不提供实现。刻意保守：
-
-- 常量值按 Linux 实际取值（`EPOLL_CTL_*`、`MSG_NOSIGNAL` 等）
-- `epoll_data_t` 用 `union`，与 glibc 一致
-- 不模拟 `errno` 语义，所以依赖错误码分支的逻辑只能靠 review
-
-它**不是**兼容层，不要试图用它跑程序。
 
 ## 一个概率型缺陷怎么测：case F 与插桩工具
 
