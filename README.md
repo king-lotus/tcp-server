@@ -8,7 +8,7 @@ thread with N sub-reactors. Everything is in that one file.
 industrial::MultiReactorServer server(cfg);
 ```
 
-No `.cpp`, no build scripts, no third-party dependencies. To use it, copy
+No `.cpp`, nothing to link, no third-party dependencies. To use it, copy
 `include/tcp-server-mt.h` into your project. It needs Linux (`epoll` +
 `eventfd`), so the machine that can compile it is also the machine that has to
 run it -- `verify/` is that machine.
@@ -49,6 +49,20 @@ just the trivial translation unit.
 
 CI runs the same suite on every push and pull request -- see
 `.github/workflows/c-cpp.yml`.
+
+`CMakeLists.txt` builds the same sources for a build system or an IDE. It is a
+convenience, not a second definition of "verified": `run.sh` remains the gate,
+because the three configurations, cpplint and the ordering live there.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure     # the same ten runs
+```
+
+`-DTCP_SANITIZE=address,undefined` (or `thread`) rebuilds the suites under one
+sanitizer set; the tsan configuration wraps every test in `setarch -R` for the
+same reason `run.sh` does. `-DTCP_BUILD_BENCH=ON` adds the four benchmarks.
 
 `verify/bench.sh` is the third kind of check, and it is deliberately not in CI:
 it measures resident memory per idle connection, ingest rate at one, two and
