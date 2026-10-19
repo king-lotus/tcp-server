@@ -96,7 +96,12 @@ overall=0
 #    file prints nothing beyond "Done processing". Zero and "did not run" look
 #    the same, so every run lints a file that certainly offends first, and the
 #    clean result below is not believed unless that file did offend.
-python3 -m cpplint --version >/dev/null 2>&1 || python3 -m pip install -q cpplint
+# Ubuntu 24.04 marks its system python externally managed (PEP 668), so the
+# plain install is refused there. The fallback is for images that predate that.
+if ! python3 -m cpplint --version >/dev/null 2>&1; then
+    python3 -m pip install -q cpplint 2>/dev/null ||
+        python3 -m pip install -q --break-system-packages cpplint
+fi
 
 run_cpplint() {
     echo "== cpplint =="
