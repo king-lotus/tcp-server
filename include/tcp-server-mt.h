@@ -638,8 +638,18 @@ class MultiReactorServer {
         int         idleTimeoutMs   = 120000;
         int         tickMs          = 500;
         size_t      rbufCapacity    = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
-        size_t      wbufCapacity    = 256 * 1024;   // 256KB
-        size_t      maxPendingBytes = 256 * 1024;   // <= wbufCapacity
+        // One maximum frame, not 256KB. The write buffer is allocated per
+        // accepted connection, so it is most of the per-connection memory cost:
+        // 324.7KB at 256KB, 128.8KB here, with no throughput change in the
+        // ingest benchmark. The floor is FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD
+        // rather than a rounded number: sendTo refuses a frame that does not
+        // fit, so a smaller buffer makes a maximum-size reply impossible to
+        // write, on an idle connection, forever.
+        size_t      wbufCapacity    = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        // Matches the buffer above rather than repeating 256KB: start() clamps
+        // this down to wbufCapacity anyway, so a larger default would only be a
+        // number that reads as a promise it does not keep.
+        size_t      maxPendingBytes = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
         size_t      writeBudgetBytes = 256 * 1024;
         // Grace period for a half-closed connection: after our FIN went out we
         // keep reading until the peer's FIN, but never longer than this. Bounds

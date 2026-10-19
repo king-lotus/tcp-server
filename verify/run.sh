@@ -56,6 +56,7 @@ build() {
     g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
         -o /tmp/fault_injection
     g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o /tmp/reactor_spread
+    g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o /tmp/config_budget
 }
 
 run_all() {
@@ -81,7 +82,8 @@ run_all() {
                    "backpressure:/tmp/backpressure" \
                    "fault_injection:/tmp/fault_injection" \
                    "reactor_spread, default reactors:/tmp/reactor_spread" \
-                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread"; do
+                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread" \
+                   "config_budget:/tmp/config_budget"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0

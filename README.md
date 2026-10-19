@@ -32,8 +32,8 @@ This project has no "just run it and see" position. Everything is settled by
 building and running it on Linux:
 
 ```bash
-# Seven suites, nine runs per configuration -- two of them run twice, at
-# different reactor counts -- over {plain, asan+ubsan, tsan}: 27 configurations,
+# Eight suites, ten runs per configuration -- two of them run twice, at
+# different reactor counts -- over {plain, asan+ubsan, tsan}: 30 configurations,
 # cpplint included.
 ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh
 ```
