@@ -1695,7 +1695,12 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
         if (c->rbuf.readable() < FRAME_HEADER_SIZE + len) return;
 
         c->rbuf.consume(FRAME_HEADER_SIZE);
-        c->lastRecvMs = nowMs();
+        // No per-frame clock read here. lastRecvMs is stamped once per recv()
+        // (handleRead), which is when bytes actually arrive; re-stamping it
+        // while parsing only refreshes the idle deadline with the age of data
+        // that already arrived. It also cost 18% of this reactor's CPU:
+        // clock_gettime showed up as a fifth of parseFrames in perf, because
+        // at 20M frames/s it is one call per 64 bytes.
         server_->statsRef().framesRecv.fetch_add(1, std::memory_order_relaxed);
         --framesLeft;
 
