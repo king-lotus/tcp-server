@@ -48,7 +48,8 @@ behaviour gets asserted -- which is why the suites compile it everywhere, not
 just the trivial translation unit.
 
 CI runs the same suite on every push and pull request -- see
-`.github/workflows/c-cpp.yml`.
+`.github/workflows/c-cpp.yml`. How a suite is written, and what the client side
+of one now shares, is in [`docs/testing.md`](docs/testing.md).
 
 `CMakeLists.txt` builds the same sources for a build system or an IDE. It is a
 convenience, not a second definition of "verified": `run.sh` remains the gate,
@@ -116,7 +117,8 @@ shrinking; that one is open.
 
 ```
 include/tcp-server-mt.h   the only deliverable, 2988 lines
-verify/                   runtime suites + one-off evidence probes
+verify/                   runtime suites, the peer harness, one-off probes
+docs/testing.md           how a suite is written, and how the harness is tested
 docs/review/              eight rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
 ```
