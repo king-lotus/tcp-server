@@ -774,7 +774,6 @@ class SubReactor {
     // The rest of a rollback for a connection that never took its place here.
     void discardRejectedConn(Conn* c) noexcept;
     void discardPendingOutput(Conn* c) noexcept;
-    void finishClose(std::shared_ptr<Conn>& c) noexcept;
     void flushCloseCallbacks() noexcept;
     void armWrite(Conn* c) noexcept;
     void disarmWrite(Conn* c) noexcept;
@@ -2528,15 +2527,6 @@ inline void SubReactor::teardownClosed(Conn* c, const char* reason,
     }
 }
 
-// Release our reference before running the callbacks: after this the connection
-// may be fully destroyed, which is exactly the state a deferred callback
-// expects.
-// Takes a mutable reference on purpose: reset() cannot be called through const,
-// and the caller's slot must be emptied rather than merely read.
-inline void SubReactor::finishClose(std::shared_ptr<Conn>& c) noexcept {
-    c.reset();
-}
-
 // Runs the deferred ConnStateHandler(false) / CloseHandler pairs. The batch is
 // swapped out first, so a callback that closes more connections (or enqueues
 // work) lands in a fresh batch instead of invalidating this loop.
@@ -2546,7 +2536,11 @@ inline void SubReactor::flushCloseCallbacks() noexcept {
     if (batch.empty()) return;
 
     for (auto& e : batch) {
-        finishClose(e.conn);              // connection may die here
+        // Release our reference before running the callbacks: after this the
+        // connection may be fully destroyed, which is exactly the state a
+        // deferred callback expects. This used to be a finishClose() call
+        // whose body was this one line.
+        e.conn.reset();
         auto& sh = server_->stateHandlerRef();
         if (sh) sh(e.id, e.peer, false);
         if (server_->closeHandler_)
