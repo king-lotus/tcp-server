@@ -1,123 +1,144 @@
-# R3 审计记录
+# R3 audit record
 
-分支：`refactor/r3-close-state-machine`
-审计对象：`include/tcp-server-mt.h` 相对 `main` 的 diff（+344 / −104）
-判据：`docs/architecture/r3-baseline.md` 第 1、2、5、6 节
+Branch: `refactor/r3-close-state-machine`
+Audited: the diff of `include/tcp-server-mt.h` against `main` (+344 / −104)
+Criteria: `docs/architecture/r3-baseline.md` sections 1, 2, 5 and 6
 
-审计方与实现方为同一执行体（两个委派 agent 均因 429 限流未产出），因此**这份记录不能算独立审计**。它的价值在于把每一项核对做成可复核的命令，而不是一句"看起来等价"。
+The auditor and the implementer were the same process (both delegated agents produced
+nothing, rate-limited), so **this record is not an independent audit**. Its value is that
+every check is written as a command that can be re-run, rather than as the sentence "looks
+equivalent".
 
 ---
 
-## E1 字段引用点 — PASS
+## E1 field references — PASS
 
-| 字段 | 新代码 `c->close.*` 行数 | baseline | 差额来源 |
+| Field | `c->close.*` lines in the new code | baseline | where the difference comes from |
 |---|---|---|---|
 | `closing` | 10 | 10 | — |
 | `finSent` | 8 | 8 | — |
-| `round` | 11 | 7 | +4：`parkClose`/`finishPeerClosed`/`drainInputThenClose`/`handleWrite` 各一处只读 facts |
-| `inputBudget` | 5 | 4 | +1：`drainInputThenClose` 的 `facts.budgetLeft` 只读 |
+| `round` | 11 | 7 | +4: one read-only facts block each in `parkClose` / `finishPeerClosed` / `drainInputThenClose` / `handleWrite` |
+| `inputBudget` | 5 | 4 | +1: the read-only `facts.budgetLeft` in `drainInputThenClose` |
 | `drainReadBytes` | 4 | 4 | — |
 | `peerFinSeen` | 2 | 2 | — |
 | `startedAtMs` | 3 | 3 | — |
 | `finSentAtMs` | 1 | 1 | — |
 
-5 处增量全部是读，无新增写入点。旧名（`closeInputBytes` / `closeStartedAtMs` / `deferredRound` / `peerClosed` / `DeferredRound`）全文件零残留。
+All five increments are reads; no new write sites. The old names (`closeInputBytes` /
+`closeStartedAtMs` / `deferredRound` / `peerClosed` / `DeferredRound`) leave zero residue
+anywhere in the file.
 
 ```
 grep -c "c->close.round" include/tcp-server-mt.h          # 11
 grep -n "closeInputBytes\|closeStartedAtMs\|deferredRound\|peerClosed\|DeferredRound" include/tcp-server-mt.h
 ```
 
-## E2 原子性 — PASS
+## E2 atomicity — PASS
 
-`closing`（L389）与 `isClosed`（L571）仍是 `std::atomic<bool>`。`closing` 的 10 处访问全部带 `acquire`/`release`，无 relaxed 混入。
+`closing` (L389) and `isClosed` (L571) are still `std::atomic<bool>`. All ten accesses to
+`closing` carry `acquire`/`release`; no relaxed access slipped in.
 
-## E3 单调性 — PASS
+## E3 monotonicity — PASS
 
-写入点与 baseline 第 1 节逐行一致：
+The write sites match baseline section 1 line for line:
 
-| 字段 | 写入点 | 次数 |
+| Field | Write site | Count |
 |---|---|---|
-| `peerFinSeen` | L1615 | 1（单调） |
-| `finSent` | L1764 | 1（单调） |
-| `round` | L1865 / L2316 / L2350 | 3（`None` → `Close`/`PeerClosed`，无回退） |
-| `closing` | L2171（true）/ L2051（false） | 2（false 仍只在 `unregisterConn`） |
+| `peerFinSeen` | L1615 | 1 (monotonic) |
+| `finSent` | L1764 | 1 (monotonic) |
+| `round` | L1865 / L2316 / L2350 | 3 (`None` → `Close`/`PeerClosed`, never back) |
+| `closing` | L2171 (true) / L2051 (false) | 2 (the false one is still only in `unregisterConn`) |
 
-无新增复位点。
+No new reset points.
 
-## E4 决策表 26 行 — PASS
+## E4 the decision tables — PASS
 
-三处最危险的重写逐一核对：
+The three riskiest rewrites, checked one by one:
 
-**1. `parkClose` 入口 gate**
+**1. `parkClose` entry gate**
 
-旧：`if (isClosed || finSent) return;`
-新：`if (decide(phase(), AppClose, facts) == None) return;`
+Old: `if (isClosed || finSent) return;`
+New: `if (decide(phase(), AppClose, facts) == None) return;`
 
-`AppClose` 只在 `FinSent` / `Torn` 返回 `None`；`Open` / `Closing` 恒返回 `SendFin` 或 `Park`。等价。
+`AppClose` returns `None` only for `FinSent` / `Torn`; for `Open` / `Closing` it always
+returns `SendFin` or `Park`. Equivalent.
 
-**2. `parkClose` drain 之后**
+**2. `parkClose` after the drain**
 
-旧：`if (!wbuf.empty()) armWrite(); else tryBeginWriteShutdown();`
-新：按 `decide(AppClose, wbufEmpty)` 分派 `SendFin` → `tryBeginWriteShutdown`，`Park` → `armWrite`。
+Old: `if (!wbuf.empty()) armWrite(); else tryBeginWriteShutdown();`
+New: dispatch on `decide(AppClose, wbufEmpty)` — `SendFin` → `tryBeginWriteShutdown`,
+`Park` → `armWrite`.
 
-`AppClose` 在非 `FinSent`/`Torn` 时只可能返回这两个值之一，且与 `wbufEmpty` 一一对应。`switch` 的 `default` 分支在语义上不可达，保留是为了不引入未处理枚举警告。等价。
+Outside `FinSent`/`Torn`, `AppClose` can only return those two values, and they correspond
+one-to-one with `wbufEmpty`. The `switch`'s `default` branch is semantically unreachable and
+is kept only to avoid an unhandled-enum warning. Equivalent.
 
-**3. `handleWrite` 收尾**
+**3. `handleWrite` tail**
 
-旧：`if (closing && !tryBeginWriteShutdown(c)) teardown;`
-新：`if (decide(DrainDone) == SendFin) { if (!tryBeginWriteShutdown(c)) teardown; }`
+Old: `if (closing && !tryBeginWriteShutdown(c)) teardown;`
+New: `if (decide(DrainDone) == SendFin) { if (!tryBeginWriteShutdown(c)) teardown; }`
 
-`decide(DrainDone)` 在 `Closing` 且 `wbufEmpty` 时返回 `SendFin`，而此处 `wbuf` 必然为空（上面刚 `return` 掉非空分支），所以外层条件退化为 `phase == Closing`，与原 `closing` 测试一致。短路顺序：先判阶段，再判 `shutdown` 返回值，与旧代码相同。等价。
+`decide(DrainDone)` returns `SendFin` when the phase is `Closing` and `wbufEmpty` is true,
+and `wbuf` is necessarily empty here (the non-empty branch returned above), so the outer
+condition reduces to `phase == Closing` — the same test the old `closing` performed.
+Short-circuit order is also unchanged: phase first, then the `shutdown` return value.
+Equivalent.
 
-**`finishPeerClosed` 的四种落点**逐格对照（`wbuf` 空、`round != None` 这一格是旧代码最容易读错的地方）：
+**The four outcomes of `finishPeerClosed`**, cell by cell (the empty-wbuf / `round != None`
+cell is the one the old code was easiest to misread):
 
-| 阶段 | wbuf | round | pending | 旧行为 | 新表 |
+| Phase | wbuf | round | pending | Old behaviour | New table |
 |---|---|---|---|---|---|
-| Open | 空 | None | 有 | defer 一轮 | DeferPark |
-| Open | 空 | None | 无 | graceful | TeardownGraceful |
-| Open | 空 | **非 None** | 任意 | graceful | TeardownGraceful |
-| Closing | 空 | 任意 | 任意 | tryBeginWriteShutdown | SendFin |
-| FinSent | 空 | 任意 | 任意 | graceful | TeardownGraceful |
-| 任意 | 非空 | 任意 | 任意 | park | Park |
+| Open | empty | None | yes | defer one round | DeferPark |
+| Open | empty | None | no | graceful | TeardownGraceful |
+| Open | empty | **not None** | any | graceful | TeardownGraceful |
+| Closing | empty | any | any | tryBeginWriteShutdown | SendFin |
+| FinSent | empty | any | any | graceful | TeardownGraceful |
+| any | non-empty | any | any | park | Park |
 
-一致。
+They agree.
 
 ## E5 `doTick` linger — PASS
 
-仍读 `c->close.startedAtMs`（L2421–2422），与 `parkClose` 的 L2173 写入配对。`finSentAtMs` 仍无读者（baseline 已标注为死字段，本次未动）。
+Still reads `c->close.startedAtMs` (L2421–2422), pairing with the write at L2173 in
+`parkClose`. `finSentAtMs` still has no reader (baseline already marked it a dead field;
+untouched here).
 
-## E6 回调延迟 — PASS
+## E6 callback deferral — PASS
 
-`teardownClosed` 仍只把 `ClosedConn` 推进 `pendingCloses_`，无新增同步回调调用。
+`teardownClosed` still only pushes a `ClosedConn` onto `pendingCloses_`; no new synchronous
+callback invocation.
 
-## E7 无新增分配 / 锁 — PASS
+## E7 no new allocation or locks — PASS
 
-diff 中新增行匹配 `make_shared|new |mutex|lock_guard|unique_lock|shared_lock` 的数量为 **0**。
+Lines added by the diff matching `make_shared|new |mutex|lock_guard|unique_lock|shared_lock`:
+**0**.
 
-## E8 Linux 编译与集成 — PASS（一项环境性失败，已对照 main 排除）
+## E8 Linux build and integration — PASS (one environmental failure, ruled out against main)
 
-环境：WSL2 Ubuntu 22.04，`g++ 11.4.0`，8 核，`ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh`。
+Environment: WSL2 Ubuntu 22.04, `g++ 11.4.0`, 8 cores,
+`ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh`.
 
-| 项 | 结果 |
+| Item | Result |
 |---|---|
-| `-Wall -Wextra -Werror` 编译 `verify/close_state_machine.cpp` | 通过，零警告 |
-| cpplint（`include/tcp-server-mt.h`） | **0 findings** |
-| plain 配置 | 11/12 绿 |
-| asan+ubsan 配置 | 11/12 绿 |
-| tsan 配置 | 11/12 绿 |
-| 合计 | **33/36** |
+| `-Wall -Wextra -Werror` build of `verify/close_state_machine.cpp` | passes, zero warnings |
+| cpplint (`include/tcp-server-mt.h`) | **0 findings** |
+| plain configuration | 11/12 green |
+| asan+ubsan configuration | 11/12 green |
+| tsan configuration | 11/12 green |
+| total | **33/36** |
 
-**唯一失败项：`harness_selftest`，三个配置各一次。**
+**The only failure is `harness_selftest`, once per configuration.**
 
-失败内容是 D 用例 `expectClose(Rst)`：
+It fails in case D, `expectClose(Rst)`:
 
 ```
 [FAIL] RST was reported: expected RST, saw FIN
 [FAIL] and it is not reported as a FIN
 ```
 
-这不是本次改动引起的。同一个日志里其它套件对同一件事给的是 `[SKIP]`：
+This is not caused by the change. Other suites in the same log say `[SKIP]` about the same
+thing:
 
 ```
 [SKIP] no wire RST is observable on this kernel: it ignores SO_LINGER{on,0}
@@ -125,9 +146,12 @@ diff 中新增行匹配 `make_shared|new |mutex|lock_guard|unique_lock|shared_lo
        server's own evidence here
 ```
 
-WSL2 内核不把 `SO_LINGER{on,0}` 变成可观测的 RST，于是 harness 自己的 RST 检测器无法被验证。`harness_selftest` 没有做这个前置探测，直接断言，所以它红了。
+The WSL2 kernel does not turn `SO_LINGER{on,0}` into an observable RST, so the harness's own
+RST detector cannot be verified. `harness_selftest` does not probe for that first — it
+asserts directly, which is why it is red.
 
-对照实验（决定性证据）：在 `main`（`6d1eedd`，重构前）上单独编译并运行同一个用例：
+Control experiment (the decisive evidence): build and run the same case on `main`
+(`6d1eedd`, before the refactor):
 
 ```
 $ g++ -std=c++17 -Wall -Wextra -Iinclude verify/harness_selftest.cpp -o /tmp/hs_main
@@ -138,52 +162,77 @@ D. expectClose(Rst) recognises a reset
   [FAIL] and it is not reported as a FIN
 ```
 
-**逐字相同。** 与本次重构无关，是环境限制。
+**Verbatim the same.** Unrelated to this refactor; an environment limitation.
 
-### 顺带发现的两件事（不属于 R3，未处理）
+### Two incidental findings (outside R3, left alone)
 
-1. `harness_selftest` 缺少其它套件都有的内核能力探测，所以它在本内核上是硬失败而不是 `[SKIP]`。这是"检查本身无法通过"的检查，按项目自己的标准应当先问机器再断言。
-2. `run.sh` 的退出码在本次执行中不可靠（`Result: FAILURES` 但 shell 拿到 0）。所以本次结论是逐行读每个套件的 `rc=` 得出的，不是看脚本退出码。
+1. `harness_selftest` lacks the kernel-capability probe the other suites have, so on this
+   kernel it fails hard instead of emitting `[SKIP]`. By this project's own standard, a check
+   should ask the machine before asserting.
+2. `run.sh`'s exit status was unreliable in this run (`Result: FAILURES` while the shell got
+   0). The conclusions above were drawn by reading each suite's `rc=` line, not the script's
+   exit status.
 
-### 行尾问题（环境）
+### Line endings (environment)
 
-工作树是 CRLF（`core.autocrlf=true`，仓库无 `.gitattributes`），`set -euo pipefail\r` 在 bash 下直接报 `invalid option name`。验证在 `/tmp` 的 LF 副本上完成，内容与分支一致。**这只影响 Windows 侧检出后直接在 WSL 里跑**，不影响 CI。
-
----
-
-## 审计过程中发现并修掉的三个问题
-
-这三条是这次重构自己引入的，不是原有缺陷。
-
-### A1 `decide(DrainDone)` 不检查 `wbufEmpty`（阻塞，已修）
-
-第一版只判阶段：`Closing → SendFin`。测试里的手写断言 `no FIN over a non-empty wbuf (DrainDone)` 失败。
-
-穷举测试没抓到它，因为**预言机是同一份表的第二次抄写**，两处都漏了同一个守卫。抓到它的是那条独立写出来的安全性质断言。这是"表对表"测试的盲区，值得记下来。
-
-修法：`decide` 里把 `!f.wbufEmpty` 并入条件，返回 `None` 而不是 `SendFin`。预言机同步加守卫，并在注释里注明"此处比 baseline 第 5 节更严，是契约的一部分"。
-
-### A2 / A3 defer 分支失败后 `facts.round` 未同步（非阻塞，已修）
-
-`finishPeerClosed` 与 `drainInputThenClose` 里，defer 分支先置 `round` 再 `enqueue`；`enqueue` 失败时函数继续往下走，而 `facts.round` 还是进入时的值，后面的 `expectClose` 会误报一次 `closeStateMismatch`。
-
-这条在集成测试里表现为"队列打满时计数器莫名非零"，极难追。修法：置位后同步 `facts.round = c->close.round;`。
+The working tree is CRLF (`core.autocrlf=true`, no `.gitattributes` in the repo), so
+`set -euo pipefail\r` makes bash report `invalid option name`. Verification was done on an LF
+copy in `/tmp` with identical content. **This only affects running the scripts in WSL straight
+from a Windows checkout**; it does not affect CI.
 
 ---
 
-## 结论
+## Three problems this refactor introduced, and how each was caught
 
-E1–E8 通过。33/36 绿，唯一红项在 `main` 上逐字复现，是内核能力问题而非代码问题。
+These were not pre-existing defects.
 
-代码层面等价性成立，运行时等价性有集成证据支撑：plain / asan+ubsan / tsan 三种配置下，`close_semantics`（含 `CS_REACTORS=1`）、`idle_semantics`、`ping_pong`、`send_results`、`backpressure`、`fault_injection`、`reactor_spread`（两种 reactor 数）、`config_budget` 全部通过——也就是八轮评审落过的每一个关闭协议现场，都在重构后仍然成立。
+### A1 `decide(DrainDone)` did not check `wbufEmpty` (blocking, fixed)
 
-**`closeStateMismatch` 的证据**：`close_semantics.cpp` 的 D 段新增一条断言，运行结束后 `closeStateMismatch == 0`。它必须在这里而不是在 `close_state_machine.cpp`，因为只有真实运行才会走到 `expectClose()`。
+The first version tested the phase only: `Closing → SendFin`. The hand-written assertion
+`no FIN over a non-empty wbuf (DrainDone)` failed.
 
-断言的有效性做了负向验证：把 `finishPeerClosed` 里一处 `expectClose(..., Park, ...)` 故意改成 `SendFin`，同一个套件立刻红：
+The exhaustive test did not catch it, because **the oracle is a second transcription of the
+same table** and both missed the same guard. What caught it was the independently written
+safety property. That is the blind spot of a table-against-table test, and it is worth
+recording.
+
+Fix: `decide` folds `!f.wbufEmpty` into the condition and returns `None` instead of
+`SendFin`. The oracle gained the same guard, with a comment noting that this point is
+stricter than baseline section 5 and is part of the contract.
+
+### A2 / A3 `facts.round` not updated after a failed defer (non-blocking, fixed)
+
+In `finishPeerClosed` and `drainInputThenClose`, the defer branch sets `round` before calling
+`enqueue`; when `enqueue` fails the function continues, but `facts.round` still holds the
+entry value, so a later `expectClose` reports a spurious `closeStateMismatch`.
+
+In integration this shows up as "the counter is mysteriously non-zero when the queue is full",
+which is very hard to trace. Fix: `facts.round = c->close.round;` after the assignment.
+
+---
+
+## Conclusion
+
+E1–E8 pass. 33/36 green; the only red reproduces verbatim on `main` and is a kernel
+capability problem rather than a code problem.
+
+Equivalence at the code level holds, and runtime equivalence has integration evidence:
+under plain / asan+ubsan / tsan, `close_semantics` (including `CS_REACTORS=1`),
+`idle_semantics`, `ping_pong`, `send_results`, `backpressure`, `fault_injection`,
+`reactor_spread` (both reactor counts) and `config_budget` all pass — every close-protocol
+scene the eight review rounds landed on still holds after the refactor.
+
+**The evidence for `closeStateMismatch`**: section D of `close_semantics.cpp` gained an
+assertion that it is `0` after the run. It has to live there rather than in
+`close_state_machine.cpp`, because only a real run reaches `expectClose()`.
+
+That assertion was verified negatively: changing one `expectClose(..., Park, ...)` in
+`finishPeerClosed` to `SendFin` turns the same suite red immediately:
 
 ```
 [FAIL] decide() and the close branches agreed on every transition
 FAILURES (1 failure)
 ```
 
-还原后 `ALL PASS (0 failures)`。所以这条断言不是"永远为真"的装饰。
+Restoring it gives `ALL PASS (0 failures)`. So the assertion is not decoration that is always
+true.

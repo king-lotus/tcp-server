@@ -1,287 +1,353 @@
-# 架构分析：`include/tcp-server-mt.h`
+# Architecture analysis: `include/tcp-server-mt.h`
 
-分析对象：`include/tcp-server-mt.h`（2989 行，1702 代码行）
-方法：静态结构分析 + 度量 + 既有 8 轮评审记录的交叉比对
-性质：**架构层**评估，不重复 `docs/review/` 里的缺陷清单。本文只回答"结构哪里会持续产生缺陷"，不回答"第 N 行有 bug"。
+Subject: `include/tcp-server-mt.h` (2989 lines, 1702 code lines)
+Method: static structure analysis + measurement + cross-check against the eight existing
+review documents
+Nature: an **architectural** assessment. It does not repeat the defect list in `docs/review/`.
+It answers "where will this structure keep producing defects", not "line N has a bug".
 
 ---
 
-## 0. 结论
+## 0. Conclusions
 
-| 维度 | 判断 |
+| Dimension | Finding |
 |---|---|
-| 分层 | 5 层存在，但 L3/L4 边界是名义上的；`Conn` 与 `SubReactor` 共享同一套状态机寄存器 |
-| 依赖方向 | L4 ↔ L5 **双向循环**，靠 `friend class SubReactor` 打开私有面 |
-| 单一职责 | 3 处明显越界：`start()`（8 职责）、`acceptLoop()`（7 职责）、`Conn`（4 类状态混装） |
-| 状态表达 | 关闭协议 = 7 个字段 + 5 个转移函数 + 26 个入口，**无单一转移函数** |
-| 规格载体 | 39.4% 的注释承担了不变量说明；`handleWrite` 86 行跨度里只有 23 行代码 |
-| 分发契约 | 单文件是产品承诺，不能拆；但公开符号面可以收窄 70% |
+| Layering | Five layers exist, but the L3/L4 boundary is nominal; `Conn` and `SubReactor` share one set of state-machine registers |
+| Dependency direction | L4 ↔ L5 is a **two-way cycle**, opened by `friend class SubReactor` |
+| Single responsibility | Three clear breaches: `start()` (8 jobs), `acceptLoop()` (7 jobs), `Conn` (four kinds of state in one bag) |
+| State expression | The close protocol is 7 fields + 5 transition functions + 26 entry points, **with no single transition function** |
+| Where the spec lives | 39.4% comments, carrying the invariants; `handleWrite` spans 86 lines for 23 lines of code |
+| Distribution contract | One file is the product promise and cannot be split; but the public symbol surface can shrink by ~70% |
 
-核心判断：**这个文件的复杂度不在算法，在状态**。8 轮评审的主要落点（case E / case F / P0-5 / R7-1 / R8-1）全部落在关闭协议，而关闭协议的复杂度来自"同一事实被 7 个字段分别记录"。这是结构问题，不是实现问题。
+The core judgement: **the complexity in this file is in its state, not its algorithms.** The
+main landing sites across eight review rounds (case E / case F / P0-5 / R7-1 / R8-1) are all
+in the close protocol, and that protocol's complexity comes from "one fact recorded
+separately in seven fields". That is a structural problem, not an implementation one.
 
 ---
 
-## 1. 度量基线
+## 1. Measurement baseline
 
-| 指标 | 值 |
+| Metric | Value |
 |---|---|
-| 总行数 / 代码行 / 注释行 / 空行 | 2989 / 1702 / 1106 / 181 |
-| 注释占非空行比 | **39.4%** |
-| 函数数 | 41 |
-| 最长函数 | `start()` 169 行（115 代码行） |
-| 次长 | `acceptLoop()` 163 行、`parseFrames()` 114 行、`drainInputThenClose()` 113 行 |
-| `Conn` 字段数 | 23 |
-| `SubReactor` 方法数 | 32 |
-| `ServerStats` 计数器 | 22 |
-| `closeConn` / `parkClose` / `teardownClosed` 调用点 | 26（不含声明） |
-| 关闭原因字面量（`const char*`） | 14 种 |
-| `epoll_ctl` 直接调用 | 10 处 |
-| `closing` 引用 / `pendingBytes` 引用 / `isClosed` 引用 | 35 / 25 / 16 |
+| Total / code / comment / blank lines | 2989 / 1702 / 1106 / 181 |
+| Comments as a share of non-blank lines | **39.4%** |
+| Functions | 41 |
+| Longest function | `start()` 169 lines (115 code lines) |
+| Next longest | `acceptLoop()` 163, `parseFrames()` 114, `drainInputThenClose()` 113 |
+| `Conn` fields | 23 |
+| `SubReactor` methods | 32 |
+| `ServerStats` counters | 22 |
+| Call sites of `closeConn` / `parkClose` / `teardownClosed` | 26 (excluding declarations) |
+| Distinct close-reason string literals (`const char*`) | 14 |
+| Direct `epoll_ctl` calls | 10 |
+| References to `closing` / `pendingBytes` / `isClosed` | 35 / 25 / 16 |
 
-注释率是这份代码最诚实的度量：**每 2.5 行代码配 1 行注释**，说明作者在持续用散文补偿结构缺失的表达力。这不是坏习惯——它让这个文件比同规模 C++ 可读得多——但它是一个信号：注释在承担本应由类型承担的工作。
-
----
-
-## 2. 分层视图
-
-| 层 | 行范围 | 内容 | 公开程度 |
-|---|---|---|---|
-| L0 协议编解码 | 46–97 | `FRAME_MAGIC` / `writeFrameHeader` / `pongFrame` / `encodeFrameInto` | `namespace industrial` 全局可见 |
-| L1 基础设施 | 99–234 | `FdGuard`、`RingBuffer` | 全局可见 |
-| L2 观测 | 236–295 | `ServerStats`（22 个 atomic） | 全局可见 |
-| L3 连接状态 | 297–486 | `SendResult`、`Admission`、`Conn`、`DrainOutcome`、`ClosedConn` | 全局可见 |
-| L4 反应堆 | 488–620 + 882–2396 | `SubReactor` 声明 + 实现 | 全局可见（注释写"internal interface"） |
-| L5 服务器 | 622–880 + 2398–2988 | `MultiReactorServer` | 公开 API |
-
-### 2.1 L3/L4 边界是名义上的
-
-`Conn` 的 23 个字段按归属可分为四组：
-
-| 组 | 字段 | 数量 | 归属 |
-|---|---|---|---|
-| 标识 | `id` `fd` `peer` `owner` | 4 | 服务器 / 反应堆 |
-| IO 缓冲 | `rbuf` `wbuf` `writeArmed` `sendFrameRemain` | 4 | 反应堆线程独占 |
-| **关闭状态机** | `closing` `finSent` `deferredRound` `closeInputBytes` `drainReadBytes` `peerClosed` `closeStartedAtMs` `finSentAtMs` | **8** | 反应堆线程独占（`closing` 例外，跨线程读） |
-| **调度 + 配额** | `readPending` `readNext` `readPrev` `pendingBytes` `admission` `isClosed` | **6** | 反应堆 + 跨线程 |
-
-**8 + 6 = 14 个字段（61%）不是连接本身的属性，是 `SubReactor` 状态机的寄存器。** `Conn` 因此既不是数据对象也不是行为对象，它是"被结构体化的调用栈"。
-
-后果可度量：`Conn` 每增加一个字段，`SubReactor` 的 5 个关闭函数都要重新审一遍。R8-1（`unregisterConn` 清 `closing`）之所以能成为一个真实缺陷，正是因为 `closing` 的生命周期跨越了两个类的边界，而没有任何一处代码同时拥有它的全部写入点。
+The comment ratio is the most honest measurement here: **one comment line per 2.5 lines of
+code**, which says the author keeps compensating in prose for what the structure cannot
+express. That is not a bad habit — it makes this file far more readable than C++ of its size
+usually is — but it is a signal: the comments are doing work that types should be doing.
 
 ---
 
-## 3. 依赖方向：L4 ↔ L5 循环
+## 2. The layering
 
-名义方向是 L5 → L4。实际存在反向边：
+| Layer | Lines | Contents | Visibility |
+|---|---|---|---|
+| L0 protocol codec | 46–97 | `FRAME_MAGIC` / `writeFrameHeader` / `pongFrame` / `encodeFrameInto` | visible across `namespace industrial` |
+| L1 infrastructure | 99–234 | `FdGuard`, `RingBuffer` | visible |
+| L2 observability | 236–295 | `ServerStats` (22 atomics) | visible |
+| L3 connection state | 297–486 | `SendResult`, `Admission`, `Conn`, `DrainOutcome`, `ClosedConn` | visible |
+| L4 reactor | 488–620 + 882–2396 | `SubReactor` declaration + implementation | visible (the comment says "internal interface") |
+| L5 server | 622–880 + 2398–2988 | `MultiReactorServer` | public API |
+
+### 2.1 The L3/L4 boundary is nominal
+
+`Conn`'s 23 fields fall into four groups by ownership:
+
+| Group | Fields | Count | Owner |
+|---|---|---|---|
+| Identity | `id` `fd` `peer` `owner` | 4 | server / reactor |
+| IO buffers | `rbuf` `wbuf` `writeArmed` `sendFrameRemain` | 4 | reactor thread only |
+| **Close state machine** | `closing` `finSent` `deferredRound` `closeInputBytes` `drainReadBytes` `peerClosed` `closeStartedAtMs` `finSentAtMs` | **8** | reactor thread only (`closing` is the exception: read cross-thread) |
+| **Scheduling + quota** | `readPending` `readNext` `readPrev` `pendingBytes` `admission` `isClosed` | **6** | reactor + cross-thread |
+
+**8 + 6 = 14 fields (61%) are not properties of a connection at all; they are registers of
+`SubReactor`'s state machine.** `Conn` is therefore neither a data object nor a behaviour
+object — it is a call stack turned into a struct.
+
+The consequence is measurable: every new `Conn` field means re-reading `SubReactor`'s five
+close functions. R8-1 (clearing `closing` in `unregisterConn`) could become a real defect
+precisely because `closing`'s lifetime crosses the boundary between the two classes, and no
+single piece of code owns all of its write sites.
+
+---
+
+## 3. Dependency direction: the L4 ↔ L5 cycle
+
+The nominal direction is L5 → L4. The reverse edge exists too:
 
 ```
-MultiReactorServer ──owns──> SubReactor        (正向：reactors_)
-SubReactor ──server_──────> MultiReactorServer (反向：裸指针 + friend)
-Conn ──owner──────────────> SubReactor         (L3 → L4 反向)
+MultiReactorServer ──owns──> SubReactor        (forward: reactors_)
+SubReactor ──server_──────> MultiReactorServer (reverse: raw pointer + friend)
+Conn ──owner──────────────> SubReactor         (L3 → L4, also reverse)
 ```
 
-`SubReactor` 通过 `friend class SubReactor`（L794）直接访问 L5 的私有成员：
+`SubReactor` reaches L5's private members directly via `friend class SubReactor` (L794):
 
-| 被访问的 L5 私有成员 | 访问点 |
+| L5 private member reached | Access point |
 |---|---|
-| `server_->cfg_` | `submitNewConnection`、`drainWbufToSocket`、`parseFrames`（PONG 配额） |
-| `server_->stats_`（经 `statsRef()`） | 45 处 |
-| `server_->msgHandler_` / `stateHandler_` / `closeHandler_` | `parseFrames`、`flushCloseCallbacks` |
-| `server_->onConnectionOpened/Closed` | 注册 / 注销 |
+| `server_->cfg_` | `submitNewConnection`, `drainWbufToSocket`, `parseFrames` (PONG quota) |
+| `server_->stats_` (via `statsRef()`) | 45 sites |
+| `server_->msgHandler_` / `stateHandler_` / `closeHandler_` | `parseFrames`, `flushCloseCallbacks` |
+| `server_->onConnectionOpened/Closed` | registration / deregistration |
 
-也就是说：**这两个类在结构上是同一个组件，只是被切成两块写。** 这不是"故意设计的紧耦合"，而是没有被命名的中间概念——一个"反应堆运行上下文"（只读配置 + 计数器 + 回调 + 连接注册表）缺失了。
+In other words: **these two classes are structurally one component, cut into two pieces for
+writing.** This is not "deliberate tight coupling"; it is a missing intermediate concept — a
+"reactor run context" (read-only config + counters + callbacks + connection registry) that
+was never named.
 
-补上这个概念后，`friend` 可以取消，L4 只依赖一个 6 成员的只读结构，测试也能在没有 `MultiReactorServer` 的情况下构造反应堆。
+Once that concept exists, the `friend` can go, L4 depends on a six-member read-only struct,
+and the reactor becomes constructible in a test without a `MultiReactorServer`.
 
 ---
 
-## 4. 关闭协议：最贵的那部分
+## 4. The close protocol: the expensive part
 
-### 4.1 现状
+### 4.1 As it stands
 
-**状态变量（7 个 + 1 个互斥标志）**
+**State variables (7 plus one mutual-exclusion flag)**
 
-| 变量 | 类型 | 语义 |
+| Variable | Type | Meaning |
 |---|---|---|
-| `isClosed` | `atomic<bool>` | 已从两个注册表摘除 |
-| `closing` | `atomic<bool>` | 已请求优雅关闭，拒绝新提交 |
-| `finSent` | `bool` | `shutdown(SHUT_WR)` 已返回 |
-| `deferredRound` | `enum{None,Close,PeerClosed}` | 谁欠一个队列轮次 |
-| `closeInputBytes` | `int64_t` | 关闭时仍欠对端的输入字节预算 |
-| `drainReadBytes` | `size_t` | 本轮读取字节数（计费） |
-| `peerClosed` | `bool` | 已收到对端 FIN |
+| `isClosed` | `atomic<bool>` | removed from both registries |
+| `closing` | `atomic<bool>` | graceful close requested, new submissions refused |
+| `finSent` | `bool` | `shutdown(SHUT_WR)` has returned |
+| `deferredRound` | `enum{None,Close,PeerClosed}` | who owes a queue round |
+| `closeInputBytes` | `int64_t` | input still owed to the peer at close time |
+| `drainReadBytes` | `size_t` | bytes read this round (billing) |
+| `peerClosed` | `bool` | the peer's FIN has arrived |
 
-**转移函数（5 个，互相调用）**
+**Transition functions (5, calling each other)**
 
 ```
 closeConn ──> parkClose ──> drainWbufToSocket
     │              └──────> tryBeginWriteShutdown
     └──────────> teardownClosed
 
-drainInputThenClose ──> handleRead ──> finishPeerClosed ──> enqueue(自身)
+drainInputThenClose ──> handleRead ──> finishPeerClosed ──> enqueue(itself)
                                                 └────────> teardownClosed
 handleWrite ──> drainWbufToSocket / finishPeerClosed
 ```
 
-**入口（26 个）**：`closeConn` 20 处、`parkClose` 8 处、`teardownClosed` 10 处（有重叠，因为前两者内部会调到后者）。
+**Entry points (26)**: 20 in `closeConn`, 8 in `parkClose`, 10 in `teardownClosed` (they
+overlap, because the first two call the third internally).
 
-### 4.2 为什么这是架构问题而不是实现问题
+### 4.2 Why this is architectural rather than an implementation problem
 
-三条证据，全部来自仓库自己的记录：
+Three pieces of evidence, all from the repository's own records:
 
-1. `Conn` 里 `deferredRound` 的注释原文：「One bool cannot say which, and conflating them cost the peer its last answer」——**一个字段被拆成两个值，是因为一个 bool 表达不了两种"欠轮次"的语义**。这是状态建模问题。
-2. `drainInputThenClose` 的注释原文：「Charging `served * FRAME_HEADER_SIZE` made this a frame counter…」——**预算的单位曾经错了一个量级（帧 vs 字节）**，因为预算本身是个裸 `int64_t`，没有类型保护。
-3. 8 轮评审里，case E（0/229432 字节）、case F（11/22 字节）、P0-5（对端半关连接被 RST）、R7-1（close 与 FIN 同读时吞掉刚排队的回复）——**四个独立缺陷，同一个状态机**。
+1. The comment on `Conn::deferredRound` reads: "One bool cannot say which, and conflating
+   them cost the peer its last answer" — **one field had to be split into two values because
+   one bool cannot express two different senses of "owing a round"**. That is state modelling.
+2. The comment in `drainInputThenClose` reads: "Charging `served * FRAME_HEADER_SIZE` made
+   this a frame counter…" — **the budget's unit was once wrong by an order of magnitude
+   (frames vs bytes)**, because the budget was a bare `int64_t` with no type protection.
+3. Across eight rounds: case E (0/229432 bytes), case F (11/22 bytes), P0-5 (a half-closed
+   peer reset), R7-1 (a reply queued just as close and FIN were read together, swallowed) —
+   **four independent defects, one state machine**.
 
-缺陷密度与状态变量数正相关，这在数据上是可见的：关闭协议占全部代码约 18%（约 300 行），却占了 8 轮评审中 5 轮的 P0/P1 条目。
+Defect density correlates with the number of state variables, and the data shows it: the close
+protocol is about 18% of the code (~300 lines) but accounts for the P0/P1 entries of five of
+the eight review rounds.
 
-### 4.3 建议的结构
+### 4.3 The suggested structure
 
-把 7 个字段收进一个子结构，并把转移集中到一个纯函数：
+Gather the seven fields into one sub-struct and concentrate the transitions in a pure function:
 
 ```
 struct CloseState {
     Phase phase;              // Open | Closing | FinSent | Torn
     bool  peerFinSeen;
     Round round;              // None | Close | PeerClosed
-    Budget inputBudget;       // 强类型，内部是字节
+    Budget inputBudget;       // strongly typed, bytes inside
     int64_t startedAtMs, finSentAtMs;
 };
 
-// 纯函数，不碰 socket、不碰 epoll、不碰 stats
+// pure: touches no socket, no epoll, no stats
 Transition decide(const CloseState&, CloseEvent);
 ```
 
-`CloseEvent` 枚举只有 6 个值：`AppClose` / `PeerFin` / `DrainDone` / `BudgetSpent` / `LingerExpired` / `IoError`。
-26 个入口退化为 6 个事件投递点。转移表可以在 `verify/` 里直接单测——**不需要 socket、不需要线程、不需要 epoll**，因为它是纯函数。
+`CloseEvent` has only six values: `AppClose` / `PeerFin` / `DrainDone` / `BudgetSpent` /
+`LingerExpired` / `IoError`. The 26 entry points collapse into 6 event delivery points. The
+transition table can be unit-tested directly in `verify/` — **no socket, no thread, no
+epoll** — because it is a pure function.
 
-这是本文最有价值的单条建议：它把一个只能靠 `verify/` 里的 33 种配置、几十秒一轮的集成测试来守的状态机，变成一个毫秒级可穷举的表。
+This is the single most valuable recommendation in this document: it turns a state machine
+that could only be guarded by 33 configurations of a several-second integration suite into a
+table that can be enumerated in milliseconds.
+
+> When it was implemented, the table turned out to be larger than the "8 states × 6 events"
+> sketched in R3 below: 4 phases × 6 events × every fact combination = 2304 cells. See
+> `verify/close_state_machine.cpp`.
 
 ---
 
-## 5. 四重连接索引与全局读锁
+## 5. Four connection indexes and a global read lock
 
-同一个"有多少连接"的事实，存在四个来源：
+The same fact — "how many connections are there" — has four sources:
 
-| 来源 | 位置 | 锁 |
+| Source | Location | Lock |
 |---|---|---|
-| `MultiReactorServer::conns_` | L874 | `connsMutex_`（`shared_mutex`） |
-| `SubReactor::conns_` | L617 | 无（worker 独占） |
-| `SubReactor::fdIndex_` | L616 | 无（worker 独占） |
-| `admitted_` | L868 | `atomic<size_t>`（`Admission` RAII） |
+| `MultiReactorServer::conns_` | L874 | `connsMutex_` (`shared_mutex`) |
+| `SubReactor::conns_` | L617 | none (worker-exclusive) |
+| `SubReactor::fdIndex_` | L616 | none (worker-exclusive) |
+| `admitted_` | L868 | `atomic<size_t>` (`Admission` RAII) |
 
-四个来源必须一致，靠 `onConnectionOpened` / `onConnectionClosed` 两次回调维持。这是**架构上的重复真相**（duplicated source of truth），代价具体为：
+The four must agree, kept in step by two callbacks: `onConnectionOpened` /
+`onConnectionClosed`. This is **a duplicated source of truth**, and the cost is concrete:
 
-- `sendTo()` 每次调用做：`isRunning()` → `submissionMutex_` 共享锁 → `isRunning()` → `connsMutex_` 共享锁 → `conns_.find()` → `shared_ptr` 拷贝（原子 ++）→ `pendingBytes` CAS → `submitSend` → 任务里 `shared_ptr` 析构（原子 --）。
-- **多生产者路径上，每一次发送都要拿两把全局锁、做两次原子引用计数。** 这是这个服务器唯一的跨线程读热点。
-- 一致性靠回调维持，意味着"忘记调用 `onConnectionClosed`"是一个可静默的缺陷类别（`discardRejectedConn` 的注释就在描述这一类）。
+- Every `sendTo()` call does: `isRunning()` → shared lock on `submissionMutex_` →
+  `isRunning()` → shared lock on `connsMutex_` → `conns_.find()` → `shared_ptr` copy
+  (atomic ++) → `pendingBytes` CAS → `submitSend` → `shared_ptr` destruction in the task
+  (atomic --).
+- **On the multi-producer path, every send takes two global locks and does two atomic
+  refcount operations.** This is the server's only cross-thread read hotspot.
+- Consistency maintained by callbacks means "forgot to call `onConnectionClosed`" is a
+  silently-failing defect class (the comment on `discardRejectedConn` describes exactly this).
 
-**建议（需基准验证，不能凭推理改）**：
+**Recommendation (requires benchmark validation; do not change this by reasoning alone)**:
 
-1. 把 `id → SubReactor*` 作为主索引（无 `shared_ptr`），连接生命周期由 reactor 独占，`shared_ptr` 只在跨线程交接时使用。这样 `sendTo` 不再做两次原子 RMW。
-2. 索引按 `id & 15` 分 16 个 shard，每 shard 一把 `shared_mutex`，消掉全局读锁。
-3. 验证方式：`verify/bench_send.cpp` 与 `verify/bench_rx.cpp` 前后对比，8 生产者场景。项目规则要求"数字进 commit message"，这条必须遵守。
+1. Make `id → SubReactor*` the primary index (no `shared_ptr`); the reactor owns the
+   connection's lifetime, and `shared_ptr` is used only for cross-thread hand-off. Then
+   `sendTo` stops doing two atomic RMWs.
+2. Shard the index 16 ways on `id & 15`, one `shared_mutex` per shard, removing the global
+   read lock.
+3. Verification: before/after with `verify/bench_send.cpp` and `verify/bench_rx.cpp`, in an
+   8-producer scenario. Project rules require the numbers in the commit message; this one
+   must comply.
 
 ---
 
-## 6. 单文件契约与内部边界
+## 6. The one-file contract and internal boundaries
 
-README 第一段就是这个项目的产品定义：
+The first paragraph of the README is this project's product definition:
 
 > copy `include/tcp-server-mt.h` into your project. No `.cpp`, nothing to link.
 
-所以**拆文件不是选项**。但单文件的代价是可度量的，且可以不付：
+So **splitting the file is not an option**. But the costs of one file are measurable, and most
+of them need not be paid:
 
-| 代价 | 是否可缓解 | 缓解方式 |
+| Cost | Mitigable? | How |
 |---|---|---|
-| 每个包含者编译约 3000 行 + 全套系统头 | 部分 | 提供 `INDUSTRIAL_TCP_DECL_ONLY` 编译开关，只含声明段 |
-| 无法按层单测 | 是 | `detail` 命名空间隔离 L0–L2，测试直接 include 后访问 |
-| 公开符号面 ~20 个，全部落在 `industrial::` | 是 | L0–L3 的多数符号移入 `industrial::detail` |
-| 无 TU 边界，无法链接期隔离 | 否 | 接受 |
+| Every includer compiles ~3000 lines plus the full set of system headers | partly | offer an `INDUSTRIAL_TCP_DECL_ONLY` switch that pulls in declarations only |
+| No per-layer unit testing | yes | isolate L0–L2 in a `detail` namespace; tests include the header and reach in |
+| ~20 public symbols, all under `industrial::` | yes | move most L0–L3 symbols into `industrial::detail` |
+| No TU boundary, no link-time isolation | no | accept it |
 
-**公开面收窄清单**（建议保留在 `industrial::` 顶层）：
+**The list to keep at the top level of `industrial::`**:
 
 ```
 MultiReactorServer, Config, ServerStats, SendResult, FrameType,
 FRAME_MAGIC, MAX_FRAME_PAYLOAD, nowMs
 ```
 
-移入 `detail`：`FdGuard`、`RingBuffer`、`Admission`、`Conn`、`ClosedConn`、`DrainOutcome`、`writeFrameHeader`、`pongFrame`、`encodeFrameInto`。
+Move into `detail`: `FdGuard`, `RingBuffer`, `Admission`, `Conn`, `ClosedConn`,
+`DrainOutcome`, `writeFrameHeader`, `pongFrame`, `encodeFrameInto`.
 
-收益：使用者误用内部类型的可能性归零；`Conn` 的 23 个字段从"公共契约"降级为"实现细节"，可以自由重构。
+Benefit: the chance of a caller misusing an internal type drops to zero, and `Conn`'s 23
+fields go from "public contract" to "implementation detail", free to be refactored.
+
+> In the event, `encodeFrameInto` and `writeFrameHeader` stayed public — every suite builds
+> frames with them, and `idle_semantics` needs the header writer for a half frame. See
+> `r4-r6-record.md` §R5.
 
 ---
 
-## 7. 其他结构性发现
+## 7. Other structural findings
 
-| ID | 位置 | 问题 | 影响 | 建议 |
+| ID | Location | Problem | Impact | Suggestion |
 |---|---|---|---|---|
-| S1 | L2201 | `finishClose(shared_ptr&)` 函数体只有 `c.reset()` | 空抽象层，1 个调用点（L2214），读者要跳过去才发现什么也没做 | 内联删除 |
-| S2 | L450–452 | `readPending` / `readNext` / `readPrev` 是侵入式链表节点，直接挂在 `Conn` 上 | 调度器状态污染连接对象；`Conn` 不可重定位 | 抽 `ReadQueue`，节点仍内联但语义归位 |
-| S3 | 26 处 | 关闭原因用 `const char*` 字面量，14 种取值 | 不可穷举、不可计数、测试无法断言 | `enum class CloseReason` + `toString()` |
-| S4 | L237–295 | 22 个计数器无快照/差分类型 | README 承诺"每次变更记录 before/after"，但没有工具支撑 | `struct StatsSnapshot` + `diff()` |
-| S5 | L2469 | `start()` 169 行，承担 8 件事 | 唯一的启动路径，也是最难改的函数 | 拆 `validate()` / `raiseFdLimit()` / `bind()` / `spawnReactors()` / `handshake()` |
-| S6 | L2704 | `acceptLoop()` 163 行，承担 7 件事 | fd 建立、accept 循环、准入、socket 调优、peer 格式化、reactor 选择、收尾 | 拆 `setupEpoll()` / `acceptBatch()` / `formatPeer()` / `tuneSocket()` |
-| S7 | L744–747 | `failWorkerForTest` / `failAcceptForTest` 是生产类的 public 成员 | 测试钩子进入公共 API | 注入 `FaultHooks` 接口，默认空实现 |
-| S8 | L859 | `thread_local callbackServer_` + `CallbackScope` 是隐式全局态 | `SubReactor::stop()`、`~MultiReactorServer()`、`start()` 各自读原始指针判断"是否在回调里" | 收敛为 `Server::isInsideCallback()` 单一 API |
-| S9 | 全线 | `noexcept` + `catch(...)` 吞掉异常，失败只进计数器 | 生产环境无法诊断，只有 22 个数字 | 单一 `onInternalFault(code)` 钩子（默认计数，可选日志） |
-| S10 | L2499 | `start()` 就地修改 `cfg_.maxPendingBytes` | 配置从"不可变输入"变成"可变状态" | `ResolvedConfig` 独立结构（`resolvedReactorCount()` 已是正确先例） |
+| S1 | L2201 | `finishClose(shared_ptr&)` has the body `c.reset()` | an empty abstraction layer, one call site (L2214); the reader has to jump there to discover it does nothing | inline and delete |
+| S2 | L450–452 | `readPending` / `readNext` / `readPrev` are intrusive list nodes hanging directly off `Conn` | scheduler state pollutes the connection object; `Conn` cannot be relocated | extract a `ReadQueue`, nodes still inline but their meaning restored |
+| S3 | 26 sites | close reasons are `const char*` literals with 14 distinct values | not enumerable, not countable, not assertable in tests | `enum class CloseReason` + `toString()` |
+| S4 | L237–295 | 22 counters with no snapshot or diff type | the README promises "record before/after per change" with no tool behind it | `struct StatsSnapshot` + `diff()` |
+| S5 | L2469 | `start()` is 169 lines doing 8 things | the only startup path and the hardest function to change | split into `validate()` / `raiseFdLimit()` / `bind()` / `spawnReactors()` / `handshake()` |
+| S6 | L2704 | `acceptLoop()` is 163 lines doing 7 things | fd setup, accept loop, admission, socket tuning, peer formatting, reactor choice, teardown | split into `setupEpoll()` / `acceptBatch()` / `formatPeer()` / `tuneSocket()` |
+| S7 | L744–747 | `failWorkerForTest` / `failAcceptForTest` are public members of a production class | test hooks leak into the public API | inject a `FaultHooks` interface with a default no-op |
+| S8 | L859 | `thread_local callbackServer_` + `CallbackScope` is implicit global state | `SubReactor::stop()`, `~MultiReactorServer()` and `start()` each read a raw pointer to decide "am I inside a callback" | converge on a single `Server::isInsideCallback()` |
+| S9 | throughout | `noexcept` + `catch(...)` swallow exceptions; failures only reach counters | undiagnosable in production, 22 numbers and nothing else | a single `onInternalFault(code)` hook (count by default, optional logging) |
+| S10 | L2499 | `start()` mutates `cfg_.maxPendingBytes` in place | configuration goes from immutable input to mutable state | a separate `ResolvedConfig` (the already-correct precedent is `resolvedReactorCount()`) |
 
 ---
 
-## 8. 优先级路线图
+## 8. Priority roadmap
 
-排序依据：**风险降低 / 改动成本**。每条都给出可在 Linux 上执行的验证判据，遵循项目"无运行时证据不落结论"的规则。
+Ordered by **risk reduction / cost of change**. Each item carries a verification criterion that
+can be executed on Linux, following the project rule that nothing is concluded without
+runtime evidence.
 
-### R1 — 类型化关闭原因（低风险，半天）
+### R1 — typed close reasons (low risk, half a day)
 
-`const char*` → `enum class CloseReason`。14 种取值改为枚举，`flushCloseCallbacks` 里转字符串。
-验证：现有 9 个 suite 全绿；`grep -c '"' closeConn` 应为 0。
+`const char*` → `enum class CloseReason`. The 14 values become an enum, stringified in
+`flushCloseCallbacks`.
+Verify: the nine existing suites stay green; `grep -c '"' closeConn` should be 0.
 
-### R2 — 快照与差分（低风险，半天）
+### R2 — snapshot and diff (low risk, half a day)
 
-`StatsSnapshot` + `diff()`。
-验证：`verify/config_budget.cpp` 增加一条断言：任一次 `diff()` 的 `accepted - closed` 等于 `connectionCount()`。
+`StatsSnapshot` + `diff()`.
+Verify: add an assertion to `verify/config_budget.cpp` that `accepted - closed` from any
+`diff()` equals `connectionCount()`.
 
-### R3 — 关闭状态机集中化（中风险，2–3 天，收益最大）
+### R3 — centralize the close state machine (medium risk, 2–3 days, largest payoff)
 
-`CloseState` 子结构 + `decide()` 纯函数 + `CloseEvent` 枚举。
-分两步走：
-1. 先只做**提取**（字段搬进子结构，行为不变），跑全部 33 种配置；
-2. 再把 5 个函数体改写为"投递事件 + 执行返回的 action"，逐步替换。
+`CloseState` sub-struct + `decide()` pure function + `CloseEvent` enum.
+In two steps:
+1. **Extraction only** (fields move into the sub-struct, behaviour unchanged), run all 33
+   configurations;
+2. Then rewrite the five function bodies as "deliver an event, execute the returned action",
+   one at a time.
 
-验证：新增 `verify/close_state_machine.cpp`，对 `decide()` 做穷举（8 状态 × 6 事件 = 48 格），断言每一格要么是合法转移，要么明确是非法组合。这是这个项目第一次能用毫秒级测试覆盖关闭协议。
+Verify: a new `verify/close_state_machine.cpp` enumerating `decide()` exhaustively,
+asserting that every cell is either a legal transition or explicitly an illegal combination.
+This is the first time the project can cover the close protocol with a millisecond-scale test.
 
-### R4 — 拆 `start()` / `acceptLoop()`（中风险，1 天）
+### R4 — split `start()` / `acceptLoop()` (medium risk, 1 day)
 
-纯机械拆分，无行为变化。
-验证：`verify/fault_injection.cpp`（启动失败注入）+ `config_budget.cpp` 全绿。
+Purely mechanical, no behaviour change.
+Verify: `verify/fault_injection.cpp` (startup-failure injection) + `config_budget.cpp` green.
 
-### R5 — 公开面收窄（低风险，半天）
+### R5 — narrow the public surface (low risk, half a day)
 
-`detail` 命名空间。
-验证：`cmake --build` 全绿；`verify/evidence/probe_api_contract.cpp` 需要同步更新——这条 probe 的存在本身就是这个改动的验收标准。
+A `detail` namespace.
+Verify: `cmake --build` green; `verify/evidence/probe_api_contract.cpp` needs updating — the
+existence of that probe is itself the acceptance criterion for this change.
 
-### R6 — 索引重构（中高风险，需基准，2–3 天）
+### R6 — index refactor (medium-high risk, needs a benchmark, 2–3 days)
 
-分片 + 去 `shared_ptr`。
-验证：`verify/bench_send.cpp` 8 生产者吞吐与 p99 前后对比，数字进 commit message。**没有数字就不合入**。
+Sharding plus dropping the `shared_ptr`.
+Verify: 8-producer throughput and p99 from `verify/bench_send.cpp`, before and after, with the
+numbers in the commit message. **No numbers, no merge.**
 
 ---
 
-## 9. 明确不建议做的
+## 9. Explicitly not recommended
 
-| 提案 | 否决理由 |
+| Proposal | Why not |
 |---|---|
-| 拆成 `.h` + `.cpp` 或多头文件 | 破坏 README 的产品承诺（copy one file），这是这个库存在的理由 |
-| 引入 asio / libevent 抽象 | README 明确 no third-party dependencies；抽象层的收益抵不过失去的确定性 |
-| `Conn` 改成 POD 传给 handler | `sendTo` 依赖 `Conn::owner` 直达路径，改造成本远超收益 |
-| `RingBuffer` 改无锁 SPSC | `wbuf` 单线程独占，没有第二个生产者，无收益 |
-| 用 `std::expected` 替换 `SendResult` | C++17 目标，且 `SendResult` 的 6 个值已经是充分建模 |
-| 全面日志化 | 这个库的定位是"零依赖单文件"，引入日志设施违背定位；S9 的钩子式方案足够 |
+| Split into `.h` + `.cpp` or several headers | breaks the README's product promise (copy one file), which is the reason this library exists |
+| Introduce an asio / libevent abstraction | the README says no third-party dependencies; the abstraction's benefit does not repay the determinism it costs |
+| Turn `Conn` into a POD passed to handlers | `sendTo` depends on the direct `Conn::owner` path; the rework costs far more than it returns |
+| Make `RingBuffer` a lock-free SPSC | `wbuf` is single-thread-exclusive with no second producer; no gain |
+| Replace `SendResult` with `std::expected` | C++17 target, and `SendResult`'s six values are already sufficient modelling |
+| Log everything | this library is positioned as "zero-dependency single file"; logging infrastructure contradicts that, and S9's hook covers it |
 
 ---
 
-## 10. 一句话总结
+## 10. In one sentence
 
-这个文件的代码质量显著高于它的结构质量。注释、不变量说明、单一退出路径的纪律都在平均线以上；欠的是**把已经在注释里写清楚的状态机，翻译成类型**。8 轮评审已经用 4 个真实缺陷为这件事付过账了——R3 是唯一能把这份账结掉的改动。
+The code quality of this file is markedly higher than its structural quality. The comments,
+the invariant statements and the single-exit discipline are all above average; what is
+missing is **translating the state machine already described in prose into types**. Eight
+review rounds have already paid for that with four real defects — R3 is the one change that
+settles the bill.

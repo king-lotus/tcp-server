@@ -1,68 +1,95 @@
-# `FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD` 与缓存
+# `FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD` and the cache
 
-问题：`8 + 65536 = 65544`，比 16 页（65536）多 8 字节。这多出来的一点点，对缓存有影响吗？
+The question: `8 + 65536 = 65544`, eight bytes past sixteen pages (65536). Does that little
+excess cost anything in cache?
 
-结论：**没有，因为那 8 字节根本到不了缓存。** 测量脚本：`verify/evidence/probe_stride_cache.cpp`。
+The answer: **no, because those eight bytes never reach the cache.** Measurement:
+`verify/evidence/probe_stride_cache.cpp`.
 
 ---
 
-## 1. 分配器先把 +8 吃掉了
+## 1. The allocator eats the +8 first
 
-连接缓冲区是 `std::vector<uint8_t>`，走 `operator new`。glibc 的 chunk 大小必须 16 字节对齐，且要带 8 字节头：
+Connection buffers are `std::vector<uint8_t>`, so they go through `operator new`. A glibc
+chunk has to be 16-byte aligned and carries an 8-byte header:
 
-| 请求容量 | chunk = cap + 8 | 对齐到 16 | 实测相邻步长 |
+| Requested capacity | chunk = cap + 8 | aligned to 16 | measured stride |
 |---|---|---|---|
 | 65544 | 65552 | 65552 | **65552** |
 | 65536 | 65544 | 65552 | **65552** |
 | 65600 | 65608 | 65616 | 65616 |
 
-`cap=65544` 和 `cap=65536` 产生**完全相同的步长**。那 8 字节被 16 字节对齐精确吸收，缓存看到的地址序列一模一样。
+`cap=65544` and `cap=65536` produce **exactly the same stride**. The eight bytes are
+absorbed precisely by 16-byte alignment, and the cache sees an identical address sequence.
 
-所以"稍微比 pagesize 多一点"这个前提，在缓存层面不成立——它不是"多一点"，它是"一样"。
+So the premise — "slightly more than a page" — does not hold at the cache level. It is not
+"slightly more"; it is "the same".
 
-## 2. 而且两种情况下都没有集冲突
+## 2. And neither case aliases
 
-x86-64 的 L1 集索引是地址位 `[11:6]`。步长是 4096 的整数倍时，每个缓冲区落在同一个集上，8 路组相联就是 8 条常驻、其余每轮全部驱逐。
+On x86-64 the L1 set index is address bits `[11:6]`. When the stride is a multiple of 4096,
+every buffer lands on the same set: with 8-way associativity that is 8 lines resident and
+the rest evicted on every pass.
 
-实测步长 65552，`65552 % 4096 = 16`，不是页的整数倍。缓冲区 k 的集索引按 `floor(k·0.25)` 前进，256 个缓冲区走遍全部 64 个集。**没有别名。**
+The measured stride is 65552, and `65552 % 4096 = 16` — not a page multiple. The set index
+for buffer k advances by `floor(k·0.25)`, so 256 buffers cover all 64 sets. **No aliasing.**
 
-有一点值得记住：**想要"整齐"的 64 KiB 容量并不能换来对齐**，因为分配器照样把它变成 65552。这个方向的优化是无效的。
+One thing worth remembering: **asking for a tidy 64 KiB capacity buys no alignment**,
+because the allocator rewrites it to 65552 anyway. Optimising in that direction is wasted
+work.
 
-## 3. 那 8 字节真正买到的东西
+## 3. What the eight bytes actually buy
 
-`MAX_FRAME_PAYLOAD` 是 65536，一个满帧是 8 字节头 + 65536 载荷 = 65544。缓冲区刚好容纳一个满帧。
+`MAX_FRAME_PAYLOAD` is 65536, so a full frame is an 8-byte header plus 65536 bytes of
+payload = 65544. The buffer holds exactly one full frame.
 
-把容量向下取整到 65536，会让"最大尺寸的回复"永远写不进去——在一条空闲连接上，永远。`Config::wbufCapacity` 的注释已经写了这件事，它把这个值称作 floor 而不是巧合。
+Rounding the capacity down to 65536 would make the largest possible reply impossible to
+write — on an idle connection, forever. The comment on `Config::wbufCapacity` already says
+this; it calls the value a floor rather than a coincidence.
 
-## 4. 唯一真实的缓存痕迹：相邻缓冲区共享一条缓存行
+## 4. The one real cache artefact: adjacent buffers share a line
 
-`65552 % 64 = 16`。缓冲区 k 的尾部 16 字节和缓冲区 k+1 的头部 48 字节在同一条 64 字节行上。两个 reactor 线程如果同时写这条行，就是伪共享。
+`65552 % 64 = 16`. The last 16 bytes of buffer k and the first 48 bytes of buffer k+1 sit on
+the same 64-byte line. Two reactor threads writing that line concurrently is false sharing.
 
-实测（两线程各 200 万次写入，同一行 vs 相隔一行的不同行）：
+Measured (two threads, 2 million writes each, same line versus lines a row apart):
 
-| 场景 | ns/op |
+| Case | ns/op |
 |---|---|
-| 同一缓存行 | 2.01 |
-| 不同缓存行 | 1.34 |
+| Same cache line | 2.01 |
+| Different cache lines | 1.34 |
 
-**共享一行慢约 50%。**
+**Sharing the line is about 50% slower per operation.**
 
-但这个代价在真实路径上几乎不会发生：`rbuf` 是顺序写入的，那条边界行只有在环形缓冲区绕回末尾时才会被碰到——每 64 KiB 流量一次。`wbuf` 同理。所以它是"存在但基本不触发"的那一类。
+But that cost almost never materialises on the real path: `rbuf` is written sequentially, and
+the boundary line is only touched when the ring wraps to the end — once per 64 KiB of
+traffic. Same for `wbuf`. So it is real, and it almost never fires.
 
-顺带一个反例，也是这个探针差点骗过我的地方：如果两个缓冲区用两次 `emplace_back` 分别分配，堆会在中间留空洞（实测步长 65616 而不是 65552），两个指针根本不在同一行上——测试照样"通过"，只是什么都没测。C 段最后改成单块分配再按步长切片，才是真的。
+One counterexample, and the place this probe nearly fooled me: if the two buffers are
+allocated with two separate `emplace_back` calls, the heap leaves a gap between them
+(measured stride 65616 rather than 65552), and the two pointers are not on the same line at
+all — the test still "passes", having measured nothing. Section C only became real once it
+allocated one block and sliced it at the stride.
 
-## 5. 页数
+## 5. Page count
 
-65544 字节如果页对齐，确实跨 17 页。但缓冲区来自堆，不是每个连接一次 `mmap`：第 17 页由下一个 chunk 共用。
+If it were page-aligned, 65544 bytes would indeed span 17 pages. But the buffer comes from
+the heap, not from one `mmap` per connection: the seventeenth page is shared with the next
+chunk.
 
-实测 RSS：**128.70 KB/连接**，在 R3→R4→R5 的所有改动中一直没变。没有多出来的 4 KiB。
+Measured RSS: **128.70 KB per connection**, unchanged across every change from R3 through
+R5. No extra 4 KiB.
 
 ---
 
-## 建议
+## Recommendation
 
-**保持现状。** 没有任何测量支持改动它。
+**Leave it alone.** Nothing measured supports changing it.
 
-如果出于可读性想让它对齐到缓存行，可以取 `65600`（下一个 64 的倍数），代价是每连接 56 字节、一万连接 560 KB。但探针里 `65600` 那一行更快（1.62 vs 2.12 ns/line）这件事我**不打算当作理由**——步长 65616 和 65552 在集分布上没有结构性差别，这个差异更像堆布局的副产物，而且在服务器级基准里复现不出来。
+If you want cache-line alignment for its own sake, `65600` (the next multiple of 64) costs
+56 bytes per connection, 560 KB at ten thousand connections. But the probe's `65600` row
+being faster (1.62 vs 2.12 ns/line) is something I am **not willing to use as a reason** —
+strides 65616 and 65552 show no structural difference in set distribution, the gap looks
+like an artefact of heap layout, and it does not reproduce at server scale.
 
-要动这个数，前提是先有一个能分辨它的基准。目前没有。
+Changing this number requires a benchmark that can resolve it first. There isn't one.
