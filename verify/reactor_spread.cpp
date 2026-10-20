@@ -27,18 +27,12 @@
 // Build (Linux only):
 //   g++ -std=c++17 -Wall -Wextra -pthread -Iinclude verify/reactor_spread.cpp
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -46,20 +40,12 @@
 #include <thread>
 #include <vector>
 
-#include "tcp-server-mt.h"
+#include "harness.h"
 
 using industrial::FrameType;
-using industrial::MultiReactorServer;
 using industrial::ServerStats;
 
 namespace {
-
-int gFailures = 0;
-
-void expect(bool ok, const char* what) {
-    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++gFailures;
-}
 
 bool waitFor(int ms, const std::function<bool()>& done) {
     const auto deadline = std::chrono::steady_clock::now() +
@@ -69,40 +55,6 @@ bool waitFor(int ms, const std::function<bool()>& done) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return done();
-}
-
-int connectTo(uint16_t port) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in sa{};
-    sa.sin_family      = AF_INET;
-    sa.sin_port        = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-        ::close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-bool sendAll(int fd, const void* p, size_t n) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    size_t off = 0;
-    while (off < n) {
-        const ssize_t k = ::send(fd, b + off, n - off, 0);
-        if (k <= 0) {
-            if (k < 0 && errno == EINTR) continue;
-            return false;
-        }
-        off += static_cast<size_t>(k);
-    }
-    return true;
-}
-
-std::vector<uint8_t> frame(FrameType t, const void* p, size_t n) {
-    std::vector<uint8_t> f(industrial::FRAME_HEADER_SIZE + n);
-    industrial::encodeFrameInto(f.data(), t, p, n);
-    return f;
 }
 
 }  // namespace
@@ -115,7 +67,9 @@ int main() {
     if (const char* r = std::getenv("RS_REACTORS")) reactors = std::atoi(r);
     if (reactors < 1) reactors = 1;
 
-    MultiReactorServer::Config cfg;
+    std::printf("== %d connections over %d reactor(s) ==\n", kConnections, reactors);
+
+    industrial::MultiReactorServer::Config cfg;
     cfg.bindAddr      = "127.0.0.1";
     cfg.port          = 0;        // let the kernel choose; port() reports it
     cfg.numReactors   = reactors;
@@ -123,69 +77,59 @@ int main() {
     cfg.idleTimeoutMs = 60000;    // nothing here may end by a timer
     cfg.closeLingerMs = 300;
 
-    std::printf("== %d connections over %d reactor(s) ==\n",
-                kConnections, reactors);
-
-    MultiReactorServer server(cfg);
-
     std::mutex ownersMutex;
     std::map<uint64_t, std::thread::id> owners;   // connection -> its reactor
     std::atomic<int> framesHandled{0};
     std::atomic<int> closeCallbacks{0};
 
-    server.setMessageHandler([&](uint64_t id, const uint8_t*, size_t) {
-        std::lock_guard<std::mutex> lock(ownersMutex);
-        owners[id] = std::this_thread::get_id();
-        framesHandled.fetch_add(1);
-    });
-    server.setCloseHandler([&](uint64_t, const std::string&, const char*) {
-        closeCallbacks.fetch_add(1);
-    });
+    harness::Fixture server(
+        cfg,
+        [&](uint64_t id, const uint8_t*, size_t) {
+            std::lock_guard<std::mutex> lock(ownersMutex);
+            owners[id] = std::this_thread::get_id();
+            framesHandled.fetch_add(1);
+        },
+        [&](uint64_t, const std::string&, const char*) { closeCallbacks.fetch_add(1); });
 
-    if (!server.start()) {
-        expect(false, "start() ok");
-        return 1;
+    if (!server.started()) {
+        harness::expect(false, "start() ok");
+        return harness::finish();
     }
 
     // Port 0 means the kernel picked, so this is the only place the number
     // exists. A server that reports 0 here has connections going nowhere.
     const uint16_t port = server.port();
-    expect(port != 0, "port() reports the port the kernel chose");
+    harness::expect(port != 0, "port() reports the port the kernel chose");
 
-    std::vector<int> fds;
-    for (int i = 0; i < kConnections; ++i) {
-        const int fd = connectTo(port);
-        if (fd < 0) break;
-        fds.push_back(fd);
+    std::vector<harness::Peer> peers(kConnections);
+    int connected = 0;
+    for (auto& p : peers) {
+        if (!p.connect(port)) break;
+        ++connected;
     }
-    expect(static_cast<int>(fds.size()) == kConnections, "all clients connected");
-    if (static_cast<int>(fds.size()) != kConnections) {
-        for (int fd : fds) ::close(fd);
-        server.stop();
-        return 1;
-    }
+    harness::expect(connected == kConnections, "all clients connected");
+    if (connected != kConnections) return harness::finish();
 
     // One frame each: it registers each connection with a reactor and makes
     // that reactor run the handler, which is where the owner becomes visible.
-    const std::vector<uint8_t> request = frame(FrameType::DATA, "hi", 2);
     int sent = 0;
-    for (int fd : fds) {
-        if (sendAll(fd, request.data(), request.size())) ++sent;
+    for (auto& p : peers) {
+        if (p.send(FrameType::DATA, "hi", 2)) ++sent;
     }
-    expect(sent == kConnections, "one frame sent on every connection");
+    harness::expect(sent == kConnections, "one frame sent on every connection");
 
     const int expectedOwners = std::min(reactors, kConnections);
     waitFor(5000, [&] { return framesHandled.load() == kConnections; });
-    expect(framesHandled.load() == kConnections,
-           "every frame reached a handler");
+    harness::expect(framesHandled.load() == kConnections,
+                    "every frame reached a handler");
 
     std::map<std::thread::id, int> perThread;
     {
         std::lock_guard<std::mutex> lock(ownersMutex);
         for (const auto& kv : owners) ++perThread[kv.second];
     }
-    std::printf("      %zu connection(s) seen from %zu thread(s), expected %d:"
-                "\n", owners.size(), perThread.size(), expectedOwners);
+    std::printf("      %zu connection(s) seen from %zu thread(s), expected %d:\n",
+                owners.size(), perThread.size(), expectedOwners);
     for (const auto& kv : perThread) {
         std::printf("        thread %08zx handled %d\n",
                     std::hash<std::thread::id>{}(kv.first) & 0xffffffffu,
@@ -196,45 +140,44 @@ int main() {
     // per thread is not asserted -- a rejected connection advances the counter
     // without consuming a slot, and a test that forbids that would be
     // forbidding a documented behaviour.
-    expect(static_cast<int>(perThread.size()) == expectedOwners,
-           "connections are spread over min(reactors, connections) threads");
+    harness::expect(static_cast<int>(perThread.size()) == expectedOwners,
+                    "connections are spread over min(reactors, connections) threads");
 
     // Close every connection from the main thread, which owns none of them.
     // Each of these is therefore a cross-reactor submission, one per
     // connection, and a queue that silently drops them shows up as a
     // connection that never closes rather than as a crash.
-    const std::vector<uint64_t> ids = server.connectionIds();
-    expect(static_cast<int>(ids.size()) == kConnections,
-           "the registry holds every connection");
+    const std::vector<uint64_t> ids = server.server().connectionIds();
+    harness::expect(static_cast<int>(ids.size()) == kConnections,
+                    "the registry holds every connection");
     int accepted = 0;
     for (uint64_t id : ids) {
-        if (server.closeConnection(id)) ++accepted;
+        if (server.server().closeConnection(id)) ++accepted;
     }
-    expect(accepted == kConnections, "every close request was accepted");
+    harness::expect(accepted == kConnections, "every close request was accepted");
 
     // Our end has to go too, or each close waits out closeLingerMs.
-    for (int fd : fds) ::close(fd);
+    for (auto& p : peers) p.close();
 
-    expect(waitFor(5000, [&] { return server.connectionCount() == 0; }),
-           "every connection closed");
+    harness::expect(waitFor(5000, [&] { return server.server().connectionCount() == 0; }),
+                    "every connection closed");
     waitFor(2000, [&] { return closeCallbacks.load() == kConnections; });
 
     const ServerStats& s = server.stats();
-    expect(s.accepted.load() == static_cast<uint64_t>(kConnections),
-           "accepted counts each connection once");
-    expect(s.rejected.load() == 0, "nothing was rejected");
-    expect(s.reactorFailures.load() == 0, "no reactor failed");
-    expect(s.closeRequestsDropped.load() == 0, "no close request was dropped");
-    expect(s.queueDrops.load() == 0, "no queued task was dropped");
-    expect(closeCallbacks.load() == kConnections,
-           "every close ran its callback exactly once");
+    harness::expect(s.accepted.load() == static_cast<uint64_t>(kConnections),
+                    "accepted counts each connection once");
+    harness::expect(s.rejected.load() == 0, "nothing was rejected");
+    harness::expect(s.reactorFailures.load() == 0, "no reactor failed");
+    harness::expect(s.closeRequestsDropped.load() == 0, "no close request was dropped");
+    harness::expect(s.queueDrops.load() == 0, "no queued task was dropped");
+    harness::expect(closeCallbacks.load() == kConnections,
+                    "every close ran its callback exactly once");
 
     server.stop();
-    expect(server.port() == 0, "a stopped server reports no port");
-    expect(server.connectionCount() == 0,
-           "a stopped server reports no connections");
+    harness::expect(server.port() == 0, "a stopped server reports no port");
+    harness::expect(server.server().connectionCount() == 0,
+                    "a stopped server reports no connections");
 
-    std::printf("\n%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
-                gFailures, gFailures == 1 ? "" : "s");
-    return gFailures == 0 ? 0 : 1;
+    std::printf("\n");
+    return harness::finish();
 }

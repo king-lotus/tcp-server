@@ -36,6 +36,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <utility>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -105,17 +106,27 @@ inline int finish() {
 
 class Fixture {
 public:
-    using Handler = std::function<void(uint64_t, const uint8_t*, size_t)>;
+    using Handler      = std::function<void(uint64_t, const uint8_t*, size_t)>;
+    using CloseHandler = std::function<void(uint64_t, const std::string&, const char*)>;
 
     explicit Fixture(industrial::MultiReactorServer::Config cfg,
-                     Handler handler = Handler())
+                     Handler handler = Handler(),
+                     CloseHandler closeHandler = CloseHandler())
         : cfg_(std::move(cfg)), server_(cfg_) {
         if (handler) server_.setMessageHandler(std::move(handler));
+        if (closeHandler) server_.setCloseHandler(std::move(closeHandler));
         started_ = server_.start();
     }
 
-    ~Fixture() {
-        if (started_) server_.stop();
+    ~Fixture() { stop(); }
+
+    // Idempotent, and callable early: a suite that wants to assert about a
+    // stopped server has to stop it before it looks.
+    void stop() noexcept {
+        if (started_ && !stopped_) {
+            server_.stop();
+            stopped_ = true;
+        }
     }
 
     Fixture(const Fixture&)            = delete;
@@ -134,6 +145,7 @@ private:
     industrial::MultiReactorServer::Config cfg_;
     industrial::MultiReactorServer         server_;
     bool                                   started_ = false;
+    bool                                   stopped_ = false;
 };
 
 // ---------------------------------------------------------------------------
