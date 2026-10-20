@@ -378,6 +378,31 @@ private:
 // a port the kernel picks.
 // ---------------------------------------------------------------------------
 
+// A port the kernel is willing to hand out right now. The gap between this call
+// and the bind is real, so this is only for the tests that need the number before
+// the server exists: a forked child, a second listener, a probe that must run
+// before start().
+inline uint16_t freePort() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in sa{};
+    sa.sin_family      = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port        = 0;
+    if (::bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        ::close(fd);
+        return 0;
+    }
+    socklen_t len = sizeof(sa);
+    if (::getsockname(fd, (struct sockaddr*)&sa, &len) < 0) {
+        ::close(fd);
+        return 0;
+    }
+    const uint16_t port = ntohs(sa.sin_port);
+    ::close(fd);
+    return port;
+}
+
 inline industrial::MultiReactorServer::Config quietConfig(int reactors = 1) {
     industrial::MultiReactorServer::Config cfg;
     cfg.bindAddr      = "127.0.0.1";

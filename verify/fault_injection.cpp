@@ -50,18 +50,14 @@
 #error "fault_injection.cpp requires -DINDUSTRIAL_TCP_TESTING; see the file header"
 #endif
 
+#include "harness.h"
 #include "tcp-server-mt.h"
 
 using industrial::MultiReactorServer;
 
 namespace {
 
-int gFailures = 0;
-
-void expect(bool ok, const char* what) {
-    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++gFailures;
-}
+using harness::freePort;
 
 // Runs fn elsewhere and gives it `ms` to finish.
 //
@@ -90,19 +86,6 @@ bool waitFor(int ms, const std::function<bool()>& pred) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return pred();
-}
-
-uint16_t pickPort() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ::bind(fd, (struct sockaddr*)&sa, sizeof(sa));
-    socklen_t len = sizeof(sa);
-    ::getsockname(fd, (struct sockaddr*)&sa, &len);
-    uint16_t port = ntohs(sa.sin_port);
-    ::close(fd);
-    return port;
 }
 
 // Anything still accepting here? Answers "was the listening socket actually
@@ -136,17 +119,17 @@ int main() {
     {
         std::printf("A. a reactor leaves its loop through an exception\n");
         MultiReactorServer::Config cfg = base;
-        cfg.port = pickPort();
+        cfg.port = freePort();
         MultiReactorServer server(cfg);
-        expect(server.start(), "start() ok");
+        harness::expect(server.start(), "start() ok");
         const uint64_t before = server.stats().reactorFailures.load();
 
         server.failWorkerForTest.store(true);
-        expect(waitFor(3000, [&] { return !server.isRunning(); }),
+        harness::expect(waitFor(3000, [&] { return !server.isRunning(); }),
                "the server stops reporting itself as running");
-        expect(server.stats().reactorFailures.load() > before,
+        harness::expect(server.stats().reactorFailures.load() > before,
                "reactorFailures counted it");
-        expect(within(3000, "stop()", [&] { server.stop(); }),
+        harness::expect(within(3000, "stop()", [&] { server.stop(); }),
                "stop() still completes");
     }
 
@@ -154,21 +137,21 @@ int main() {
     {
         std::printf("B. the accept loop leaves through an exception\n");
         MultiReactorServer::Config cfg = base;
-        cfg.port = pickPort();
+        cfg.port = freePort();
         const uint16_t port = cfg.port;
         MultiReactorServer server(cfg);
-        expect(server.start(), "start() ok");
-        expect(portIsListening(port), "listening before the fault");
+        harness::expect(server.start(), "start() ok");
+        harness::expect(portIsListening(port), "listening before the fault");
         const uint64_t before = server.stats().reactorFailures.load();
 
         server.failAcceptForTest.store(true);
-        expect(waitFor(3000, [&] { return !server.isRunning(); }),
+        harness::expect(waitFor(3000, [&] { return !server.isRunning(); }),
                "the server stops reporting itself as running");
-        expect(server.stats().reactorFailures.load() > before,
+        harness::expect(server.stats().reactorFailures.load() > before,
                "reactorFailures counted it");
-        expect(waitFor(3000, [&] { return !portIsListening(port); }),
+        harness::expect(waitFor(3000, [&] { return !portIsListening(port); }),
                "the listening socket it owned was released");
-        expect(within(3000, "stop()", [&] { server.stop(); }),
+        harness::expect(within(3000, "stop()", [&] { server.stop(); }),
                "stop() still completes");
     }
 
@@ -176,7 +159,7 @@ int main() {
     {
         std::printf("C. 12 rounds of start -> fault -> stop -> start\n");
         MultiReactorServer::Config cfg = base;
-        cfg.port = pickPort();
+        cfg.port = freePort();
         // One reactor, so there is no question about which worker picked it up
         // and no round passes by targeting a worker that has already left.
         cfg.numReactors = 1;
@@ -187,7 +170,7 @@ int main() {
             if (!server.start()) {
                 std::printf("  [FAIL] round %d: start() refused after %d "
                             "recoveries\n", round, usableAgain);
-                ++gFailures;
+                ++harness::failureCount();
                 break;
             }
             const uint64_t before = server.stats().reactorFailures.load();
@@ -195,18 +178,18 @@ int main() {
             else                server.failAcceptForTest.store(true);
             if (!waitFor(3000, [&] { return !server.isRunning(); })) {
                 std::printf("  [FAIL] round %d: the fault never took effect\n", round);
-                ++gFailures;
+                ++harness::failureCount();
                 break;
             }
             if (server.stats().reactorFailures.load() <= before) {
                 std::printf("  [FAIL] round %d: reactorFailures did not move\n", round);
-                ++gFailures;
+                ++harness::failureCount();
                 break;
             }
             if (!within(3000, "stop()", [&] { server.stop(); })) break;
             ++usableAgain;
         }
-        expect(usableAgain == 12, "every round left a server that could start again");
+        harness::expect(usableAgain == 12, "every round left a server that could start again");
         std::printf("      completed %d of 12 rounds\n", usableAgain);
     }
 
@@ -214,20 +197,20 @@ int main() {
     {
         std::printf("D. closeLingerMs <= 0 is refused at start()\n");
         MultiReactorServer::Config cfg = base;
-        cfg.port = pickPort();
+        cfg.port = freePort();
 
         cfg.closeLingerMs = 0;
         MultiReactorServer server0(cfg);
-        expect(!server0.start(), "closeLingerMs=0 refused");
-        expect(!server0.isRunning(), "a refused start leaves the server stopped");
+        harness::expect(!server0.start(), "closeLingerMs=0 refused");
+        harness::expect(!server0.isRunning(), "a refused start leaves the server stopped");
 
         cfg.closeLingerMs = -1;
         MultiReactorServer serverNeg(cfg);
-        expect(!serverNeg.start(), "closeLingerMs=-1 refused");
+        harness::expect(!serverNeg.start(), "closeLingerMs=-1 refused");
 
         cfg.closeLingerMs = 1;
         MultiReactorServer serverOk(cfg);
-        expect(serverOk.start(), "closeLingerMs=1 still accepted");
+        harness::expect(serverOk.start(), "closeLingerMs=1 still accepted");
         if (serverOk.isRunning()) serverOk.stop();
 
         // The one accept-side setting that silently degrades: Linux clamps
@@ -236,19 +219,17 @@ int main() {
         cfg.closeLingerMs = 5000;
         cfg.backlog = 0;
         MultiReactorServer serverB0(cfg);
-        expect(!serverB0.start(), "backlog=0 refused");
+        harness::expect(!serverB0.start(), "backlog=0 refused");
 
         cfg.backlog = -1;
         MultiReactorServer serverBNeg(cfg);
-        expect(!serverBNeg.start(), "backlog=-1 refused");
+        harness::expect(!serverBNeg.start(), "backlog=-1 refused");
 
         cfg.backlog = 1;
         MultiReactorServer serverBOk(cfg);
-        expect(serverBOk.start(), "backlog=1 still accepted");
+        harness::expect(serverBOk.start(), "backlog=1 still accepted");
         if (serverBOk.isRunning()) serverBOk.stop();
     }
 
-    std::printf("%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
-                gFailures, gFailures == 1 ? "" : "s");
-    return gFailures == 0 ? 0 : 1;
+    return harness::finish();
 }
