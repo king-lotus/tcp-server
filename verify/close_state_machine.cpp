@@ -26,51 +26,62 @@
 #include <cstdio>
 #include <cstring>
 
+// R5 moved the state machine into industrial::detail, where it belongs: it is
+// not part of what a caller of this library is allowed to depend on. This file
+// is a white-box test and reaches in on purpose, so it names the namespace
+// once here. In standalone mode the extractor lifts the section out of detail
+// and pastes it at industrial scope, hence the two cases.
+#ifdef CLOSE_SM_STANDALONE
+namespace sm = industrial;
+#else
+namespace sm = industrial::detail;
+#endif
+
 namespace {
 
 int g_pass = 0;
 int g_fail = 0;
 
-const char* phaseName(industrial::ClosePhase p) {
+const char* phaseName(sm::ClosePhase p) {
     switch (p) {
-    case industrial::ClosePhase::Open:    return "Open";
-    case industrial::ClosePhase::Closing: return "Closing";
-    case industrial::ClosePhase::FinSent: return "FinSent";
-    case industrial::ClosePhase::Torn:    return "Torn";
+    case sm::ClosePhase::Open:    return "Open";
+    case sm::ClosePhase::Closing: return "Closing";
+    case sm::ClosePhase::FinSent: return "FinSent";
+    case sm::ClosePhase::Torn:    return "Torn";
     }
     return "?";
 }
 
-const char* eventName(industrial::CloseEvent e) {
+const char* eventName(sm::CloseEvent e) {
     switch (e) {
-    case industrial::CloseEvent::AppClose:      return "AppClose";
-    case industrial::CloseEvent::PeerFin:       return "PeerFin";
-    case industrial::CloseEvent::DrainDone:     return "DrainDone";
-    case industrial::CloseEvent::BudgetSpent:   return "BudgetSpent";
-    case industrial::CloseEvent::LingerExpired: return "LingerExpired";
-    case industrial::CloseEvent::IoError:       return "IoError";
+    case sm::CloseEvent::AppClose:      return "AppClose";
+    case sm::CloseEvent::PeerFin:       return "PeerFin";
+    case sm::CloseEvent::DrainDone:     return "DrainDone";
+    case sm::CloseEvent::BudgetSpent:   return "BudgetSpent";
+    case sm::CloseEvent::LingerExpired: return "LingerExpired";
+    case sm::CloseEvent::IoError:       return "IoError";
     }
     return "?";
 }
 
-const char* actionName(industrial::CloseAction a) {
+const char* actionName(sm::CloseAction a) {
     switch (a) {
-    case industrial::CloseAction::None:             return "None";
-    case industrial::CloseAction::Park:             return "Park";
-    case industrial::CloseAction::SendFin:          return "SendFin";
-    case industrial::CloseAction::RedrainInput:     return "RedrainInput";
-    case industrial::CloseAction::DeferPark:        return "DeferPark";
-    case industrial::CloseAction::TeardownGraceful: return "TeardownGraceful";
-    case industrial::CloseAction::TeardownAbort:    return "TeardownAbort";
+    case sm::CloseAction::None:             return "None";
+    case sm::CloseAction::Park:             return "Park";
+    case sm::CloseAction::SendFin:          return "SendFin";
+    case sm::CloseAction::RedrainInput:     return "RedrainInput";
+    case sm::CloseAction::DeferPark:        return "DeferPark";
+    case sm::CloseAction::TeardownGraceful: return "TeardownGraceful";
+    case sm::CloseAction::TeardownAbort:    return "TeardownAbort";
     }
     return "?";
 }
 
-using industrial::CloseAction;
-using industrial::CloseEvent;
-using industrial::CloseFacts;
-using industrial::ClosePhase;
-using industrial::CloseRound;
+using sm::CloseAction;
+using sm::CloseEvent;
+using sm::CloseFacts;
+using sm::ClosePhase;
+using sm::CloseRound;
 
 // ---- the oracle: baseline section 5, written out again on purpose -----------
 CloseAction expected(ClosePhase p, CloseEvent e, const CloseFacts& f) {
@@ -180,7 +191,7 @@ int main() {
     for (auto p : phases) {
         std::printf("%-10s", phaseName(p));
         for (auto e : events) {
-            const CloseAction a = industrial::decide(p, e, canonical(e));
+            const CloseAction a = sm::decide(p, e, canonical(e));
             std::printf("%-18s", actionName(a));
         }
         std::printf("\n");
@@ -207,7 +218,7 @@ int main() {
                     for (int s = 0; s < 2; ++s) {
                         f.served = s != 0;
                         ++cells;
-                        const CloseAction got = industrial::decide(p, e, f);
+                        const CloseAction got = sm::decide(p, e, f);
                         const CloseAction want = expected(p, e, f);
                         if (got != want) {
                             char buf[160];
@@ -234,72 +245,72 @@ int main() {
     // parkClose is idempotent once the FIN has gone, and a no-op when torn.
     f = canonical(CloseEvent::AppClose);
     check("parkClose after FIN is a no-op",
-          industrial::decide(ClosePhase::FinSent, CloseEvent::AppClose, f) ==
+          sm::decide(ClosePhase::FinSent, CloseEvent::AppClose, f) ==
               CloseAction::None, nullptr);
     check("parkClose on a torn conn is a no-op",
-          industrial::decide(ClosePhase::Torn, CloseEvent::AppClose, f) ==
+          sm::decide(ClosePhase::Torn, CloseEvent::AppClose, f) ==
               CloseAction::None, nullptr);
 
     // A FIN must never be sent while wbuf still holds bytes: shutdown() would
     // discard them and the peer would see a clean end to a truncated stream.
     f.wbufEmpty = false;
     check("no FIN over a non-empty wbuf (AppClose)",
-          industrial::decide(ClosePhase::Closing, CloseEvent::AppClose, f) ==
+          sm::decide(ClosePhase::Closing, CloseEvent::AppClose, f) ==
               CloseAction::Park, nullptr);
     check("no FIN over a non-empty wbuf (DrainDone)",
-          industrial::decide(ClosePhase::Closing, CloseEvent::DrainDone, f) !=
+          sm::decide(ClosePhase::Closing, CloseEvent::DrainDone, f) !=
               CloseAction::SendFin, nullptr);
     check("no FIN over a non-empty wbuf (PeerFin)",
-          industrial::decide(ClosePhase::Closing, CloseEvent::PeerFin, f) ==
+          sm::decide(ClosePhase::Closing, CloseEvent::PeerFin, f) ==
               CloseAction::Park, nullptr);
 
     // PeerFin on a connection that is not closing and owes nothing: tear down
     // gracefully, never abort (P0-5 was an RST the peer never earned).
     f = canonical(CloseEvent::PeerFin);
     check("PeerFin on an open, owed-nothing conn is graceful",
-          industrial::decide(ClosePhase::Open, CloseEvent::PeerFin, f) ==
+          sm::decide(ClosePhase::Open, CloseEvent::PeerFin, f) ==
               CloseAction::TeardownGraceful, nullptr);
 
     // PeerFin with replies still reserved gets exactly one queue round.
     f.pending = true;
     check("PeerFin with reserved bytes defers one round",
-          industrial::decide(ClosePhase::Open, CloseEvent::PeerFin, f) ==
+          sm::decide(ClosePhase::Open, CloseEvent::PeerFin, f) ==
               CloseAction::DeferPark, nullptr);
     f.round = CloseRound::PeerClosed;
     check("PeerFin does not defer twice",
-          industrial::decide(ClosePhase::Open, CloseEvent::PeerFin, f) ==
+          sm::decide(ClosePhase::Open, CloseEvent::PeerFin, f) ==
               CloseAction::TeardownGraceful, nullptr);
 
     // A parked close always ends in a FIN once the drain is done.
     f = canonical(CloseEvent::DrainDone);
     check("DrainDone while closing sends the FIN",
-          industrial::decide(ClosePhase::Closing, CloseEvent::DrainDone, f) ==
+          sm::decide(ClosePhase::Closing, CloseEvent::DrainDone, f) ==
               CloseAction::SendFin, nullptr);
     check("DrainDone while open does nothing",
-          industrial::decide(ClosePhase::Open, CloseEvent::DrainDone, f) ==
+          sm::decide(ClosePhase::Open, CloseEvent::DrainDone, f) ==
               CloseAction::None, nullptr);
 
     // The linger deadline aborts, because a deadline is all it can be sure of.
     f = CloseFacts();
     check("linger aborts a closing conn",
-          industrial::decide(ClosePhase::Closing, CloseEvent::LingerExpired,
+          sm::decide(ClosePhase::Closing, CloseEvent::LingerExpired,
                              f) == CloseAction::TeardownAbort, nullptr);
     check("linger aborts a fin-sent conn",
-          industrial::decide(ClosePhase::FinSent, CloseEvent::LingerExpired,
+          sm::decide(ClosePhase::FinSent, CloseEvent::LingerExpired,
                              f) == CloseAction::TeardownAbort, nullptr);
     check("linger ignores an open conn",
-          industrial::decide(ClosePhase::Open, CloseEvent::LingerExpired, f) ==
+          sm::decide(ClosePhase::Open, CloseEvent::LingerExpired, f) ==
               CloseAction::None, nullptr);
 
     // IoError aborts everything that is not already gone.
     check("IoError aborts while open",
-          industrial::decide(ClosePhase::Open, CloseEvent::IoError, f) ==
+          sm::decide(ClosePhase::Open, CloseEvent::IoError, f) ==
               CloseAction::TeardownAbort, nullptr);
     check("IoError aborts after the FIN",
-          industrial::decide(ClosePhase::FinSent, CloseEvent::IoError, f) ==
+          sm::decide(ClosePhase::FinSent, CloseEvent::IoError, f) ==
               CloseAction::TeardownAbort, nullptr);
     check("IoError ignores a torn conn",
-          industrial::decide(ClosePhase::Torn, CloseEvent::IoError, f) ==
+          sm::decide(ClosePhase::Torn, CloseEvent::IoError, f) ==
               CloseAction::None, nullptr);
 
     // The close-input budget: another round needs progress, budget and buffered
@@ -307,15 +318,15 @@ int main() {
     f = canonical(CloseEvent::BudgetSpent);
     f.served = true; f.budgetLeft = true; f.rbufEmpty = false;
     check("budget left with input buffered re-drains",
-          industrial::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) ==
+          sm::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) ==
               CloseAction::RedrainInput, nullptr);
     f.rbufEmpty = true;
     check("budget left with nothing buffered does not re-drain",
-          industrial::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) !=
+          sm::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) !=
               CloseAction::RedrainInput, nullptr);
     f.rbufEmpty = false; f.budgetLeft = false;
     check("exhausted budget does not re-drain",
-          industrial::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) !=
+          sm::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) !=
               CloseAction::RedrainInput, nullptr);
 
     // finishPeerClosed owns the round: a close that deferred for PeerFin must
@@ -323,14 +334,14 @@ int main() {
     f = canonical(CloseEvent::BudgetSpent);
     f.round = CloseRound::PeerClosed;
     check("a PeerClosed round is never parked over",
-          industrial::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) ==
+          sm::decide(ClosePhase::Closing, CloseEvent::BudgetSpent, f) ==
               CloseAction::None, nullptr);
 
     // Nothing that has already sent its FIN gets another FIN.
     for (auto e : events) {
         CloseFacts g = canonical(e);
         check("no second FIN",
-              industrial::decide(ClosePhase::FinSent, e, g) !=
+              sm::decide(ClosePhase::FinSent, e, g) !=
                   CloseAction::SendFin, eventName(e));
     }
 

@@ -76,6 +76,9 @@ inline void writeFrameHeader(uint8_t* out, FrameType type,
     out[7] =  len        & 0xFF;
 }
 
+namespace detail {
+// The PONG this server answers a PING with, precomputed once. Internal: it is
+// the server's own cached reply, not a codec a caller needs.
 inline const std::array<uint8_t, FRAME_HEADER_SIZE>& pongFrame() noexcept {
     static const std::array<uint8_t, FRAME_HEADER_SIZE> kPong = [] {
         std::array<uint8_t, FRAME_HEADER_SIZE> v{};
@@ -84,6 +87,8 @@ inline const std::array<uint8_t, FRAME_HEADER_SIZE>& pongFrame() noexcept {
     }();
     return kPong;
 }
+
+}  // namespace detail
 
 inline void encodeFrameInto(uint8_t* out, FrameType type,
                             const void* payload, size_t len) noexcept {
@@ -97,6 +102,7 @@ inline void encodeFrameInto(uint8_t* out, FrameType type,
 }
 
 // ==================== RAII fd ====================
+namespace detail {
 struct FdGuard {
     int fd = -1;
     FdGuard() noexcept = default;
@@ -233,6 +239,8 @@ class RingBuffer {
     size_t size_ = 0;
 };
 
+}  // namespace detail
+
 // ==================== Statistics ====================
 struct ServerStats {
     std::atomic<uint64_t> accepted{0};
@@ -314,7 +322,6 @@ enum class SendResult : int {
 };
 
 class MultiReactorServer;
-class SubReactor;
 
 // One reservation follows a socket from the accept queue through connection
 // lifetime. Every failure/discard path releases it through the same destructor.
@@ -322,6 +329,10 @@ class SubReactor;
 // update, nothing non-atomic is published through the count, and the accept
 // loop's cap check is advisory by nature (the load races the reservation by
 // definition). The ++/-- operator forms would quietly mean seq_cst.
+namespace detail {
+// Conn names a SubReactor before the class is defined below it, the same
+// way it did at namespace scope.
+class SubReactor;
 struct Admission {
     std::atomic<size_t>& count;
     explicit Admission(std::atomic<size_t>& value) noexcept : count(value) {
@@ -787,6 +798,8 @@ class SubReactor {
     std::vector<uint8_t> frameScratch_;
 };
 
+}  // namespace detail
+
 // ==================== MultiReactorServer ====================
 class MultiReactorServer {
  public:
@@ -938,9 +951,6 @@ class MultiReactorServer {
 
     const ServerStats& stats() const noexcept { return stats_; }
 
-    // SubReactor internal interface
-    bool   onConnectionOpened(uint64_t id, std::shared_ptr<Conn> c) noexcept;
-    void   onConnectionClosed(uint64_t id) noexcept;
     // Running means: lifecycle reached Running AND no component has failed.
     // A reactor/accept thread failure only raises failed_; it never rewrites
     // the
@@ -959,7 +969,21 @@ class MultiReactorServer {
     ConnStateHandler& stateHandlerRef()   noexcept { return stateHandler_; }
 
  private:
-    friend class SubReactor;
+    friend class detail::SubReactor;
+    // The reactor's callbacks into the server's connection map. Private
+    // because their signature names detail::Conn, and a public method that
+    // did would put the internal type back on the surface this refactor
+    // just cleared.
+    bool   onConnectionOpened(uint64_t id,
+                              std::shared_ptr<detail::Conn> c) noexcept;
+    void   onConnectionClosed(uint64_t id) noexcept;
+    // The internals these name live in industrial::detail. Aliasing them
+    // once keeps the bodies below readable without a detail:: in front of
+    // every reference.
+    using SubReactor = detail::SubReactor;
+    using Conn       = detail::Conn;
+    using FdGuard    = detail::FdGuard;
+    using Admission  = detail::Admission;
 
     // Lifecycle states. Only the thread holding lifecycleMutex_ moves the state
     // out of/into Stopped; threads that merely observe a fatal error use
@@ -1067,6 +1091,10 @@ class MultiReactorServer {
 // ====================================================================
 //                         SubReactor implementation
 // ====================================================================
+
+// The class is in detail; its out-of-line definitions have to be too, or they
+// would define industrial::SubReactor, a different type that does not exist.
+namespace detail {
 
 inline bool SubReactor::start() noexcept {
     if (running_.exchange(true)) return true;
@@ -2654,6 +2682,8 @@ inline void SubReactor::loop() noexcept {
     cleanup();
 }
 
+}  // namespace detail
+
 // ====================================================================
 //                     MultiReactorServer implementation
 // ====================================================================
@@ -2985,7 +3015,7 @@ inline void MultiReactorServer::wakeAcceptLoop() noexcept {
     }
 }
 
-inline SubReactor* MultiReactorServer::pickReactor() noexcept {
+inline detail::SubReactor* MultiReactorServer::pickReactor() noexcept {
     if (reactors_.empty()) return nullptr;
     size_t i = nextReactor_.fetch_add(1, std::memory_order_relaxed) %
                reactors_.size();
