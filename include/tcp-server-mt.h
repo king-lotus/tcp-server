@@ -499,8 +499,8 @@ inline CloseAction decide(ClosePhase phase, CloseEvent event,
         if (phase == ClosePhase::Closing) return CloseAction::SendFin;
         if (phase == ClosePhase::FinSent) return CloseAction::TeardownGraceful;
         // Open: replies may be queued behind this batch and not yet in wbuf.
-        // One round is enough to let them land; a producer racing the close must
-        // not hold the connection open forever.
+        // One round is enough to let them land; a producer racing the close
+        // must not hold the connection open forever.
         if (f.round == CloseRound::None && f.pending)
             return CloseAction::DeferPark;
         return CloseAction::TeardownGraceful;
@@ -517,8 +517,8 @@ inline CloseAction decide(ClosePhase phase, CloseEvent event,
 
     case CloseEvent::BudgetSpent:
         // drainInputThenClose. Input this close still owes the peer may not fit
-        // in one read budget; the budget bounds it, not the peer's willingness to
-        // keep sending.
+        // in one read budget; the budget bounds it, not the peer's willingness
+        // to keep sending.
         if (f.served && f.budgetLeft && !f.rbufEmpty)
             return CloseAction::RedrainInput;
         if (!f.served && f.round == CloseRound::None && f.pending)
@@ -2291,7 +2291,8 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     // this close promised to serve. Progress is required (served > 0) so a peer
     // that stops mid-frame cannot keep the close pending on a half a frame.
     if (served > 0 && !c->rbuf.empty() && c->close.inputBudget > 0) {
-        expectClose(c, CloseEvent::BudgetSpent, CloseAction::RedrainInput, facts);
+        expectClose(c, CloseEvent::BudgetSpent, CloseAction::RedrainInput,
+                    facts);
         const uint64_t id = c->id;
         if (enqueue([this, id]() noexcept {
                 auto it = conns_.find(id);
@@ -3148,7 +3149,8 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
     // is not a shutdown or a disconnection that Ok is allowed to be vague
     // about -- it is the close this caller asked for moments ago.
     if (c->isClosed.load(std::memory_order_acquire) ||
-        c->close.closing.load(std::memory_order_acquire)) return SendResult::Closed;
+        c->close.closing.load(std::memory_order_acquire))
+        return SendResult::Closed;
 
     std::vector<uint8_t> frame;
     try {
