@@ -114,8 +114,11 @@ bool portIsListening(uint16_t port) {
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    bool ok = ::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0;
-    if (ok) ::close(fd);
+    // One close, always. This used to close twice when the connect succeeded,
+    // and the second close could land on a descriptor number the accept loop
+    // had just handed out -- which TSan reported, correctly, as a race between
+    // this close() and accept4() on the same slot.
+    const bool ok = ::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0;
     ::close(fd);
     return ok;
 }
