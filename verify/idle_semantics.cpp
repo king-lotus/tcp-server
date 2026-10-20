@@ -46,6 +46,7 @@
 #include <thread>
 #include <vector>
 
+#include "harness.h"
 #include "tcp-server-mt.h"
 
 using industrial::FrameType;
@@ -53,65 +54,13 @@ using industrial::MultiReactorServer;
 
 namespace {
 
-int gFailures = 0;
-
-void expect(bool ok, const char* what) {
-    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++gFailures;
-}
-
-uint16_t pickPort() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
-    struct sockaddr_in sa{};
-    sa.sin_family      = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    sa.sin_port        = 0;
-    if (::bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-        ::close(fd);
-        return 0;
-    }
-    socklen_t sl = sizeof(sa);
-    ::getsockname(fd, (struct sockaddr*)&sa, &sl);
-    ::close(fd);
-    return ntohs(sa.sin_port);
-}
-
-int connectTo(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in sa{};
-    sa.sin_family      = AF_INET;
-    sa.sin_port        = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-        ::close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-bool sendAll(int fd, const void* p, size_t n) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    size_t off = 0;
-    while (off < n) {
-        ssize_t k = ::send(fd, b + off, n - off, 0);
-        if (k <= 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        off += static_cast<size_t>(k);
-    }
-    return true;
-}
-
 // 600ms idle, checked every 50ms: a transfer that keeps sending crosses the
 // deadline twice over the ~1.6s each case runs, so "the deadline did not fire"
 // cannot be explained by the tick simply not having come around yet.
 MultiReactorServer::Config idleConfig() {
     MultiReactorServer::Config cfg;
     cfg.bindAddr      = "127.0.0.1";
-    cfg.port          = pickPort();
+    cfg.port          = 0;   // kernel picks; the fixture reports it
     cfg.numReactors   = 1;
     cfg.tickMs        = 50;
     cfg.idleTimeoutMs = 600;
@@ -131,26 +80,32 @@ bool hungUp(int fd) {
 // never once going quiet.
 void caseHalfFrame() {
     std::printf("A. half-frame: one frame declared, dribbled, never completed\n");
-    MultiReactorServer::Config cfg = idleConfig();
-    MultiReactorServer server(cfg);
-    server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
-    if (!server.start()) { expect(false, "start() ok"); return; }
+    harness::Fixture server(idleConfig(),
+                            [](uint64_t, const uint8_t*, size_t) {});
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    int fd = connectTo(cfg.port);
-    if (fd < 0) { expect(false, "client connected"); server.stop(); return; }
+    harness::Peer peer;
+    if (!peer.connect(server.port())) {
+        harness::expect(false, "client connected");
+        return;
+    }
+    const int fd = peer.fd();
 
     const size_t kChunk = 2000;
     const size_t kTotal = 14000;
     uint8_t hdr[industrial::FRAME_HEADER_SIZE];
     industrial::writeFrameHeader(hdr, FrameType::DATA, kTotal);
-    if (!sendAll(fd, hdr, sizeof(hdr))) { expect(false, "header sent"); ::close(fd); server.stop(); return; }
+    if (!peer.sendRaw(hdr, sizeof(hdr))) {
+        harness::expect(false, "header sent");
+        return;
+    }
 
     bool   fin   = false;
     size_t sent  = 0;
     for (int i = 0; i < static_cast<int>(kTotal / kChunk); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         std::vector<uint8_t> body(kChunk, 'x');
-        if (!sendAll(fd, body.data(), body.size())) break;
+        if (!peer.sendRaw(body.data(), body.size())) break;
         sent += kChunk;
         if (hungUp(fd)) { fin = true; break; }
     }
@@ -160,25 +115,29 @@ void caseHalfFrame() {
     std::printf("      sent %zu B, server received %llu B, idleTimeouts %llu\n",
                 sent, recv, idle);
 
-    expect(recv > 0, "the bytes arrived (the peer was not silent)");
-    expect(!fin, "a peer that never stopped sending is not closed for idling");
-    expect(idle == 0, "the idle deadline did not fire on a peer inside a frame");
+    harness::expect(recv > 0, "the bytes arrived (the peer was not silent)");
+    harness::expect(!fin,
+                    "a peer that never stopped sending is not closed for idling");
+    harness::expect(idle == 0,
+                    "the idle deadline did not fire on a peer inside a frame");
 
-    ::close(fd);
-    server.stop();
+    peer.close();
 }
 
 // The control: a peer that really is silent still has to be reclaimed, or the
 // fix for the case above is just the timeout being switched off.
 void caseSilent() {
     std::printf("B. silent: connected, then nothing at all\n");
-    MultiReactorServer::Config cfg = idleConfig();
-    MultiReactorServer server(cfg);
-    server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
-    if (!server.start()) { expect(false, "start() ok"); return; }
+    harness::Fixture server(idleConfig(),
+                            [](uint64_t, const uint8_t*, size_t) {});
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    int fd = connectTo(cfg.port);
-    if (fd < 0) { expect(false, "client connected"); server.stop(); return; }
+    harness::Peer peer;
+    if (!peer.connect(server.port())) {
+        harness::expect(false, "client connected");
+        return;
+    }
+    const int fd = peer.fd();
 
     bool fin = false;
     for (int i = 0; i < 150 && !fin; ++i) {
@@ -188,11 +147,10 @@ void caseSilent() {
 
     const unsigned long long idle = server.stats().idleTimeouts.load();
     std::printf("      idleTimeouts %llu, server FIN'd: %s\n", idle, fin ? "yes" : "no");
-    expect(idle >= 1, "a silent peer is still reclaimed");
-    expect(fin, "and the peer sees it");
+    harness::expect(idle >= 1, "a silent peer is still reclaimed");
+    harness::expect(fin, "and the peer sees it");
 
-    ::close(fd);
-    server.stop();
+    peer.close();
 }
 
 // Same bytes, same rate, each piece a complete frame: what the clock used to
@@ -200,14 +158,18 @@ void caseSilent() {
 // having stopped working.
 void caseFullFrames() {
     std::printf("C. full-frames: the same pieces, each a complete frame\n");
-    MultiReactorServer::Config cfg = idleConfig();
-    MultiReactorServer server(cfg);
     std::atomic<long> frames{0};
-    server.setMessageHandler([&](uint64_t, const uint8_t*, size_t) { frames.fetch_add(1); });
-    if (!server.start()) { expect(false, "start() ok"); return; }
+    harness::Fixture server(
+        idleConfig(),
+        [&frames](uint64_t, const uint8_t*, size_t) { frames.fetch_add(1); });
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    int fd = connectTo(cfg.port);
-    if (fd < 0) { expect(false, "client connected"); server.stop(); return; }
+    harness::Peer peer;
+    if (!peer.connect(server.port())) {
+        harness::expect(false, "client connected");
+        return;
+    }
+    const int fd = peer.fd();
 
     const size_t kChunk = 2000;
     bool   fin = false;
@@ -217,7 +179,7 @@ void caseFullFrames() {
         std::vector<uint8_t> f(industrial::FRAME_HEADER_SIZE + kChunk);
         industrial::encodeFrameInto(f.data(), FrameType::DATA, nullptr, kChunk);
         std::memset(f.data() + industrial::FRAME_HEADER_SIZE, 'x', kChunk);
-        if (!sendAll(fd, f.data(), f.size())) break;
+        if (!peer.sendRaw(f.data(), f.size())) break;
         sent += f.size();
         if (hungUp(fd)) { fin = true; break; }
     }
@@ -225,12 +187,12 @@ void caseFullFrames() {
     const unsigned long long idle = server.stats().idleTimeouts.load();
     std::printf("      sent %zu B in %ld frames, idleTimeouts %llu\n",
                 sent, frames.load(), idle);
-    expect(!fin, "a peer sending complete frames is not closed for idling");
-    expect(frames.load() >= 5, "the frames were delivered and dispatched");
-    expect(idle == 0, "the idle deadline did not fire");
+    harness::expect(!fin,
+                    "a peer sending complete frames is not closed for idling");
+    harness::expect(frames.load() >= 5, "the frames were delivered and dispatched");
+    harness::expect(idle == 0, "the idle deadline did not fire");
 
-    ::close(fd);
-    server.stop();
+    peer.close();
 }
 
 // The consequence of A, and the question its fix leaves open: if a peer inside
@@ -247,26 +209,32 @@ void caseFullFrames() {
 // So: send a legal maximum frame all but one byte of it, then stop talking.
 void caseHalfFrameThenSilent() {
     std::printf("D. half-frame that stops mid-frame: is it reclaimed then?\n");
-    MultiReactorServer::Config cfg = idleConfig();
-    MultiReactorServer server(cfg);
-    server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
-    if (!server.start()) { expect(false, "start() ok"); return; }
+    harness::Fixture server(idleConfig(),
+                            [](uint64_t, const uint8_t*, size_t) {});
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    int fd = connectTo(cfg.port);
-    if (fd < 0) { expect(false, "client connected"); server.stop(); return; }
+    harness::Peer peer;
+    if (!peer.connect(server.port())) {
+        harness::expect(false, "client connected");
+        return;
+    }
+    const int fd = peer.fd();
 
     const size_t kChunk = 2000;
     const size_t kTotal = industrial::MAX_FRAME_PAYLOAD;
     uint8_t hdr[industrial::FRAME_HEADER_SIZE];
     industrial::writeFrameHeader(hdr, FrameType::DATA, kTotal);
-    if (!sendAll(fd, hdr, sizeof(hdr))) { expect(false, "header sent"); ::close(fd); server.stop(); return; }
+    if (!peer.sendRaw(hdr, sizeof(hdr))) {
+        harness::expect(false, "header sent");
+        return;
+    }
 
     // All but the last byte, delivered fast enough that the clock never expires
     // while the peer is still active.
     size_t sent = 0;
     while (sent + kChunk < kTotal) {
         std::vector<uint8_t> body(kChunk, 'x');
-        if (!sendAll(fd, body.data(), body.size())) break;
+        if (!peer.sendRaw(body.data(), body.size())) break;
         sent += kChunk;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -284,12 +252,13 @@ void caseHalfFrameThenSilent() {
                 "(was %llu while sending), FIN'd: %s\n",
                 sent, kTotal, idle, idleWhileSending, fin ? "yes" : "no");
 
-    expect(idleWhileSending == 0, "still not reclaimed while it was sending");
-    expect(fin, "reclaimed once it went silent, even mid-frame");
-    expect(idle >= 1, "by the idle clock, which is the only thing that changed");
+    harness::expect(idleWhileSending == 0,
+                    "still not reclaimed while it was sending");
+    harness::expect(fin, "reclaimed once it went silent, even mid-frame");
+    harness::expect(idle >= 1,
+                    "by the idle clock, which is the only thing that changed");
 
-    ::close(fd);
-    server.stop();
+    peer.close();
 }
 
 }  // namespace
@@ -302,7 +271,6 @@ int main() {
     caseSilent();
     caseFullFrames();
     caseHalfFrameThenSilent();
-    std::printf("\n%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
-                gFailures, gFailures == 1 ? "" : "s");
-    return gFailures == 0 ? 0 : 1;
+    std::printf("\n");
+    return harness::finish();
 }
