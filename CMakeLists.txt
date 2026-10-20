@@ -40,7 +40,8 @@ if(TCP_BUILD_SUITES)
         send_results
         backpressure
         reactor_spread
-        config_budget)
+        config_budget
+        harness_selftest)
 
     foreach(suite IN LISTS TCP_SUITES)
         add_executable(${suite} verify/${suite}.cpp)
@@ -90,6 +91,8 @@ if(TCP_BUILD_SUITES)
                          ENVIRONMENT "RS_REACTORS=2")
     add_test(NAME config_budget
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:config_budget>)
+    add_test(NAME harness_selftest
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:harness_selftest>)
 
     # run.sh gives each case 180s so a hang presents as a failure; the same
     # bound here keeps ctest from outliving the CI job.
@@ -97,6 +100,7 @@ if(TCP_BUILD_SUITES)
                          idle_semantics ping_pong send_results backpressure
                          fault_injection reactor_spread
                          reactor_spread_2_reactors config_budget
+                         harness_selftest
                          PROPERTIES TIMEOUT 180)
 endif()
 
