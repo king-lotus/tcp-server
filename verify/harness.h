@@ -289,6 +289,51 @@ public:
         }
     }
 
+    // Reads until the far side ends the connection, keeping every byte that
+    // arrived before it did, and reports which ending it was.
+    //
+    // This is the primitive close_semantics needs and expectClose cannot give:
+    // there, "which bytes arrived" and "how did it end" have to come from the
+    // same read, because a reply that was queued and then refused looks exactly
+    // like a reply that was never produced unless you count the bytes.
+    Status readToEnd(std::vector<uint8_t>* out, Close* end, int timeoutMs = 2000) {
+        if (out != nullptr) out->clear();
+        if (end != nullptr) *end = Close::Any;
+        if (fd_ < 0) return failed("readToEnd: not connected");
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            uint8_t       buf[4096];
+            const ssize_t r = ::recv(fd_, buf, sizeof(buf), MSG_DONTWAIT);
+            if (r > 0) {
+                if (out != nullptr) out->insert(out->end(), buf, buf + r);
+                continue;
+            }
+            if (r == 0) {
+                if (end != nullptr) *end = Close::Fin;
+                closeSeen_ = true;
+                closeKind_ = Close::Fin;
+                return ok();
+            }
+            if (errno == EINTR) continue;
+            if (errno == ECONNRESET) {
+                if (end != nullptr) *end = Close::Rst;
+                closeSeen_ = true;
+                closeKind_ = Close::Rst;
+                return ok();
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return failed("readToEnd: timeout before the far side ended");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            return failed(std::string("readToEnd: recv ") + std::strerror(errno));
+        }
+    }
+
     int  fd() const noexcept { return fd_; }
     bool connected() const noexcept { return fd_ >= 0; }
 

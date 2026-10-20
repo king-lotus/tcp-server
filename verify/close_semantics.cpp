@@ -56,6 +56,7 @@
 #include <thread>
 #include <vector>
 
+#include "harness.h"
 #include "tcp-server-mt.h"
 
 using industrial::FrameType;
@@ -76,27 +77,6 @@ void expect(bool ok, const char* what) {
 
 // ---- client side -----------------------------------------------------------
 
-int connectTo(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        std::printf("      socket() failed: errno=%d (%s)\n", errno, std::strerror(errno));
-        return -1;
-    }
-    struct sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-        // Do not swallow this: it is the difference between "the server rejected
-        // us" and "nothing is listening at all", and it decides where to look.
-        std::printf("      connect(127.0.0.1:%u) failed: errno=%d (%s)\n",
-                    (unsigned)port, errno, std::strerror(errno));
-        ::close(fd);
-        return -1;
-    }
-    return fd;
-}
-
 // Is anything listening on this port at all? Used to tell "server failed to
 // bind" apart from "server bound but the accept loop never ran".
 bool portIsListening(uint16_t port) {
@@ -109,21 +89,6 @@ bool portIsListening(uint16_t port) {
     bool ok = ::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0;
     ::close(fd);
     return ok;
-}
-
-std::vector<uint8_t> encode(FrameType type, const void* payload, size_t len) {
-    std::vector<uint8_t> f(industrial::FRAME_HEADER_SIZE + len);
-    industrial::encodeFrameInto(f.data(), type, payload, len);
-    return f;
-}
-
-void sendAll(int fd, const std::vector<uint8_t>& f) {
-    size_t off = 0;
-    while (off < f.size()) {
-        ssize_t n = ::send(fd, f.data() + off, f.size() - off, MSG_NOSIGNAL);
-        if (n <= 0) return;
-        off += (size_t)n;
-    }
 }
 
 // Three ways a read can end, kept apart on purpose. "orderly FIN", "nothing ever
@@ -350,17 +315,18 @@ int main() {
     {
         std::printf("A. reply + close\n");
         dumpStats(server, "A.begin");
-        int fd = connectTo(port);
-        expect(fd >= 0, "client connected");
+        harness::Peer peer;
+        expect(static_cast<bool>(peer.connect(port)), "client connected");
+        const int fd = peer.fd();
         replyQueued.store(false);
         closeAfterReply.store(true);
         const std::string payload = "ANSWER-42";
-        sendAll(fd, encode(FrameType::DATA, payload.data(), payload.size()));
+        peer.send(FrameType::DATA, payload.data(), payload.size());
         expect(waitFor(2000, [&] { return replyQueued.load(); }), "handler ran");
 
         ReadEnd end = ReadEnd::Invalid;
         auto got = readToEnd(fd, end, 2000);
-        ::close(fd);
+        peer.close();
 
         expect(end != ReadEnd::Reset, "peer got FIN, not RST");
         expect(got.size() == industrial::FRAME_HEADER_SIZE + payload.size(),
@@ -385,8 +351,9 @@ int main() {
         // assertion then passed against the wrong socket while the one under test
         // was quietly never closed.
         const auto preexisting = server.connectionIds();
-        int fd = connectTo(port);
-        expect(fd >= 0, "client connected");
+        harness::Peer peer;
+        expect(static_cast<bool>(peer.connect(port)), "client connected");
+        const int fd = peer.fd();
         uint64_t id = 0;
         expect(waitFor(2000, [&] {
                    for (uint64_t seen : server.connectionIds()) {
@@ -407,8 +374,8 @@ int main() {
         // whether the reactor has read them is deliberately left open, which is
         // precisely what a graceful close has to cope with.
         const uint64_t sentAt = server.stats().bytesRecv.load();
-        sendAll(fd, encode(FrameType::DATA, "one", 3));
-        sendAll(fd, encode(FrameType::DATA, "two", 3));
+        peer.send(FrameType::DATA, "one", 3);
+        peer.send(FrameType::DATA, "two", 3);
         waitFor(2000, [&] {
             return server.stats().bytesRecv.load() >=
                    sentAt + 2 * (industrial::FRAME_HEADER_SIZE + 3);
@@ -417,7 +384,7 @@ int main() {
 
         ReadEnd end = ReadEnd::Invalid;
         auto got = readToEnd(fd, end, 2000);
-        ::close(fd);
+        peer.close();
         expect(end != ReadEnd::Reset, "close did not degenerate into RST");
         std::printf("      wire ended with: %s\n", readEndName(end));
         expect(!got.empty(), "at least the first reply was delivered");
@@ -428,15 +395,16 @@ int main() {
     {
         std::printf("C. bad magic -> abort\n");
         dumpStats(server, "C.begin");
-        int fd = connectTo(port);
-        expect(fd >= 0, "client connected");
+        harness::Peer peer;
+        expect(static_cast<bool>(peer.connect(port)), "client connected");
+        const int fd = peer.fd();
         uint8_t junk[16];
         std::memset(junk, 0x11, sizeof(junk));      // never a valid 0xEB90 header
-        sendAll(fd, std::vector<uint8_t>(junk, junk + sizeof(junk)));
+        peer.sendRaw(junk, sizeof(junk));
 
         ReadEnd end = ReadEnd::Invalid;
         readToEnd(fd, end, 2000);
-        ::close(fd);
+        peer.close();
         if (gZeroLinger) {
             expect(end == ReadEnd::Reset, "peer observes RST on a protocol violation");
         } else {
@@ -460,8 +428,9 @@ int main() {
     {
         std::printf("E. peer FIN with replies still queued\n");
         dumpStats(server, "E.begin");
-        int fd = connectTo(port);
-        expect(fd >= 0, "client connected");
+        harness::Peer peer;
+        expect(static_cast<bool>(peer.connect(port)), "client connected");
+        const int fd = peer.fd();
         // Shrink the peer's receive buffer so the answer cannot drain into it
         // while the client sleeps: the server must park with bytes in wbuf,
         // which is exactly the state this case is about. (The kernel doubles
@@ -472,7 +441,7 @@ int main() {
         replyQueued.store(false);
         bigReplyFrames.store(250);     // 250 x 32KB = 8MB: cannot drain in one go
         const std::string req = "half-close-then-answer";
-        sendAll(fd, encode(FrameType::DATA, req.data(), req.size()));
+        peer.send(FrameType::DATA, req.data(), req.size());
         // Done sending, still entitled to the answer. This is the HTTP/1.0-style
         // exchange: request, half-close, read until FIN.
         ::shutdown(fd, SHUT_WR);
@@ -495,7 +464,7 @@ int main() {
 
         ReadEnd end = ReadEnd::Invalid;
         auto got = readToEnd(fd, end, 5000);
-        ::close(fd);
+        peer.close();
         expect(end == ReadEnd::Fin, "wire ends with FIN, not RST or silence");
         std::printf("      wire ended with: %s, %zu of %zu bytes\n",
                     readEndName(end), got.size(), wantBytes);
@@ -526,14 +495,15 @@ int main() {
         int lost = 0;
 
         for (int round = 0; round < rounds; ++round) {
-            int fd = connectTo(port);
-            if (fd < 0) {
+            harness::Peer peer;
+            if (!peer.connect(port)) {
                 std::printf("      round %d: connect failed\n", round);
                 ++lost;
                 continue;
             }
-            sendAll(fd, encode(FrameType::DATA, "one", 3));
-            sendAll(fd, encode(FrameType::DATA, "two", 3));
+            const int fd = peer.fd();
+            peer.send(FrameType::DATA, "one", 3);
+            peer.send(FrameType::DATA, "two", 3);
             // Close the instant the bytes are known to have arrived, which is
             // the earliest the application could know there is anything to wait
             // for -- polling every millimetre rather than every 10ms widens the
@@ -552,7 +522,7 @@ int main() {
 
             ReadEnd end = ReadEnd::Invalid;
             auto got = readToEnd(fd, end, 2000);
-            ::close(fd);
+            peer.close();
             // Both requests were served before the close was asked for, so both
             // answers must arrive: anything less is an answer that existed and
             // was then refused. Judging a round on "did anything arrive at all"
@@ -599,9 +569,9 @@ int main() {
                 if (gserver.sendTo(id, blob.data(), blob.size()) != SendResult::Ok) break;
         });
         expect(gserver.start(), "second server starts");
-        int gfd = connectTo(gcfg.port);
-        expect(gfd >= 0, "client connects");
-        sendAll(gfd, encode(FrameType::DATA, "go", 2));
+        harness::Peer peer;
+        expect(static_cast<bool>(peer.connect(gcfg.port)), "client connects");
+        peer.send(FrameType::DATA, "go", 2);
         // Read nothing on purpose: idle (300ms) parks the close, linger
         // (200ms) aborts it, the rest is margin for the tick.
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
@@ -620,7 +590,7 @@ int main() {
         expect(fsent == bsent / wire,
                "framesSent counts frames that left, not frames that were queued");
 
-        ::close(gfd);
+        peer.close();
         gserver.stop();
     }
 
