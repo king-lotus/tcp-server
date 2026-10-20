@@ -56,6 +56,7 @@
 #include <thread>
 #include <vector>
 
+#include "harness.h"
 #include "tcp-server-mt.h"
 
 using industrial::FrameType;
@@ -63,13 +64,6 @@ using industrial::MultiReactorServer;
 using industrial::SendResult;
 
 namespace {
-
-int gFailures = 0;
-
-void expect(bool ok, const char* what) {
-    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++gFailures;
-}
 
 // A case that asked the machine a question first and did not like the answer.
 // It says which question. It is not a pass.
@@ -103,41 +97,9 @@ uint16_t pickPort() {
     return ntohs(sa.sin_port);
 }
 
-int connectTo(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in sa{};
-    sa.sin_family      = AF_INET;
-    sa.sin_port        = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) { ::close(fd); return -1; }
-    return fd;
-}
-
-bool sendAll(int fd, const void* p, size_t n) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    size_t off = 0;
-    while (off < n) {
-        ssize_t k = ::send(fd, b + off, n - off, 0);
-        if (k <= 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        off += static_cast<size_t>(k);
-    }
-    return true;
-}
-
-std::vector<uint8_t> frame(FrameType t, const void* p, size_t n) {
-    std::vector<uint8_t> f(industrial::FRAME_HEADER_SIZE + n);
-    industrial::encodeFrameInto(f.data(), t, p, n);
-    return f;
-}
-
 MultiReactorServer::Config baseConfig() {
     MultiReactorServer::Config cfg;
     cfg.bindAddr      = "127.0.0.1";
-    cfg.port          = pickPort();
     cfg.numReactors   = 1;
     cfg.tickMs        = 50;
     cfg.idleTimeoutMs = 60000;   // nothing here may end by a timer
@@ -154,16 +116,15 @@ void caseFiveOutcomes() {
     // Overloaded does not have to outrun the drain to be observed.
     cfg.maxPendingBytes = industrial::FRAME_HEADER_SIZE * 4;
     cfg.wbufCapacity    = industrial::FRAME_HEADER_SIZE * 64;
-    MultiReactorServer server(cfg);
-    server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
-    if (!server.start()) { expect(false, "start() ok"); return; }
+    harness::Fixture server(cfg, [](uint64_t, const uint8_t*, size_t) {});
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    int fd = connectTo(cfg.port);
-    if (fd < 0) { expect(false, "client connected"); server.stop(); return; }
+    harness::Peer peer;
+    if (!peer.connect(server.port())) { harness::expect(false, "client connected"); return; }
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
 
-    const std::vector<uint64_t> ids = server.connectionIds();
-    if (ids.empty()) { expect(false, "connection registered"); ::close(fd); server.stop(); return; }
+    const std::vector<uint64_t> ids = server.server().connectionIds();
+    if (ids.empty()) { harness::expect(false, "connection registered"); return; }
     const uint64_t id = ids[0];
 
     const std::string small(4, 'a');
@@ -172,42 +133,43 @@ void caseFiveOutcomes() {
     // this case is the only thing running.
     const uint64_t neverIssued = 999999;
 
-    const SendResult ok      = server.sendTo(id, small.data(), small.size());
-    const SendResult unknown = server.sendTo(neverIssued, small.data(), small.size());
-    const SendResult tooBig  = server.sendTo(id, small.data(),
+    const SendResult ok      = server.server().sendTo(id, small.data(), small.size());
+    const SendResult unknown = server.server().sendTo(neverIssued, small.data(), small.size());
+    const SendResult tooBig  = server.server().sendTo(id, small.data(),
                                              industrial::MAX_FRAME_PAYLOAD + 1);
-    const SendResult noData  = server.sendTo(id, nullptr, 5);
-    const SendResult over    = server.sendTo(id, big.data(), big.size());
+    const SendResult noData  = server.server().sendTo(id, nullptr, 5);
+    const SendResult over    = server.server().sendTo(id, big.data(), big.size());
 
     std::printf("      Ok=%s NotConnected=%s TooLarge=%s InvalidArgument=%s "
                 "Overloaded=%s\n",
                 name(ok), name(unknown), name(tooBig), name(noData), name(over));
 
-    expect(ok == SendResult::Ok, "a live connection: Ok");
-    expect(unknown == SendResult::NotConnected, "an id that was never issued: NotConnected");
-    expect(tooBig == SendResult::TooLarge, "a payload past MAX_FRAME_PAYLOAD: TooLarge");
-    expect(noData == SendResult::InvalidArgument, "data == nullptr with len > 0: InvalidArgument");
-    expect(over == SendResult::Overloaded, "a frame past maxPendingBytes: Overloaded");
+    harness::expect(ok == SendResult::Ok, "a live connection: Ok");
+    harness::expect(unknown == SendResult::NotConnected, "an id that was never issued: NotConnected");
+    harness::expect(tooBig == SendResult::TooLarge, "a payload past MAX_FRAME_PAYLOAD: TooLarge");
+    harness::expect(noData == SendResult::InvalidArgument, "data == nullptr with len > 0: InvalidArgument");
+    harness::expect(over == SendResult::Overloaded, "a frame past maxPendingBytes: Overloaded");
 
     // The fifth value, on the state R6-3 is about: a close this caller asked
     // for. Baselines are taken after the close is in effect, so the backlog the
     // close itself refuses is not confused with the send under test.
-    server.closeConnection(id);
+    server.server().closeConnection(id);
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     const unsigned long long qd0 = server.stats().queueDrops.load();
     const unsigned long long bd0 = server.stats().bytesDropped.load();
-    expect(server.connectionCount() == 1, "the closing connection is still in the table");
-    const SendResult closing = server.sendTo(id, small.data(), small.size());
+    harness::expect(server.server().connectionCount() == 1,
+                    "the closing connection is still in the table");
+    const SendResult closing = server.server().sendTo(id, small.data(), small.size());
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     std::printf("      while closing: %s (queueDrops +%llu, bytesDropped +%llu)\n",
                 name(closing), server.stats().queueDrops.load() - qd0,
                 server.stats().bytesDropped.load() - bd0);
-    expect(closing == SendResult::Closed, "a connection whose close is in progress: Closed");
-    expect(server.stats().queueDrops.load() - qd0 == 0 &&
+    harness::expect(closing == SendResult::Closed, "a connection whose close is in progress: Closed");
+    harness::expect(server.stats().queueDrops.load() - qd0 == 0 &&
            server.stats().bytesDropped.load() - bd0 == 0,
            "and it bought no drops: the refusal happens before any accounting");
 
-    ::close(fd);
+    peer.close();
     server.stop();
 }
 
@@ -252,23 +214,24 @@ int serverUnderCeiling(uint16_t port) {
 void caseAcceptErrors() {
     std::printf("acceptErrors: the accept loop under a descriptor ceiling\n");
     const uint16_t port = pickPort();
-    if (port == 0) { expect(false, "a port to bind"); return; }
+    if (port == 0) { harness::expect(false, "a port to bind"); return; }
 
     pid_t pid = ::fork();
     if (pid == 0) ::_exit(serverUnderCeiling(port));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
-    std::vector<int> peers;
+    std::vector<harness::Peer> peers;
     for (int i = 0; i < 40; ++i) {
-        const int fd = connectTo(port);
-        if (fd >= 0) peers.push_back(fd);
+        harness::Peer p;
+        if (p.connect(port)) peers.push_back(std::move(p));
     }
     int status = 0;
     ::waitpid(pid, &status, 0);
-    for (int fd : peers) ::close(fd);
-    std::printf("      %zu peers connected before the child ran out\n", peers.size());
+    const size_t connected = peers.size();   // read before the peers go away
+    peers.clear();
+    std::printf("      %zu peers connected before the child ran out\n", connected);
 
-    expect(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+    harness::expect(WIFEXITED(status) && WEXITSTATUS(status) == 0,
            "refused accepts are counted, not swallowed");
 }
 
@@ -333,41 +296,41 @@ void caseHupErr() {
         return;
     }
 
-    MultiReactorServer::Config cfg = baseConfig();
-    MultiReactorServer server(cfg);
     std::atomic<int> hups{0};
-    server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
-    server.setCloseHandler([&](uint64_t, const std::string&, const char* reason) {
-        if (reason && std::strcmp(reason, "hup/err") == 0) hups.fetch_add(1);
-    });
-    if (!server.start()) { expect(false, "start() ok"); return; }
+    harness::Fixture server(
+        baseConfig(),
+        [](uint64_t, const uint8_t*, size_t) {},
+        [&hups](uint64_t, const std::string&, const char* reason) {
+            if (reason && std::strcmp(reason, "hup/err") == 0) hups.fetch_add(1);
+        });
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    int fd = connectTo(cfg.port);
-    if (fd < 0) { expect(false, "client connected"); server.stop(); return; }
+    harness::Peer peer;
+    if (!peer.connect(server.port())) { harness::expect(false, "client connected"); return; }
+    const int fd = peer.fd();
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    const std::vector<uint64_t> ids = server.connectionIds();
-    if (ids.empty()) { expect(false, "connection registered"); ::close(fd); server.stop(); return; }
+    const std::vector<uint64_t> ids = server.server().connectionIds();
+    if (ids.empty()) { harness::expect(false, "connection registered"); return; }
 
     // A request first, so the connection is one that has carried traffic in
     // both directions; then bytes the peer will not read; then the abort.
-    const std::vector<uint8_t> request = frame(FrameType::DATA, "hi", 2);
-    if (!sendAll(fd, request.data(), request.size())) {
-        expect(false, "request sent");
-        ::close(fd); server.stop(); return;
+    if (!peer.send(FrameType::DATA, "hi", 2)) {
+        harness::expect(false, "request sent");
+        return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const std::string payload(64, 'x');
-    (void)server.sendTo(ids[0], payload.data(), payload.size());
+    (void)server.server().sendTo(ids[0], payload.data(), payload.size());
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     struct linger lg{};
     lg.l_onoff  = 1;
     lg.l_linger = 0;
     ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
-    ::close(fd);
+    peer.close();
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
     std::printf("      close reasons matching hup/err: %d\n", hups.load());
-    expect(hups.load() >= 1, "a broken socket is closed as hup/err, without a drain attempt");
+    harness::expect(hups.load() >= 1, "a broken socket is closed as hup/err, without a drain attempt");
     server.stop();
 }
 
@@ -378,7 +341,6 @@ int main() {
     caseFiveOutcomes();
     caseAcceptErrors();
     caseHupErr();
-    std::printf("\n%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
-                gFailures, gFailures == 1 ? "" : "s");
-    return gFailures == 0 ? 0 : 1;
+    std::printf("\n");
+    return harness::finish();
 }
