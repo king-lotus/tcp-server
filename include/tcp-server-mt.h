@@ -1003,6 +1003,23 @@ class MultiReactorServer {
     // server that is still there.
     void        closeListenSocket() noexcept;
     void        acceptLoop(std::promise<bool>& ready) noexcept;
+    // start() was eight steps in one body, and acceptLoop() was seven. Each of
+    // these is one of them. The split is mechanical: the statements and their
+    // order are unchanged, so the only thing that moved is where a reader has
+    // to look. Every one of them still runs with lifecycleMutex_ held, from
+    // start() -- none of them may be called from anywhere else.
+    bool        validateConfig() const noexcept;
+    void        warnCoarseTick() const noexcept;
+    void        clampConfig() noexcept;
+    void        ensureFdLimit() const noexcept;
+    bool        spawnReactors() noexcept;
+    bool        startAcceptThread() noexcept;
+    void        rollbackStart() noexcept;
+    bool        setupAcceptEpoll() noexcept;
+    void        acceptBatch() noexcept;
+    static std::string formatPeer(const struct sockaddr_storage& ss,
+                                  socklen_t slen);
+    static void tuneAcceptedSocket(int fd) noexcept;
     SubReactor* pickReactor() noexcept;
 
     Config cfg_;
@@ -2708,12 +2725,10 @@ inline void MultiReactorServer::closeListenSocket() noexcept {
     boundPort_.store(0, std::memory_order_release);
 }
 
-inline bool MultiReactorServer::start() noexcept {
-    if (callbackServer_ == this) return false;
-    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
-    if (life_.load(std::memory_order_acquire) != Life::Stopped) return false;
-    life_.store(Life::Starting, std::memory_order_release);
-    failed_.store(false, std::memory_order_release);
+inline bool MultiReactorServer::validateConfig() const noexcept {
+    // The whole of start()'s refusal test, in the order it was written. A
+    // component left over from a previous run is as much a reason to refuse as
+    // a nonsensical number is.
     if (!reactors_.empty() || acceptThread_.joinable() ||
         cfg_.rbufCapacity < FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD ||
         cfg_.wbufCapacity < FRAME_HEADER_SIZE ||
@@ -2721,10 +2736,12 @@ inline bool MultiReactorServer::start() noexcept {
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 ||
         cfg_.idleTimeoutMs <= 0 || cfg_.writeBudgetBytes == 0 ||
         cfg_.closeLingerMs <= 0 || cfg_.backlog <= 0) {
-        life_.store(Life::Stopped, std::memory_order_release);
         return false;
     }
+    return true;
+}
 
+inline void MultiReactorServer::warnCoarseTick() const noexcept {
     // Deadline granularity: both timeouts only fire on tick boundaries, so a
     // tick coarser than the deadline silently stretches it by up to a full
     // tick. Warn rather than refuse -- a coarse tick with long deadlines is a
@@ -2736,12 +2753,16 @@ inline bool MultiReactorServer::start() noexcept {
                      "boundaries, so each can land up to a full tick late\n",
                      cfg_.tickMs, cfg_.closeLingerMs, cfg_.idleTimeoutMs);
     }
+}
 
+inline void MultiReactorServer::clampConfig() noexcept {
     // Configuration validation
     if (cfg_.maxPendingBytes > cfg_.wbufCapacity) {
         cfg_.maxPendingBytes = cfg_.wbufCapacity;
     }
+}
 
+inline void MultiReactorServer::ensureFdLimit() const noexcept {
     // ---- fd ceiling: raise it if we can, and say how far it goes if we cannot
     // ----
     // Warning and starting anyway hands operations a server that accepts the
@@ -2784,32 +2805,9 @@ inline bool MultiReactorServer::start() noexcept {
                 cur > 64 ? cur - 64 : 0);
         }
     }
+}
 
-    if (!initListenSocket()) {
-        life_.store(Life::Stopped, std::memory_order_release); return false;
-    }
-
-    // ---- Running must be visible before any worker thread is constructed ----
-    // Every worker asks isRunning() whether it should keep working, and every
-    // worker asks it the instant its thread starts - long before this function
-    // gets anywhere near returning. Publishing Running later is therefore a
-    // race that each worker loses by default: it reads Starting, concludes the
-    // server never came up, and returns without ever reaching epoll_wait.
-    //
-    // Two instances of exactly this have shipped. The accept loop read Starting
-    // and fell through to its teardown, closing the listening socket while
-    // start() still answered true (P0-3). The reactors survived only when they
-    // happened to start slowly enough to see this store; a fast one exited with
-    // running_ = false and then quietly refused every connection round-robin
-    // handed it, which looked like nothing at all from the client side - the
-    // socket was accepted and closed again immediately, no logs, no counters
-    // anyone thinks to read.
-    //
-    // Everything above here already fails through the recovery path below and
-    // reports false; everything below here is threads that read this value the
-    // moment they come into existence. There is nothing left to wait for.
-    life_.store(Life::Running, std::memory_order_release);
-
+inline bool MultiReactorServer::spawnReactors() noexcept {
     // Same resolution as everywhere else; see Config::resolvedReactorCount for
     // why this is not computed here.
     int nReactors = cfg_.resolvedReactorCount();
@@ -2840,7 +2838,10 @@ inline bool MultiReactorServer::start() noexcept {
         closeListenSocket();
         life_.store(Life::Stopped, std::memory_order_release); return false;
     }
+    return true;
+}
 
+inline bool MultiReactorServer::startAcceptThread() noexcept {
     // ---- startup handshake: start() returns once the accept thread reports in
     // ----
     // Success means "the accept loop is armed and no component has failed yet",
@@ -2855,13 +2856,14 @@ inline bool MultiReactorServer::start() noexcept {
             acceptLoop(*ready);
         });
         if (fut.get()) {
-            if (!failed_.load(std::memory_order_acquire)) {
-                return true;
-            }
+            return !failed_.load(std::memory_order_acquire);
         }
     } catch (...) {
     }
+    return false;
+}
 
+inline void MultiReactorServer::rollbackStart() noexcept {
     life_.store(Life::Stopping, std::memory_order_release);
     if (acceptThread_.joinable()) acceptThread_.join();
     for (auto& r : reactors_) r->stop();
@@ -2875,8 +2877,55 @@ inline bool MultiReactorServer::start() noexcept {
     closeListenSocket();
     failed_.store(false, std::memory_order_release);
     life_.store(Life::Stopped, std::memory_order_release);
+}
+
+inline bool MultiReactorServer::start() noexcept {
+    if (callbackServer_ == this) return false;
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    if (life_.load(std::memory_order_acquire) != Life::Stopped) return false;
+    life_.store(Life::Starting, std::memory_order_release);
+    failed_.store(false, std::memory_order_release);
+    if (!validateConfig()) {
+        life_.store(Life::Stopped, std::memory_order_release);
+        return false;
+    }
+
+    warnCoarseTick();
+    clampConfig();
+    ensureFdLimit();
+
+    if (!initListenSocket()) {
+        life_.store(Life::Stopped, std::memory_order_release); return false;
+    }
+
+    // ---- Running must be visible before any worker thread is constructed ----
+    // Every worker asks isRunning() whether it should keep working, and every
+    // worker asks it the instant its thread starts - long before this function
+    // gets anywhere near returning. Publishing Running later is therefore a
+    // race that each worker loses by default: it reads Starting, concludes the
+    // server never came up, and returns without ever reaching epoll_wait.
+    //
+    // Two instances of exactly this have shipped. The accept loop read Starting
+    // and fell through to its teardown, closing the listening socket while
+    // start() still answered true (P0-3). The reactors survived only when they
+    // happened to start slowly enough to see this store; a fast one exited with
+    // running_ = false and then quietly refused every connection round-robin
+    // handed it, which looked like nothing at all from the client side - the
+    // socket was accepted and closed again immediately, no logs, no counters
+    // anyone thinks to read.
+    //
+    // Everything above here already fails through the recovery path below and
+    // reports false; everything below here is threads that read this value the
+    // moment they come into existence. There is nothing left to wait for.
+    life_.store(Life::Running, std::memory_order_release);
+
+    if (!spawnReactors()) return false;
+    if (startAcceptThread()) return true;
+
+    rollbackStart();
     return false;
 }
+
 
 inline void MultiReactorServer::stop() noexcept {
     if (callbackServer_ == this) {
@@ -2943,10 +2992,10 @@ inline SubReactor* MultiReactorServer::pickReactor() noexcept {
     return reactors_[i].get();
 }
 
-inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
-    bool ok = false;
-    try {
-    {
+inline bool MultiReactorServer::setupAcceptEpoll() noexcept {
+    // The lock covers publication, the wake write and fd teardown, which is
+    // what stop() takes it for; the whole create/eventfd/ADD sequence has to
+    // stay inside one critical section or a half-built set becomes visible.
     std::lock_guard<std::mutex> descriptors(acceptFdMutex_);
     epollFd_ = ::epoll_create1(EPOLL_CLOEXEC);
     if (epollFd_ >= 0) {
@@ -2957,135 +3006,153 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
             if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, listenFd_, &ev) == 0) {
                 ev.data.fd = wakeFd_;
                 if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, wakeFd_, &ev) == 0) {
-                    ok = true;
+                    return true;
                 }
             }
         }
     }
-    }
+    return false;
+}
 
-    try {
-        ready.set_value(ok);
-    } catch (...) {}
-    // Descriptor setup failure is the accept loop's own failure: raise the
-    // shared
-    // flag instead of forcing the whole lifecycle down, so start() reports
-    // false
-    // through its normal recovery path rather than racing on the state.
-    if (!ok) {
-        fail(); return;
+inline std::string MultiReactorServer::formatPeer(
+        const struct sockaddr_storage& ss, socklen_t slen) {
+    char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+    std::string peer = "unknown";
+    if (getnameinfo(reinterpret_cast<const struct sockaddr*>(&ss), slen,
+                    hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+                    NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+        try {
+            peer.assign(hbuf);
+            peer.push_back(':');
+            peer.append(sbuf);
+        } catch (...) { peer = "unknown"; }
     }
+    return peer;
+}
 
-    std::array<struct epoll_event, 64> events{};
-    while (ok && isRunning()) {
-#ifdef INDUSTRIAL_TCP_TESTING
-        if (failAcceptForTest.exchange(false)) throw 1;
-#endif
-        int n = ::epoll_wait(epollFd_, events.data(),
-                             static_cast<int>(events.size()), 500);
-        if (n < 0) {
+inline void MultiReactorServer::tuneAcceptedSocket(int fd) noexcept {
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
+    int ka_idle = 30, ka_intvl = 10, ka_cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,
+               &ka_idle, sizeof(ka_idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,
+               &ka_intvl, sizeof(ka_intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,
+               &ka_cnt, sizeof(ka_cnt));
+}
+
+inline void MultiReactorServer::acceptBatch() noexcept {
+    // bounded accept, so a flood of new connections cannot starve the other fds
+    constexpr int kMaxAcceptPerRound = 64;
+    for (int k = 0; k < kMaxAcceptPerRound; ++k) {
+        struct sockaddr_storage ss{};
+        socklen_t slen = sizeof(ss);
+        int cfd = ::accept4(listenFd_, (struct sockaddr*)&ss, &slen,
+                            SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (cfd < 0) {
             if (errno == EINTR) continue;
-            stats_.reactorFailures.fetch_add(1, std::memory_order_relaxed);
-            fail();
-            break;
-        }
-        for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
-            if (fd == wakeFd_) {
-                uint64_t v = 0;
-                ssize_t r = ::read(wakeFd_, &v, sizeof(v)); (void)r;
+            // Out of descriptors is not an error to swallow and it is
+            // not one to spin on either: the listening socket stays
+            // readable, so returning to epoll_wait immediately means
+            // burning a core rejecting nothing. It is also the one
+            // accept failure that can be predicted at startup and
+            // therefore should be countable -- without a counter the
+            // only symptom is "it stopped accepting and said nothing".
+            if (errno == EMFILE || errno == ENFILE) {
+                stats_.acceptErrors.fetch_add(
+                    1, std::memory_order_relaxed);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
                 continue;
             }
-            if (fd != listenFd_) continue;
+            break;
+        }
+        FdGuard cfdGuard(cfd);
 
-            // bounded accept, so a flood of new connections cannot starve the
-            // other fds
-            constexpr int kMaxAcceptPerRound = 64;
-            for (int k = 0; k < kMaxAcceptPerRound; ++k) {
-                struct sockaddr_storage ss{};
-                socklen_t slen = sizeof(ss);
-                int cfd = ::accept4(listenFd_, (struct sockaddr*)&ss, &slen,
-                                    SOCK_NONBLOCK | SOCK_CLOEXEC);
-                if (cfd < 0) {
-                    if (errno == EINTR) continue;
-                    // Out of descriptors is not an error to swallow and it is
-                    // not one to spin on either: the listening socket stays
-                    // readable, so returning to epoll_wait immediately means
-                    // burning a core rejecting nothing. It is also the one
-                    // accept failure that can be predicted at startup and
-                    // therefore should be countable -- without a counter the
-                    // only symptom is "it stopped accepting and said nothing".
-                    if (errno == EMFILE || errno == ENFILE) {
-                        stats_.acceptErrors.fetch_add(
-                            1, std::memory_order_relaxed);
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(1));
-                        continue;
-                    }
-                    break;
-                }
-                FdGuard cfdGuard(cfd);
+        bool reject = false;
+        {
+            if (admitted_.load() >=
+                static_cast<size_t>(cfg_.maxConnections))
+                reject = true;
+        }
+        if (reject) {
+            stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+            continue;   // cfdGuard closes it
+        }
 
-                bool reject = false;
-                {
-                    if (admitted_.load() >=
-                        static_cast<size_t>(cfg_.maxConnections))
-                        reject = true;
-                }
-                if (reject) {
-                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                    continue;   // cfdGuard closes it
-                }
+        tuneAcceptedSocket(cfd);
 
-                int one = 1;
-                setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
-                setsockopt(cfd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
-                int ka_idle = 30, ka_intvl = 10, ka_cnt = 3;
-                setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE,
-                           &ka_idle, sizeof(ka_idle));
-                setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL,
-                           &ka_intvl, sizeof(ka_intvl));
-                setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT,
-                           &ka_cnt, sizeof(ka_cnt));
+        try {
+            std::string peer = formatPeer(ss, slen);
 
-                try {
-                char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
-                std::string peer = "unknown";
-                if (getnameinfo((struct sockaddr*)&ss, slen, hbuf, sizeof(hbuf),
-                                sbuf, sizeof(sbuf),
-                                NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-                    try {
-                        peer.assign(hbuf);
-                        peer.push_back(':');
-                        peer.append(sbuf);
-                    } catch (...) { peer = "unknown"; }
-                }
+            SubReactor* r = pickReactor();
+            if (!r) continue;   // cfdGuard closes it
 
-                SubReactor* r = pickReactor();
-                if (!r) continue;   // cfdGuard closes it
-
-                uint64_t id = nextConnId_.fetch_add(
-                    1, std::memory_order_relaxed);
-                // Submission consumes ownership on both success and rejection.
-                // accepted is NOT bumped here: queueing a task is not a
-                // connection.
-                // The reactor bumps it once the socket is registered in both
-                // maps,
-                // so a task that fails during registration counts as rejected
-                // only.
-                auto admission = std::make_shared<Admission>(admitted_);
-                if (!r->submitNewConnection(std::move(cfdGuard),
-                                            std::move(peer), id,
-                                            std::move(admission))) {
-                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                }
-                } catch (...) {
-                    // Before handoff, cfdGuard still owns the accepted socket.
-                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                }
+            uint64_t id = nextConnId_.fetch_add(
+                1, std::memory_order_relaxed);
+            // Submission consumes ownership on both success and rejection.
+            // accepted is NOT bumped here: queueing a task is not a
+            // connection.
+            // The reactor bumps it once the socket is registered in both
+            // maps,
+            // so a task that fails during registration counts as rejected
+            // only.
+            auto admission = std::make_shared<Admission>(admitted_);
+            if (!r->submitNewConnection(std::move(cfdGuard),
+                                        std::move(peer), id,
+                                        std::move(admission))) {
+                stats_.rejected.fetch_add(1, std::memory_order_relaxed);
             }
+        } catch (...) {
+            // Before handoff, cfdGuard still owns the accepted socket.
+            stats_.rejected.fetch_add(1, std::memory_order_relaxed);
         }
     }
+}
+
+inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
+    bool ok = false;
+    try {
+        ok = setupAcceptEpoll();
+
+        try {
+            ready.set_value(ok);
+        } catch (...) {}
+        // Descriptor setup failure is the accept loop's own failure: raise the
+        // shared
+        // flag instead of forcing the whole lifecycle down, so start() reports
+        // false
+        // through its normal recovery path rather than racing on the state.
+        if (!ok) {
+            fail(); return;
+        }
+
+        std::array<struct epoll_event, 64> events{};
+        while (ok && isRunning()) {
+#ifdef INDUSTRIAL_TCP_TESTING
+            if (failAcceptForTest.exchange(false)) throw 1;
+#endif
+            int n = ::epoll_wait(epollFd_, events.data(),
+                                 static_cast<int>(events.size()), 500);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                stats_.reactorFailures.fetch_add(1, std::memory_order_relaxed);
+                fail();
+                break;
+            }
+            for (int i = 0; i < n; ++i) {
+                int fd = events[i].data.fd;
+                if (fd == wakeFd_) {
+                    uint64_t v = 0;
+                    ssize_t r = ::read(wakeFd_, &v, sizeof(v)); (void)r;
+                    continue;
+                }
+                if (fd != listenFd_) continue;
+                acceptBatch();
+            }
+        }
     } catch (...) {
         stats_.reactorFailures.fetch_add(1, std::memory_order_relaxed);
         fail();
@@ -3106,6 +3173,7 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
     }
     closeListenSocket();
 }
+
 
 inline bool MultiReactorServer::onConnectionOpened(
     uint64_t id, std::shared_ptr<Conn> c) noexcept {
