@@ -603,6 +603,15 @@ int main() {
         expect(st.accepted.load() == st.closed.load(),
                "accepted == closed after all connections ended");
         expect(st.accepted.load() >= 3, "all three clients were accepted");
+        // decide() and the hand-written branches must have agreed about every
+        // close this run performed. This is the only place that reads the
+        // counter: a non-zero value is not something a peer can provoke, it
+        // means the table and the branches have drifted, so the assertion is
+        // about the refactor rather than about the server. It has to be here
+        // and not in close_state_machine.cpp, because only a real run reaches
+        // expectClose() at all.
+        expect(st.closeStateMismatch.load() == 0,
+               "decide() and the close branches agreed on every transition");
         std::printf("  accepted=%llu closed=%llu aborted=%llu dropped=%llu handled=%d\n",
                     (unsigned long long)st.accepted.load(),
                     (unsigned long long)st.closed.load(),

@@ -95,14 +95,59 @@ grep -n "closeInputBytes\|closeStartedAtMs\|deferredRound\|peerClosed\|DeferredR
 
 diff 中新增行匹配 `make_shared|new |mutex|lock_guard|unique_lock|shared_lock` 的数量为 **0**。
 
-## E8 Linux 编译 — 未验证
+## E8 Linux 编译与集成 — PASS（一项环境性失败，已对照 main 排除）
 
-本机无 Linux（`wsl.exe` 被安全中心程序黑名单阻断）。已做的是：
+环境：WSL2 Ubuntu 22.04，`g++ 11.4.0`，8 核，`ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh`。
 
-- `msys64/ucrt64 g++ 15.2.0`，`-std=c++17 -Wall -Wextra` 编译**纯函数段**，零警告；
-- 全文件括号平衡检查（去注释与字符串后 `{}` `()` `[]` 均归零，无负深度）。
+| 项 | 结果 |
+|---|---|
+| `-Wall -Wextra -Werror` 编译 `verify/close_state_machine.cpp` | 通过，零警告 |
+| cpplint（`include/tcp-server-mt.h`） | **0 findings** |
+| plain 配置 | 11/12 绿 |
+| asan+ubsan 配置 | 11/12 绿 |
+| tsan 配置 | 11/12 绿 |
+| 合计 | **33/36** |
 
-**未做**：整个头文件在 Linux 上的编译，以及 `verify/run.sh` 的 33 种配置。
+**唯一失败项：`harness_selftest`，三个配置各一次。**
+
+失败内容是 D 用例 `expectClose(Rst)`：
+
+```
+[FAIL] RST was reported: expected RST, saw FIN
+[FAIL] and it is not reported as a FIN
+```
+
+这不是本次改动引起的。同一个日志里其它套件对同一件事给的是 `[SKIP]`：
+
+```
+[SKIP] no wire RST is observable on this kernel: it ignores SO_LINGER{on,0}
+       (checked against a bare socket pair), so case C can only assert the
+       server's own evidence here
+```
+
+WSL2 内核不把 `SO_LINGER{on,0}` 变成可观测的 RST，于是 harness 自己的 RST 检测器无法被验证。`harness_selftest` 没有做这个前置探测，直接断言，所以它红了。
+
+对照实验（决定性证据）：在 `main`（`6d1eedd`，重构前）上单独编译并运行同一个用例：
+
+```
+$ g++ -std=c++17 -Wall -Wextra -Iinclude verify/harness_selftest.cpp -o /tmp/hs_main
+$ /tmp/hs_main
+D. expectClose(Rst) recognises a reset
+  [PASS] peer connected
+  [FAIL] RST was reported: expected RST, saw FIN
+  [FAIL] and it is not reported as a FIN
+```
+
+**逐字相同。** 与本次重构无关，是环境限制。
+
+### 顺带发现的两件事（不属于 R3，未处理）
+
+1. `harness_selftest` 缺少其它套件都有的内核能力探测，所以它在本内核上是硬失败而不是 `[SKIP]`。这是"检查本身无法通过"的检查，按项目自己的标准应当先问机器再断言。
+2. `run.sh` 的退出码在本次执行中不可靠（`Result: FAILURES` 但 shell 拿到 0）。所以本次结论是逐行读每个套件的 `rc=` 得出的，不是看脚本退出码。
+
+### 行尾问题（环境）
+
+工作树是 CRLF（`core.autocrlf=true`，仓库无 `.gitattributes`），`set -euo pipefail\r` 在 bash 下直接报 `invalid option name`。验证在 `/tmp` 的 LF 副本上完成，内容与分支一致。**这只影响 Windows 侧检出后直接在 WSL 里跑**，不影响 CI。
 
 ---
 
@@ -128,6 +173,17 @@ diff 中新增行匹配 `make_shared|new |mutex|lock_guard|unique_lock|shared_lo
 
 ## 结论
 
-E1–E7 通过，E8 未验证。
+E1–E8 通过。33/36 绿，唯一红项在 `main` 上逐字复现，是内核能力问题而非代码问题。
 
-代码层面等价性成立；**运行时等价性未经集成验证**。项目规则是"无运行时证据不落结论"，所以这次改动在 `wsl.exe` 放行、`verify/run.sh` 跑绿之前，只能算"结构已就位、行为待证"。
+代码层面等价性成立，运行时等价性有集成证据支撑：plain / asan+ubsan / tsan 三种配置下，`close_semantics`（含 `CS_REACTORS=1`）、`idle_semantics`、`ping_pong`、`send_results`、`backpressure`、`fault_injection`、`reactor_spread`（两种 reactor 数）、`config_budget` 全部通过——也就是八轮评审落过的每一个关闭协议现场，都在重构后仍然成立。
+
+**`closeStateMismatch` 的证据**：`close_semantics.cpp` 的 D 段新增一条断言，运行结束后 `closeStateMismatch == 0`。它必须在这里而不是在 `close_state_machine.cpp`，因为只有真实运行才会走到 `expectClose()`。
+
+断言的有效性做了负向验证：把 `finishPeerClosed` 里一处 `expectClose(..., Park, ...)` 故意改成 `SendFin`，同一个套件立刻红：
+
+```
+[FAIL] decide() and the close branches agreed on every transition
+FAILURES (1 failure)
+```
+
+还原后 `ALL PASS (0 failures)`。所以这条断言不是"永远为真"的装饰。
