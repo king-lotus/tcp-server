@@ -769,55 +769,82 @@ struct Conn {
     // rbufCapacity is closed as incomplete) and by TCP keepalive, not by the
     // idle tick.
     int64_t    lastRecvMs = 0;
-    RingBuffer rbuf;
-    RingBuffer wbuf;
-    // Target state of this socket's EPOLLOUT bit, owned by the worker thread.
-    // armWrite/disarmWrite are idempotent transitions toward it, never blind
-    // epoll_ctl calls, so a stale EPOLLOUT event cannot tear down a live write
-    // interest (and a queued frame cannot be stranded without a wakeup).
-    bool       writeArmed = false;
-    // Bytes of the frame at the head of wbuf that have not reached the kernel.
-    // wbuf only ever receives whole frames, so the head is either inside
-    // exactly one frame or exactly at a frame boundary; this field says which,
-    // so the drain can count a frame when its last byte leaves instead of when
-    // it is queued. Reactor-thread-only, like wbuf itself.
-    size_t      sendFrameRemain = 0;
+
+    // Everything the reactor needs to move bytes: the two rings, the EPOLLOUT
+    // interest that goes with the write ring, and the frame boundary the drain
+    // is currently inside. One mechanism, so one name -- a write interest
+    // without the ring it serves is exactly the bug armWrite/disarmWrite exist
+    // to avoid, and it should not be expressible by touching one field and not
+    // the other.
+    struct Io {
+        RingBuffer rbuf;
+        RingBuffer wbuf;
+        // Target state of this socket's EPOLLOUT bit, owned by the worker
+        // thread. armWrite/disarmWrite are idempotent transitions toward it,
+        // never blind epoll_ctl calls, so a stale EPOLLOUT event cannot tear
+        // down a live write interest (and a queued frame cannot be stranded
+        // without a wakeup).
+        bool       writeArmed = false;
+        // Bytes of the frame at the head of wbuf that have not reached the
+        // kernel. wbuf only ever receives whole frames, so the head is either
+        // inside exactly one frame or exactly at a frame boundary; this field
+        // says which, so the drain can count a frame when its last byte leaves
+        // instead of when it is queued. Reactor-thread-only, like wbuf itself.
+        size_t     sendFrameRemain = 0;
+    } io;
+
     CloseState close;
 
     // Shared across threads from here down:
     std::atomic<bool>   isClosed{false};
-    // Admission credit for output: bytes reserved and not yet handed to the
-    // kernel, whether they are still sitting in a queued send task or already
-    // sitting in wbuf. It is one number covering both because neither one alone
-    // says whether the peer is being kept up with.
-    //
-    // Lifecycle, which has to be read as the three places it is touched rather
-    // than the one place it happens to stay level:
-    //   1. reserve    -- enqueueing a frame adds its length (PONG included);
-    //   2. migrate    -- moving a frame from a queued task into wbuf changes
-    //                    nothing, and that is the only reason some paths nearby
-    //                    do not visibly adjust it;
-    //   3. release -- subtracting what was actually written, what was dropped
-    //                    whole (capacity reject, closing connection, refused
-    //                    PONG), and what was still unsent when we tore down.
-    //
-    // Every release runs on the connection's owning reactor, so release/release
-    // never races. Reserving races between application threads and that same
-    // reactor's PONG path, and relaxed is enough for all of it: nothing
-    // non-atomic is published through this counter, the frame itself crosses
-    // under pendingMutex_, and RMW already guarantees no update is lost --
-    // which
-    // is the property that matters, because a lost decrement is a permanent
-    // leak and a visible one in any watermark built on top. Ordering past that
-    // would only buy freshness, and freshness is not something this number can
-    // promise anyway: it is a best-effort ceiling, so reading a stale value
-    // costs one refused frame, never correctness.
-    std::atomic<size_t> pendingBytes{0};
-    // Worker-owned continuation after a parsing budget.
-    bool readPending = false;
-    Conn* readNext = nullptr;
-    Conn* readPrev = nullptr;
-    std::shared_ptr<Admission> admission;
+
+    // What this connection is charged for. pendingBytes is the byte credit and
+    // admission is the slot ticket; they are grouped because they are the two
+    // halves of "how much of this connection is outstanding", and a path that
+    // releases one without the other is the leak the comments below describe.
+    struct Out {
+        // Admission credit for output: bytes reserved and not yet handed to
+        // the kernel, whether they are still sitting in a queued send task or
+        // already sitting in wbuf. It is one number covering both because
+        // neither one alone says whether the peer is being kept up with.
+        //
+        // Lifecycle, which has to be read as the three places it is touched
+        // rather than the one place it happens to stay level:
+        //   1. reserve    -- enqueueing a frame adds its length (PONG
+        //                    included);
+        //   2. migrate    -- moving a frame from a queued task into wbuf
+        //                    changes nothing, and that is the only reason some
+        //                    paths nearby do not visibly adjust it;
+        //   3. release -- subtracting what was actually written, what was
+        //                    dropped whole (capacity reject, closing
+        //                    connection, refused PONG), and what was still
+        //                    unsent when we tore down.
+        //
+        // Every release runs on the connection's owning reactor, so
+        // release/release never races. Reserving races between application
+        // threads and that same reactor's PONG path, and relaxed is enough for
+        // all of it: nothing non-atomic is published through this counter, the
+        // frame itself crosses under pendingMutex_, and RMW already guarantees
+        // no update is lost -- which is the property that matters, because a
+        // lost decrement is a permanent leak and a visible one in any
+        // watermark built on top. Ordering past that would only buy freshness,
+        // and freshness is not something this number can promise anyway: it is
+        // a best-effort ceiling, so reading a stale value costs one refused
+        // frame, never correctness.
+        std::atomic<size_t> pendingBytes{0};
+        std::shared_ptr<Admission> admission;
+    } out;
+
+    // The reactor's read-continuation list. Intrusive: a Conn is in it at most
+    // once, and these three fields are the list's state, not the connection's.
+    // They are grouped under a name that says so, so the next reader does not
+    // have to work out which of Conn's fields a scheduler owns.
+    struct Link {
+        // Worker-owned continuation after a parsing budget.
+        bool  pending = false;
+        Conn* next = nullptr;
+        Conn* prev = nullptr;
+    } link;
 
     // Which of the four close phases this connection is in. Derived, so the
     // three flags cannot disagree about it -- which is the whole point of
@@ -838,6 +865,7 @@ struct Conn {
         }
     }
 };
+
 
 // How far a drain got. These used to be 0 / 1 / -1 with two different outcomes
 // sharing the 0: the while-loop ending because wbuf was empty, and EPIPE. The
@@ -1461,10 +1489,10 @@ inline bool SubReactor::submitNewConnection(
                 c->id = id;
                 c->peer = std::move(peer);
                 c->owner = this;
-                c->admission = std::move(admission);
+                c->out.admission = std::move(admission);
                 c->lastRecvMs = nowMs();
-                c->rbuf.init(server_->rbufCapacity());
-                c->wbuf.init(server_->wbufCapacity());
+                c->io.rbuf.init(server_->rbufCapacity());
+                c->io.wbuf.init(server_->wbufCapacity());
 
                 struct epoll_event ev{};
                 ev.events = EPOLLIN; ev.data.fd = socket->fd;
@@ -1573,7 +1601,8 @@ inline bool SubReactor::submitSend(uint64_t id,
             // peer.
             if (c->isClosed.load(std::memory_order_acquire) ||
                 c->close.closing.load(std::memory_order_acquire)) {
-                c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
+                c->out.pendingBytes.fetch_sub(
+                    f.size(), std::memory_order_relaxed);
                 // One refusal, two questions, two counters: how many replies
                 // never went out (queueDrops) and how much data the peer never
                 // received (bytesDropped). Recording whichever one this branch
@@ -1607,15 +1636,16 @@ inline bool SubReactor::submitSend(uint64_t id,
             // one
             // event that operations may want to read either way, and recording
             // whichever one this branch reached is what made them incomparable.
-            if (c->wbuf.writable() < f.size()) {
-                c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
+            if (c->io.wbuf.writable() < f.size()) {
+                c->out.pendingBytes.fetch_sub(
+                    f.size(), std::memory_order_relaxed);
                 server_->statsRef().bytesDropped.fetch_add(
                     f.size(), std::memory_order_relaxed);
                 server_->statsRef().queueDrops.fetch_add(
                     1, std::memory_order_relaxed);
                 return;
             }
-            c->wbuf.write(f.data(), f.size());
+            c->io.wbuf.write(f.data(), f.size());
             // No release here: this is step 2 above, the byte count moving from
             // "reserved by this task" to "reserved in wbuf". The drop branch
             // just
@@ -1676,11 +1706,11 @@ inline void SubReactor::armWrite(Conn* c) noexcept {
     // each
     // time bytes arrive would spin this reactor on level-triggered EPOLLOUT for
     // the rest of the connection's life.
-    if (c->writeArmed || c->fd < 0) return;
+    if (c->io.writeArmed || c->fd < 0) return;
     struct epoll_event ev{};
     ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = c->fd;
     if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) == 0) {
-        c->writeArmed = true;
+        c->io.writeArmed = true;
         return;
     }
     if (errno == ENOENT) {
@@ -1688,7 +1718,7 @@ inline void SubReactor::armWrite(Conn* c) noexcept {
         // with
         // ADD and adopt the write interest in the same call.
         if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, c->fd, &ev) == 0) {
-            c->writeArmed = true;
+            c->io.writeArmed = true;
             return;
         }
     }
@@ -1705,7 +1735,7 @@ inline void SubReactor::disarmWrite(Conn* c) noexcept {
     // interest is gone while writeArmed is still true, and skipping the MOD
     // there would leave a half-closed connection spinning on a level-triggered
     // event it can never consume.
-    if (!c->writeArmed || c->fd < 0) return;
+    if (!c->io.writeArmed || c->fd < 0) return;
     // No "still has bytes to flush" guard belongs here: dropping the interest
     // while wbuf holds bytes is exactly what strands them, and both callers
     // (handleWrite, after the drain emptied wbuf, and the finSent path) have
@@ -1719,14 +1749,14 @@ inline void SubReactor::disarmWrite(Conn* c) noexcept {
         closeConn(c, "epoll read registration failed", false);
         return;
     }
-    c->writeArmed = false;
+    c->io.writeArmed = false;
 }
 
 inline DrainOutcome SubReactor::drainWbufToSocket(Conn* c) noexcept {
     size_t budget = server_->cfg_.writeBudgetBytes;
-    while (!c->wbuf.empty()) {
+    while (!c->io.wbuf.empty()) {
         if (!budget) return DrainOutcome::Stalled;
-        auto s = c->wbuf.spans();
+        auto s = c->io.wbuf.spans();
         // Send both wrapped ring segments in one syscall, within the fair-share
         // byte budget. A larger configured budget trades latency for
         // throughput.
@@ -1765,29 +1795,29 @@ inline DrainOutcome SubReactor::drainWbufToSocket(Conn* c) noexcept {
             size_t off  = 0;   // where the current frame starts, from the head
             size_t left = static_cast<size_t>(k);
             while (left > 0) {
-                if (c->sendFrameRemain == 0) {
+                if (c->io.sendFrameRemain == 0) {
                     // Whole frames only ever enter wbuf, so a boundary inside
                     // the readable region always has a full header behind it.
                     uint8_t hdr[FRAME_HEADER_SIZE];
-                    c->wbuf.peekAt(off, hdr, FRAME_HEADER_SIZE);
+                    c->io.wbuf.peekAt(off, hdr, FRAME_HEADER_SIZE);
                     const uint32_t flen = (static_cast<uint32_t>(hdr[4]) << 24)
                                         | (static_cast<uint32_t>(hdr[5]) << 16)
                                         | (static_cast<uint32_t>(hdr[6]) <<  8)
                                         |  static_cast<uint32_t>(hdr[7]);
-                    c->sendFrameRemain = FRAME_HEADER_SIZE + flen;
+                    c->io.sendFrameRemain = FRAME_HEADER_SIZE + flen;
                 }
-                const size_t take = std::min(left, c->sendFrameRemain);
-                c->sendFrameRemain -= take;
+                const size_t take = std::min(left, c->io.sendFrameRemain);
+                c->io.sendFrameRemain -= take;
                 left -= take;
                 off += take;
-                if (c->sendFrameRemain == 0)
+                if (c->io.sendFrameRemain == 0)
                     server_->statsRef().framesSent.fetch_add(
                         1, std::memory_order_relaxed);
             }
         }
-        c->wbuf.consume(static_cast<size_t>(k));
+        c->io.wbuf.consume(static_cast<size_t>(k));
         budget -= static_cast<size_t>(k);
-        c->pendingBytes.fetch_sub(
+        c->out.pendingBytes.fetch_sub(
             static_cast<size_t>(k), std::memory_order_relaxed);
         server_->statsRef().bytesSent.fetch_add(static_cast<uint64_t>(k),
                                                   std::memory_order_relaxed);
@@ -1819,14 +1849,14 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             return dispatched();
         }
 
-        if (c->rbuf.writable() == 0) {
+        if (c->io.rbuf.writable() == 0) {
             // Still full after parsing: the partial frame can never fit, close
             // it.
             closeConn(c, "rbuf full with incomplete frame", false);
             return dispatched();
         }
 
-        auto slot = c->rbuf.reserve(static_cast<size_t>(bytesLeft));
+        auto slot = c->io.rbuf.reserve(static_cast<size_t>(bytesLeft));
         if (!slot) {
             // The ring has wrapped and its tail is full: come back after a
             // round has consumed something.
@@ -1920,7 +1950,7 @@ inline void SubReactor::handleWrite(Conn* c) noexcept {
         return;
     }
     // fair-share budget or EAGAIN: EPOLLOUT refires
-    if (!c->wbuf.empty()) return;
+    if (!c->io.wbuf.empty()) return;
 
     // A parked peer-close finishes here, deterministically, instead of waiting
     // for the next spurious EPOLLIN to notice the drain completed.
@@ -2001,7 +2031,7 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
     // Never FIN over bytes still in wbuf: they would be lost, and the peer
     // would
     // see a clean end to a truncated stream.
-    if (!c->wbuf.empty()) return false;
+    if (!c->io.wbuf.empty()) return false;
     if (::shutdown(c->fd, SHUT_WR) < 0) return false;
     // Invariant I1: a FIN only ever leaves a connection that is already
     // closing. Two call sites hold that today; nothing in the type system does,
@@ -2054,10 +2084,10 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
     // branches below are about to read. Each branch then checks itself against
     // it; a disagreement is counted and the original path still runs.
     CloseFacts facts;
-    facts.wbufEmpty = c->wbuf.empty();
-    facts.pending = c->pendingBytes.load(std::memory_order_relaxed) > 0;
+    facts.wbufEmpty = c->io.wbuf.empty();
+    facts.pending = c->out.pendingBytes.load(std::memory_order_relaxed) > 0;
     facts.round = c->close.round;
-    if (!c->wbuf.empty()) {
+    if (!c->io.wbuf.empty()) {
         expectClose(c, CloseEvent::PeerFin, CloseAction::Park, facts);
         // Parked with the write side still productive. Read interest is dropped
         // for the rest of the drain (see the header comment): the only thing a
@@ -2067,7 +2097,7 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
             wev.events  = EPOLLOUT;
             wev.data.fd = c->fd;
             if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &wev) == 0) {
-                c->writeArmed = true;
+                c->io.writeArmed = true;
                 return;                    // parked: handleWrite resumes it
             }
             if (errno == ENOENT) {
@@ -2080,7 +2110,7 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
                 // and reads gets what was already in flight and then hangs
                 // (measured: 3MB of 16MB, then nothing).
                 if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, c->fd, &wev) == 0) {
-                    c->writeArmed = true;
+                    c->io.writeArmed = true;
                     return;
                 }
             }
@@ -2109,7 +2139,7 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
     }
     if (!c->close.closing.load(std::memory_order_acquire) &&
         c->close.round == CloseRound::None &&
-        c->pendingBytes.load(std::memory_order_relaxed) > 0) {
+        c->out.pendingBytes.load(std::memory_order_relaxed) > 0) {
         expectClose(c, CloseEvent::PeerFin, CloseAction::DeferPark, facts);
         c->close.round = CloseRound::PeerClosed;
         // The round is claimed from here on, even if the hand-off below fails:
@@ -2147,8 +2177,8 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
 inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
     uint8_t hdr[FRAME_HEADER_SIZE];
     while (server_->isRunning() && framesLeft > 0 &&
-           c->rbuf.readable() >= FRAME_HEADER_SIZE) {
-        c->rbuf.peek(hdr, FRAME_HEADER_SIZE);
+           c->io.rbuf.readable() >= FRAME_HEADER_SIZE) {
+        c->io.rbuf.peek(hdr, FRAME_HEADER_SIZE);
         uint16_t magic = (static_cast<uint16_t>(hdr[0]) << 8) | hdr[1];
         if (magic != FRAME_MAGIC) {
             server_->statsRef().parseErrors.fetch_add(
@@ -2167,9 +2197,9 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             closeConn(c, "frame too large", false); return;
         }
         // partial frame, wait for more
-        if (c->rbuf.readable() < FRAME_HEADER_SIZE + len) return;
+        if (c->io.rbuf.readable() < FRAME_HEADER_SIZE + len) return;
 
-        c->rbuf.consume(FRAME_HEADER_SIZE);
+        c->io.rbuf.consume(FRAME_HEADER_SIZE);
         // No per-frame clock read here. lastRecvMs is stamped once per recv()
         // (handleRead), which is when bytes actually arrive; re-stamping it
         // while parsing only refreshes the idle deadline with the age of data
@@ -2181,11 +2211,12 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
 
         if (type == FrameType::PING) {
             const auto& pong = pongFrame();
-            size_t pending = c->pendingBytes.load(std::memory_order_relaxed);
+            size_t pending =
+                c->out.pendingBytes.load(std::memory_order_relaxed);
             bool reserved = false;
             while (pending <= server_->cfg_.maxPendingBytes &&
                    pong.size() <= server_->cfg_.maxPendingBytes - pending) {
-                if (c->pendingBytes.compare_exchange_weak(
+                if (c->out.pendingBytes.compare_exchange_weak(
                         pending, pending + pong.size(),
                         std::memory_order_relaxed,
                         std::memory_order_relaxed)) {
@@ -2206,8 +2237,8 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             if (!reserved) {
                 closeConn(c, "pending bytes at limit on pong", false); return;
             }
-            if (c->wbuf.writable() < pong.size()) {
-                c->pendingBytes.fetch_sub(
+            if (c->io.wbuf.writable() < pong.size()) {
+                c->out.pendingBytes.fetch_sub(
                     pong.size(), std::memory_order_relaxed);
                 closeConn(c, "wbuf full on pong", false); return;
             }
@@ -2219,14 +2250,14 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
                 // past the FIN -- which the kernel refuses -- or silently lost.
                 // The peer is entitled to nothing more than the reply it asked
                 // for.
-                c->pendingBytes.fetch_sub(
+                c->out.pendingBytes.fetch_sub(
                     pong.size(), std::memory_order_relaxed);
                 server_->statsRef().framesDroppedOnClose.fetch_add(
                     1, std::memory_order_relaxed);
-                c->rbuf.consume(len);
+                c->io.rbuf.consume(len);
                 continue;
             }
-            c->wbuf.write(pong.data(), pong.size());
+            c->io.wbuf.write(pong.data(), pong.size());
             // framesSent is likewise counted on leaving wbuf (see submitSend).
             // Idempotent move toward a target state; no "wasEmpty" test either.
             armWrite(c);
@@ -2234,9 +2265,9 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             // stack -- though a failed arm just above may already have closed
             // it
             if (c->isClosed.load(std::memory_order_acquire)) return;
-            c->rbuf.consume(len);
+            c->io.rbuf.consume(len);
         } else if (type == FrameType::PONG) {
-            c->rbuf.consume(len);
+            c->io.rbuf.consume(len);
         } else {
             if (len > 0) {
                 // Unreachable, and kept: the alternative to having this branch
@@ -2250,9 +2281,9 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
                 if (len > frameScratch_.size()) {
                     closeConn(c, "scratch too small", false); return;
                 }
-                c->rbuf.peek(frameScratch_.data(), len);
+                c->io.rbuf.peek(frameScratch_.data(), len);
             }
-            c->rbuf.consume(len);
+            c->io.rbuf.consume(len);
             auto& mh = server_->msgHandlerRef();
             if (mh) mh(c->id, frameScratch_.data(), len);
         }
@@ -2286,7 +2317,7 @@ inline void SubReactor::unregisterConn(Conn* c, bool graceful) noexcept {
     epoll_ctl(epollFd_, EPOLL_CTL_DEL, c->fd, nullptr);
     ::close(c->fd);
     c->fd = -1;
-    c->writeArmed = false;
+    c->io.writeArmed = false;
     // No reader observes this today, which is the point of saying so: every
     // reader of `closing` is either iterating conns_ (so the connection is
     // there)
@@ -2321,7 +2352,7 @@ inline void SubReactor::discardRejectedConn(Conn* c) noexcept {
     // The task holds the last reference and would release the ticket on return
     // either way; releasing it here instead frees the admission slot now rather
     // than whenever the ghost was going to be reaped.
-    c->admission.reset();
+    c->out.admission.reset();
 }
 
 // pendingBytes is reserved at enqueue time and released on two paths only:
@@ -2335,12 +2366,12 @@ inline void SubReactor::discardRejectedConn(Conn* c) noexcept {
 // submitSend already releases them on the isClosed path, so this function must
 // never try to guess at them (it would double-count).
 inline void SubReactor::discardPendingOutput(Conn* c) noexcept {
-    const size_t remaining = c->wbuf.readable();
+    const size_t remaining = c->io.wbuf.readable();
     if (remaining == 0) return;
-    c->wbuf.clear();
+    c->io.wbuf.clear();
     // The in-flight frame boundary dies with the buffer.
-    c->sendFrameRemain = 0;
-    c->pendingBytes.fetch_sub(remaining, std::memory_order_relaxed);
+    c->io.sendFrameRemain = 0;
+    c->out.pendingBytes.fetch_sub(remaining, std::memory_order_relaxed);
     server_->statsRef().bytesDropped.fetch_add(
         remaining, std::memory_order_relaxed);
 }
@@ -2412,7 +2443,7 @@ inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
     // `isClosed || finSent` test -- but it is now the same test every other
     // entry point asks.
     CloseFacts facts;
-    facts.wbufEmpty = c->wbuf.empty();
+    facts.wbufEmpty = c->io.wbuf.empty();
     facts.round = c->close.round;
     if (decide(c->phase(), CloseEvent::AppClose, facts) == CloseAction::None)
         return;
@@ -2439,7 +2470,7 @@ inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
     // socket buffer or sendmsg stopped exactly on the budget boundary, and
     // nothing more can be queued (`closing` refuses submissions), so the FIN
     // goes out now. Otherwise arm and wait.
-    facts.wbufEmpty = c->wbuf.empty();
+    facts.wbufEmpty = c->io.wbuf.empty();
     switch (decide(c->phase(), CloseEvent::AppClose, facts)) {
     case CloseAction::SendFin: tryBeginWriteShutdown(c); break;
     case CloseAction::Park:    armWrite(c); break;
@@ -2486,10 +2517,10 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
 
     // Measured before the read: what had arrived and had not been served yet.
     if (c->close.inputBudget < 0)
-        c->close.inputBudget = static_cast<int64_t>(c->rbuf.readable());
+        c->close.inputBudget = static_cast<int64_t>(c->io.rbuf.readable());
 
     c->close.drainReadBytes = 0;
-    const size_t queuedBefore = c->rbuf.readable();
+    const size_t queuedBefore = c->io.rbuf.readable();
     const int served = handleRead(c);
     // handleRead has its own exits: the peer's FIN may have arrived in the same
     // read, or the socket may have errored. Either way the connection is
@@ -2520,7 +2551,7 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     if (served > 0) {
         const int64_t dealt = static_cast<int64_t>(queuedBefore)
                             + static_cast<int64_t>(c->close.drainReadBytes)
-                            - static_cast<int64_t>(c->rbuf.readable());
+                            - static_cast<int64_t>(c->io.rbuf.readable());
         if (dealt > 0) c->close.inputBudget -= dealt;
         c->close.drainReadBytes = 0;
     }
@@ -2530,16 +2561,16 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     // function because `served` and the input budget are only settled now.
     CloseFacts facts;
     facts.served = served > 0;
-    facts.rbufEmpty = c->rbuf.empty();
+    facts.rbufEmpty = c->io.rbuf.empty();
     facts.budgetLeft = c->close.inputBudget > 0;
-    facts.pending = c->pendingBytes.load(std::memory_order_relaxed) > 0;
+    facts.pending = c->out.pendingBytes.load(std::memory_order_relaxed) > 0;
     facts.round = c->close.round;
 
     // More of the owed input is still buffered and the budget allows another
     // round: come back for it. Parking here would refuse the replies of frames
     // this close promised to serve. Progress is required (served > 0) so a peer
     // that stops mid-frame cannot keep the close pending on a half a frame.
-    if (served > 0 && !c->rbuf.empty() && c->close.inputBudget > 0) {
+    if (served > 0 && !c->io.rbuf.empty() && c->close.inputBudget > 0) {
         expectClose(c, CloseEvent::BudgetSpent, CloseAction::RedrainInput,
                     facts);
         const uint64_t id = c->id;
@@ -2561,7 +2592,7 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     // we took in, handled, and answered into nothing (case F: 11 of 22 bytes).
     // Their reservations still standing is what makes them visible here.
     if (served == 0 && c->close.round == CloseRound::None &&
-        c->pendingBytes.load(std::memory_order_relaxed) > 0) {
+        c->out.pendingBytes.load(std::memory_order_relaxed) > 0) {
         expectClose(c, CloseEvent::BudgetSpent, CloseAction::DeferPark, facts);
         c->close.round = CloseRound::Close;
         // Same as finishPeerClosed(): the round is spent even when the
@@ -2654,7 +2685,7 @@ inline void SubReactor::teardownClosed(Conn* c, const char* reason,
         server_->statsRef().aborted.fetch_add(
             1, std::memory_order_relaxed);
     server_->onConnectionClosed(c->id);
-    c->admission.reset();
+    c->out.admission.reset();
 
     // Queue the deferred notification: one entry, one insertion.
     //
@@ -2706,22 +2737,22 @@ inline void SubReactor::flushCloseCallbacks() noexcept {
 }
 
 inline void SubReactor::scheduleRead(Conn* c) noexcept {
-    if (c->readPending) return;
-    c->readPending = true;
-    c->readPrev = readTail_;
-    if (readTail_) readTail_->readNext = c;
+    if (c->link.pending) return;
+    c->link.pending = true;
+    c->link.prev = readTail_;
+    if (readTail_) readTail_->link.next = c;
     else readHead_ = c;
     readTail_ = c;
 }
 
 inline void SubReactor::unscheduleRead(Conn* c) noexcept {
-    if (!c->readPending) return;
-    if (c->readPrev) c->readPrev->readNext = c->readNext;
-    else readHead_ = c->readNext;
-    if (c->readNext) c->readNext->readPrev = c->readPrev;
-    else readTail_ = c->readPrev;
-    c->readPrev = c->readNext = nullptr;
-    c->readPending = false;
+    if (!c->link.pending) return;
+    if (c->link.prev) c->link.prev->link.next = c->link.next;
+    else readHead_ = c->link.next;
+    if (c->link.next) c->link.next->link.prev = c->link.prev;
+    else readTail_ = c->link.prev;
+    c->link.prev = c->link.next = nullptr;
+    c->link.pending = false;
 }
 
 inline void SubReactor::doTick() noexcept {
@@ -3459,14 +3490,14 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
 
     // Ceiling check on the credit above. See pendingBytes for why this being a
     // best-effort soft limit is what makes the relaxed orders there safe.
-    size_t old = c->pendingBytes.load(std::memory_order_relaxed);
+    size_t old = c->out.pendingBytes.load(std::memory_order_relaxed);
     for (;;) {
         if (old > cfg_.maxPendingBytes ||
             frame.size() > cfg_.maxPendingBytes - old) {
             stats_.queueDrops.fetch_add(1, std::memory_order_relaxed);
             return SendResult::Overloaded;
         }
-        if (c->pendingBytes.compare_exchange_weak(
+        if (c->out.pendingBytes.compare_exchange_weak(
                 old, old + frame.size(),
                 std::memory_order_relaxed,
                 std::memory_order_relaxed)) break;
@@ -3474,7 +3505,7 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
 
     SubReactor* owner = c->owner;
     if (!owner || !owner->submitSend(connId, std::move(frame))) {
-        c->pendingBytes.fetch_sub(
+        c->out.pendingBytes.fetch_sub(
             FRAME_HEADER_SIZE + len, std::memory_order_relaxed);
         return SendResult::Overloaded;
     }
