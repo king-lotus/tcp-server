@@ -1,8 +1,9 @@
 # CONTEXT.md
 
 这个仓库的承重词。它们只活在注释和 `docs/review/` 的散文里，新读者（或 agent）要理解
-`deferredRound` 的两种取值，得读 `Conn` 上那段 18 行注释，再翻到
-`docs/review/CODE-REVIEW-2026-10-18-round8.md` 才知道为什么。
+`deferredRound` 的两种取值，得读 `CloseRound` 上方那段注释，再翻到
+`docs/review/CODE-REVIEW-2026-10-18-round7.md` 才知道为什么（那篇第 10 行就是
+「一个 bool 被两个主人共用，含义相反」）。
 
 这里给每个词一句定义、一个反例、一个出处。**反例比定义有用**——这些词之所以需要定义，
 正是因为它们各自被误解过一次，而且每次误解都成了一个真实缺陷。
@@ -125,7 +126,7 @@
 
 | 想改什么 | 先读 |
 |---|---|
-| 关闭行为 | `docs/architecture/r3-baseline.md` 第 5 节（26 行决策表） |
+| 关闭行为 | `docs/architecture/r3-baseline.md` 第 5 节（五张决策表） |
 | 关闭为什么这样 | `docs/review/README.md` 的八轮索引，按 P0/P1 找现场 |
 | 性能数字 | `verify/bench.sh` + 本仓库 commit message 里的前后对比 |
 | 公开 API | `verify/evidence/probe_surface_shrank.sh`（它定义了什么不该被看到） |

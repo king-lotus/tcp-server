@@ -301,8 +301,10 @@ class RingBuffer {
 //
 // The copy is field by field and is NOT atomic across fields: a connection can
 // be accepted between two loads, so the snapshot is a reading, not a barrier.
-// What it does promise is that the 23 loads live in one place -- so adding a
-// counter to ServerStats means adding it here, and the compiler says so.
+// What it does promise is that the 23 loads live in one place, so adding a
+// counter to ServerStats is one edit here. The compiler will NOT say so --
+// there is no static_assert and a forgotten field compiles cleanly -- so the
+// suites' deltas are what notice, and this comment is the reminder.
 struct StatsSnapshot {
     uint64_t accepted = 0;
     uint64_t rejected = 0;

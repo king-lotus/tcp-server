@@ -622,9 +622,10 @@ int main() {
         // before it, "what moved during this run" meant reading 23 fields
         // twice by hand, and no assertion could be written about the result.
         const industrial::StatsDelta d = industrial::diff(baseline, st.snapshot());
-        expect(d.accepted >= 0 && d.closed >= 0 && d.bytesRecv >= 0 &&
-               d.bytesSent >= 0,
-               "no counter moved backwards during the run");
+        // A note, not an assertion: a "no counter moved backwards" check
+        // would be vacuous here, because the baseline is an all-zero snapshot
+        // and every counter is a count. The assertion that can actually fail
+        // is the one below, which compares two independent counters.
         expect(d.accepted == d.closed,
                "the delta agrees with the totals: accepted == closed");
         std::printf("  delta: accepted=%lld closed=%lld bytesRecv=%lld "
