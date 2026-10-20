@@ -58,6 +58,10 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o /tmp/reactor_spread
     g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o /tmp/config_budget
     g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o /tmp/harness_selftest
+    # No socket, no thread, no epoll: the close protocol is a pure function now,
+    # so this suite is the only one that finishes before a kernel is involved.
+    g++ "${base_flags[@]}" "$@" verify/close_state_machine.cpp \
+        -o /tmp/close_state_machine
 }
 
 run_all() {
@@ -85,7 +89,8 @@ run_all() {
                    "reactor_spread, default reactors:/tmp/reactor_spread" \
                    "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread" \
                    "config_budget:/tmp/config_budget" \
-                   "harness_selftest:/tmp/harness_selftest"; do
+                   "harness_selftest:/tmp/harness_selftest" \
+                   "close_state_machine:/tmp/close_state_machine"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0

@@ -41,7 +41,8 @@ if(TCP_BUILD_SUITES)
         backpressure
         reactor_spread
         config_budget
-        harness_selftest)
+        harness_selftest
+        close_state_machine)
 
     foreach(suite IN LISTS TCP_SUITES)
         add_executable(${suite} verify/${suite}.cpp)
@@ -93,6 +94,8 @@ if(TCP_BUILD_SUITES)
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:config_budget>)
     add_test(NAME harness_selftest
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:harness_selftest>)
+    add_test(NAME close_state_machine
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_state_machine>)
 
     # run.sh gives each case 180s so a hang presents as a failure; the same
     # bound here keeps ctest from outliving the CI job.
