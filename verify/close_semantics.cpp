@@ -234,6 +234,11 @@ int main() {
     // interleaved failure log is worse than none.
     setvbuf(stdout, nullptr, _IONBF, 0);
 
+    // Everything this run is about to do, measured from zero. Taking the
+    // baseline here rather than after start() means the snapshot covers the
+    // whole run, including whatever bring-up moves.
+    const auto baseline = industrial::StatsSnapshot();
+
     gZeroLinger = kernelHonoursZeroLinger();
     std::printf("== kernel turns SO_LINGER{on,0} into an observable RST: %s ==\n",
                 gZeroLinger ? "yes" : "NO - case C cannot assert it");
@@ -612,6 +617,21 @@ int main() {
         // expectClose() at all.
         expect(st.closeStateMismatch.load() == 0,
                "decide() and the close branches agreed on every transition");
+
+        // The same numbers, as a delta. This is what the snapshot exists for:
+        // before it, "what moved during this run" meant reading 23 fields
+        // twice by hand, and no assertion could be written about the result.
+        const industrial::StatsDelta d = industrial::diff(baseline, st.snapshot());
+        expect(d.accepted >= 0 && d.closed >= 0 && d.bytesRecv >= 0 &&
+               d.bytesSent >= 0,
+               "no counter moved backwards during the run");
+        expect(d.accepted == d.closed,
+               "the delta agrees with the totals: accepted == closed");
+        std::printf("  delta: accepted=%lld closed=%lld bytesRecv=%lld "
+                    "bytesSent=%lld aborted=%lld\n",
+                    (long long)d.accepted, (long long)d.closed,
+                    (long long)d.bytesRecv, (long long)d.bytesSent,
+                    (long long)d.aborted);
         std::printf("  accepted=%llu closed=%llu aborted=%llu dropped=%llu handled=%d\n",
                     (unsigned long long)st.accepted.load(),
                     (unsigned long long)st.closed.load(),

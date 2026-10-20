@@ -291,6 +291,44 @@ class RingBuffer {
 }  // namespace detail
 
 // ==================== Statistics ====================
+// One consistent read of every counter.
+//
+// ServerStats is 23 public atomics with no methods, so "what changed during
+// this run" could only be answered by reading each field twice and subtracting
+// by hand -- which is what every suite in verify/ was doing, each in its own
+// way, and which is why the README's "record the before and after" had no tool
+// behind it.
+//
+// The copy is field by field and is NOT atomic across fields: a connection can
+// be accepted between two loads, so the snapshot is a reading, not a barrier.
+// What it does promise is that the 23 loads live in one place -- so adding a
+// counter to ServerStats means adding it here, and the compiler says so.
+struct StatsSnapshot {
+    uint64_t accepted = 0;
+    uint64_t rejected = 0;
+    uint64_t closed = 0;
+    uint64_t framesRecv = 0;
+    uint64_t framesSent = 0;
+    uint64_t bytesRecv = 0;
+    uint64_t bytesSent = 0;
+    uint64_t queueDrops = 0;
+    uint64_t bytesDropped = 0;
+    uint64_t aborted = 0;
+    uint64_t framesDroppedOnClose = 0;
+    uint64_t parseErrors = 0;
+    uint64_t idleTimeouts = 0;
+    uint64_t epollCtlErrors = 0;
+    uint64_t reactorFailures = 0;
+    uint64_t acceptErrors = 0;
+    uint64_t pendingTasksTotal = 0;
+    uint64_t pendingTasksDepth = 0;
+    uint64_t eofReads = 0;
+    uint64_t closeRequestsDropped = 0;
+    uint64_t epipeWrites = 0;
+    uint64_t closeCallbacksDropped = 0;
+    uint64_t closeStateMismatch = 0;
+};
+
 struct ServerStats {
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
@@ -358,7 +396,126 @@ struct ServerStats {
     // refactor's self-check, not a runtime condition, and it has to stay
     // readable in a release build where asserts are gone.
     std::atomic<uint64_t> closeStateMismatch{0};
+
+    // See StatsSnapshot: one reading of all 23, taken in one place.
+    StatsSnapshot snapshot() const noexcept {
+        StatsSnapshot s;
+        s.accepted = accepted.load(std::memory_order_relaxed);
+        s.rejected = rejected.load(std::memory_order_relaxed);
+        s.closed = closed.load(std::memory_order_relaxed);
+        s.framesRecv = framesRecv.load(std::memory_order_relaxed);
+        s.framesSent = framesSent.load(std::memory_order_relaxed);
+        s.bytesRecv = bytesRecv.load(std::memory_order_relaxed);
+        s.bytesSent = bytesSent.load(std::memory_order_relaxed);
+        s.queueDrops = queueDrops.load(std::memory_order_relaxed);
+        s.bytesDropped = bytesDropped.load(std::memory_order_relaxed);
+        s.aborted = aborted.load(std::memory_order_relaxed);
+        s.framesDroppedOnClose = framesDroppedOnClose.load(
+                std::memory_order_relaxed);
+        s.parseErrors = parseErrors.load(std::memory_order_relaxed);
+        s.idleTimeouts = idleTimeouts.load(std::memory_order_relaxed);
+        s.epollCtlErrors = epollCtlErrors.load(std::memory_order_relaxed);
+        s.reactorFailures = reactorFailures.load(std::memory_order_relaxed);
+        s.acceptErrors = acceptErrors.load(std::memory_order_relaxed);
+        s.pendingTasksTotal = pendingTasksTotal.load(
+                std::memory_order_relaxed);
+        s.pendingTasksDepth = pendingTasksDepth.load(
+                std::memory_order_relaxed);
+        s.eofReads = eofReads.load(std::memory_order_relaxed);
+        s.closeRequestsDropped = closeRequestsDropped.load(
+                std::memory_order_relaxed);
+        s.epipeWrites = epipeWrites.load(std::memory_order_relaxed);
+        s.closeCallbacksDropped = closeCallbacksDropped.load(
+                std::memory_order_relaxed);
+        s.closeStateMismatch = closeStateMismatch.load(
+                std::memory_order_relaxed);
+        return s;
+    }
 };
+// Signed on purpose. pendingTasksDepth is a gauge -- it goes down -- and a
+// difference of unsigned counters wraps, which reads as a huge positive number
+// rather than as a decrease.
+struct StatsDelta {
+    int64_t accepted = 0;
+    int64_t rejected = 0;
+    int64_t closed = 0;
+    int64_t framesRecv = 0;
+    int64_t framesSent = 0;
+    int64_t bytesRecv = 0;
+    int64_t bytesSent = 0;
+    int64_t queueDrops = 0;
+    int64_t bytesDropped = 0;
+    int64_t aborted = 0;
+    int64_t framesDroppedOnClose = 0;
+    int64_t parseErrors = 0;
+    int64_t idleTimeouts = 0;
+    int64_t epollCtlErrors = 0;
+    int64_t reactorFailures = 0;
+    int64_t acceptErrors = 0;
+    int64_t pendingTasksTotal = 0;
+    int64_t pendingTasksDepth = 0;
+    int64_t eofReads = 0;
+    int64_t closeRequestsDropped = 0;
+    int64_t epipeWrites = 0;
+    int64_t closeCallbacksDropped = 0;
+    int64_t closeStateMismatch = 0;
+};
+
+// after - before, field by field.
+inline StatsDelta diff(const StatsSnapshot& before,
+                       const StatsSnapshot& after) noexcept {
+    StatsDelta d;
+    d.accepted = static_cast<int64_t>(after.accepted) -
+                 static_cast<int64_t>(before.accepted);
+    d.rejected = static_cast<int64_t>(after.rejected) -
+                 static_cast<int64_t>(before.rejected);
+    d.closed = static_cast<int64_t>(after.closed) -
+                 static_cast<int64_t>(before.closed);
+    d.framesRecv = static_cast<int64_t>(after.framesRecv) -
+                 static_cast<int64_t>(before.framesRecv);
+    d.framesSent = static_cast<int64_t>(after.framesSent) -
+                 static_cast<int64_t>(before.framesSent);
+    d.bytesRecv = static_cast<int64_t>(after.bytesRecv) -
+                 static_cast<int64_t>(before.bytesRecv);
+    d.bytesSent = static_cast<int64_t>(after.bytesSent) -
+                 static_cast<int64_t>(before.bytesSent);
+    d.queueDrops = static_cast<int64_t>(after.queueDrops) -
+                 static_cast<int64_t>(before.queueDrops);
+    d.bytesDropped = static_cast<int64_t>(after.bytesDropped) -
+                 static_cast<int64_t>(before.bytesDropped);
+    d.aborted = static_cast<int64_t>(after.aborted) -
+                 static_cast<int64_t>(before.aborted);
+    d.framesDroppedOnClose = static_cast<int64_t>(after.framesDroppedOnClose) -
+                 static_cast<int64_t>(before.framesDroppedOnClose);
+    d.parseErrors = static_cast<int64_t>(after.parseErrors) -
+                 static_cast<int64_t>(before.parseErrors);
+    d.idleTimeouts = static_cast<int64_t>(after.idleTimeouts) -
+                 static_cast<int64_t>(before.idleTimeouts);
+    d.epollCtlErrors = static_cast<int64_t>(after.epollCtlErrors) -
+                 static_cast<int64_t>(before.epollCtlErrors);
+    d.reactorFailures = static_cast<int64_t>(after.reactorFailures) -
+                 static_cast<int64_t>(before.reactorFailures);
+    d.acceptErrors = static_cast<int64_t>(after.acceptErrors) -
+                 static_cast<int64_t>(before.acceptErrors);
+    d.pendingTasksTotal = static_cast<int64_t>(after.pendingTasksTotal) -
+                 static_cast<int64_t>(before.pendingTasksTotal);
+    d.pendingTasksDepth = static_cast<int64_t>(after.pendingTasksDepth) -
+                 static_cast<int64_t>(before.pendingTasksDepth);
+    d.eofReads = static_cast<int64_t>(after.eofReads) -
+                 static_cast<int64_t>(before.eofReads);
+    d.closeRequestsDropped = static_cast<int64_t>(after.closeRequestsDropped) -
+                 static_cast<int64_t>(before.closeRequestsDropped);
+    d.epipeWrites = static_cast<int64_t>(after.epipeWrites) -
+                 static_cast<int64_t>(before.epipeWrites);
+    d.closeCallbacksDropped =
+        static_cast<int64_t>(after.closeCallbacksDropped) -
+        static_cast<int64_t>(before.closeCallbacksDropped);
+    d.closeStateMismatch = static_cast<int64_t>(after.closeStateMismatch) -
+                 static_cast<int64_t>(before.closeStateMismatch);
+    return d;
+}
+
+
 
 // ==================== Send results ====================
 enum class SendResult : int {
