@@ -40,6 +40,7 @@
 #include <thread>
 #include <vector>
 
+#include "harness.h"
 #include "tcp-server-mt.h"
 
 using industrial::MultiReactorServer;
@@ -47,46 +48,12 @@ using industrial::SendResult;
 
 namespace {
 
-int gFailures = 0;
-
-void expect(bool ok, const char* what) {
-    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++gFailures;
-}
-
 bool waitFor(int ms, const std::function<bool()>& pred) {
     for (int i = 0; i < ms / 10; ++i) {
         if (pred()) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return pred();
-}
-
-uint16_t pickPort() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ::bind(fd, (struct sockaddr*)&sa, sizeof(sa));
-    socklen_t len = sizeof(sa);
-    ::getsockname(fd, (struct sockaddr*)&sa, &len);
-    uint16_t port = ntohs(sa.sin_port);
-    ::close(fd);
-    return port;
-}
-
-int connectTo(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) != 0) {
-        ::close(fd);
-        return -1;
-    }
-    return fd;
 }
 
 }  // namespace
@@ -104,15 +71,12 @@ int main() {
     {
     MultiReactorServer::Config cfg;
     cfg.bindAddr = "127.0.0.1";
-    cfg.port = pickPort();
     // One worker, so every submission lands on the same queue and nothing gets
     // averaged away across reactors.
     cfg.numReactors = 1;
     // See the header: both raised until neither can be the limit being measured.
     cfg.maxPendingBytes = 8u << 20;
     cfg.wbufCapacity    = 8u << 20;
-
-    MultiReactorServer server(cfg);
 
     std::atomic<bool>   release{false};
     std::atomic<uint64_t> connId{0};
@@ -126,20 +90,23 @@ int main() {
     // verify/probe_tsan_condvar.sh. Suppressing it would leave the codebase
     // arguing with a sanitizer, so wait on an atomic with a deadline instead.
     // Same property being tested, nothing left to mis-model.
-    server.setConnStateHandler([&](uint64_t id, const std::string&, bool up) {
-        if (!up) return;
-        connId.store(id, std::memory_order_release);
-        reachedCb.store(true, std::memory_order_release);
-        for (int i = 0; i < 20000 && !release.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
+    harness::Fixture server(
+        cfg, {}, {},
+        [&](uint64_t id, const std::string&, bool up) {
+            if (!up) return;
+            connId.store(id, std::memory_order_release);
+            reachedCb.store(true, std::memory_order_release);
+            for (int i = 0; i < 20000 &&
+                            !release.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
 
-    expect(server.start(), "start() ok");
+    harness::expect(server.started(), "start() ok");
 
-    int cfd = connectTo(cfg.port);
-    expect(cfd >= 0, "client connected");
-    expect(waitFor(5000, [&] { return reachedCb.load(std::memory_order_acquire); }),
+    harness::Peer peer;
+    harness::expect(static_cast<bool>(peer.connect(server.port())), "client connected");
+    harness::expect(waitFor(5000, [&] { return reachedCb.load(std::memory_order_acquire); }),
            "the worker reached the open callback");
 
     const uint64_t before = server.stats().queueDrops.load();
@@ -147,22 +114,22 @@ int main() {
     int refused  = 0;
     for (int i = 0; i < kFanOut; ++i) {
         const uint64_t id = connId.load(std::memory_order_acquire);
-        const SendResult r = server.sendTo(id, "\x01", 1);
+        const SendResult r = server.server().sendTo(id, "\x01", 1);
         if (r == SendResult::Ok) ++accepted;
         else                     ++refused;
     }
 
     release.store(true, std::memory_order_release);
 
-    expect(accepted == kFanOut, "every frame of a full fan-out was queued");
-    expect(server.stats().queueDrops.load() == before,
+    harness::expect(accepted == kFanOut, "every frame of a full fan-out was queued");
+    harness::expect(server.stats().queueDrops.load() == before,
            "nothing was counted as a queue drop");
     std::printf("      queued %d of %d (%d refused), queueDrops=%llu\n",
                 accepted, kFanOut, refused,
                 (unsigned long long)(server.stats().queueDrops.load() - before));
 
     server.stop();
-    ::close(cfd);
+    peer.close();
     }
 
     // ---- B: a close the queue refuses must say so ---------------------------
@@ -176,32 +143,32 @@ int main() {
 
         MultiReactorServer::Config bcfg;
         bcfg.bindAddr = "127.0.0.1";
-        bcfg.port = pickPort();
         bcfg.numReactors = 1;
         // Same reasoning as case A: neither per-connection limit may be the
         // thing refusing anything here, so both are out of reach.
         bcfg.maxPendingBytes = 8u << 20;
         bcfg.wbufCapacity    = 8u << 20;
 
-        MultiReactorServer server(bcfg);
-
         std::atomic<bool>     release{false};
         std::atomic<uint64_t> connId{0};
         std::atomic<bool>     reachedCb{false};
 
-        server.setConnStateHandler([&](uint64_t id, const std::string&, bool up) {
-            if (!up) return;
-            connId.store(id, std::memory_order_release);
-            reachedCb.store(true, std::memory_order_release);
-            for (int i = 0; i < 20000 && !release.load(std::memory_order_acquire); ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        });
+        harness::Fixture server(
+            bcfg, {}, {},
+            [&](uint64_t id, const std::string&, bool up) {
+                if (!up) return;
+                connId.store(id, std::memory_order_release);
+                reachedCb.store(true, std::memory_order_release);
+                for (int i = 0; i < 20000 &&
+                                !release.load(std::memory_order_acquire); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
 
-        expect(server.start(), "start() ok");
-        int cfd = connectTo(bcfg.port);
-        expect(cfd >= 0, "client connected");
-        expect(waitFor(5000, [&] { return reachedCb.load(std::memory_order_acquire); }),
+        harness::expect(server.started(), "start() ok");
+        harness::Peer peer;
+        harness::expect(static_cast<bool>(peer.connect(server.port())), "client connected");
+        harness::expect(waitFor(5000, [&] { return reachedCb.load(std::memory_order_acquire); }),
                "the worker reached the open callback");
 
         // Fill past the queue cap: with one reactor and maxConnections at its
@@ -210,30 +177,28 @@ int main() {
         int refused = 0;
         for (int i = 0; i < 45000; ++i) {
             const uint64_t id = connId.load(std::memory_order_acquire);
-            if (server.sendTo(id, "\x01", 1) != SendResult::Ok) ++refused;
+            if (server.server().sendTo(id, "\x01", 1) != SendResult::Ok) ++refused;
         }
         std::printf("      queue refused %d of 45000 sends\n", refused);
-        expect(refused > 0, "the queue cap actually refused frames");
+        harness::expect(refused > 0, "the queue cap actually refused frames");
 
         const uint64_t before = server.stats().closeRequestsDropped.load();
         // The returned bool is the same failure the caller can see; the counter
         // is the one operations can see. Neither used to exist.
-        const bool queued = server.closeConnection(
+        const bool queued = server.server().closeConnection(
             connId.load(std::memory_order_acquire));
         std::printf("      closeRequestsDropped +%llu, returned %s\n",
                     (unsigned long long)(server.stats().closeRequestsDropped.load()
                                          - before),
                     queued ? "true" : "false");
-        expect(!queued, "closeConnection() reports that it did not get through");
-        expect(server.stats().closeRequestsDropped.load() > before,
+        harness::expect(!queued, "closeConnection() reports that it did not get through");
+        harness::expect(server.stats().closeRequestsDropped.load() > before,
                "a close the queue refused is counted, not swallowed");
 
         release.store(true, std::memory_order_release);
         server.stop();
-        ::close(cfd);
+        peer.close();
     }
 
-    std::printf("%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
-                gFailures, gFailures == 1 ? "" : "s");
-    return gFailures == 0 ? 0 : 1;
+    return harness::finish();
 }

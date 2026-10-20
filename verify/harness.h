@@ -108,13 +108,16 @@ class Fixture {
 public:
     using Handler      = std::function<void(uint64_t, const uint8_t*, size_t)>;
     using CloseHandler = std::function<void(uint64_t, const std::string&, const char*)>;
+    using ConnStateHandler = std::function<void(uint64_t, const std::string&, bool)>;
 
     explicit Fixture(industrial::MultiReactorServer::Config cfg,
                      Handler handler = Handler(),
-                     CloseHandler closeHandler = CloseHandler())
+                     CloseHandler closeHandler = CloseHandler(),
+                     ConnStateHandler connState = ConnStateHandler())
         : cfg_(std::move(cfg)), server_(cfg_) {
         if (handler) server_.setMessageHandler(std::move(handler));
         if (closeHandler) server_.setCloseHandler(std::move(closeHandler));
+        if (connState) server_.setConnStateHandler(std::move(connState));
         started_ = server_.start();
     }
 
