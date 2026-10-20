@@ -192,18 +192,54 @@ class RingBuffer {
     }
 
     // Room at the write end, for a caller that fills the buffer in place
-    // instead of copying through a stack buffer first. Only the contiguous part
-    // is offered; a ring that has wrapped has a second piece at buf_[0].
-    uint8_t* writePtr() noexcept {
-        if (cap_ == 0) return nullptr;
-        return buf_.data() + ((head_ + size_) % cap_);
+    // instead of copying through a stack buffer first.
+    //
+    // This used to be three public methods -- writePtr(), writeSpan() and
+    // commit() -- and using them required knowing the ring's layout: that only
+    // the contiguous part is on offer, that a span of 0 means the ring has
+    // wrapped and its tail is full, and that nothing is counted until commit().
+    // handleRead() is the one caller and it had to carry all three facts.
+    //
+    // reserve() is the same capability with those facts kept inside. The slot
+    // it returns is already clamped to the contiguous part, and a slot that was
+    // never committed writes nothing -- so the ways to get it wrong are not
+    // expressible rather than merely documented.
+    class Reservation {
+     public:
+        Reservation() noexcept = default;
+        // A copy would be a second owner of the same bytes, and committing both
+        // would count them twice. C++17 guarantees the elision reserve() relies
+        // on, so nothing here needs one.
+        Reservation(const Reservation&) = delete;
+        Reservation& operator=(const Reservation&) = delete;
+        uint8_t* data() const noexcept { return p_; }
+        size_t   size() const noexcept { return n_; }
+        explicit operator bool() const noexcept { return n_ != 0; }
+        // Counts what actually landed. A count past the reserved span is
+        // clamped away rather than counted into bytes this slot does not own.
+        void commit(size_t n) noexcept {
+            if (rb_) rb_->commitSpan(std::min(n, n_));
+            rb_ = nullptr; p_ = nullptr; n_ = 0;
+        }
+
+     private:
+        friend class RingBuffer;
+        Reservation(RingBuffer* rb, uint8_t* p, size_t n) noexcept
+            : rb_(rb), p_(p), n_(n) {}
+        RingBuffer* rb_ = nullptr;
+        uint8_t*    p_  = nullptr;
+        size_t      n_  = 0;
+    };
+
+    // Contiguous only: a ring that has wrapped offers the first piece, and the
+    // caller comes back for the second after consuming something. That is why
+    // an empty slot means "try again later", not "full".
+    Reservation reserve(size_t want) noexcept {
+        if (cap_ == 0) return Reservation();   // uninitialised: see init()
+        const size_t n = std::min(want, writeSpan());
+        if (n == 0) return Reservation();
+        return Reservation(this, writePtr(), n);
     }
-    size_t writeSpan() const noexcept {
-        if (cap_ == 0) return 0;
-        const size_t tail = (head_ + size_) % cap_;
-        return std::min(cap_ - size_, cap_ - tail);
-    }
-    void commit(size_t n) noexcept { size_ += std::min(n, writable()); }
 
     void consume(size_t n) noexcept {
         size_t r = std::min(n, size_);
@@ -233,6 +269,19 @@ class RingBuffer {
     void clear() noexcept { head_ = 0; size_ = 0; }
 
  private:
+    // The primitives reserve() is built from. Private because using them
+    // correctly is exactly the knowledge Reservation exists to keep.
+    uint8_t* writePtr() noexcept {
+        if (cap_ == 0) return nullptr;
+        return buf_.data() + ((head_ + size_) % cap_);
+    }
+    size_t writeSpan() const noexcept {
+        if (cap_ == 0) return 0;
+        const size_t tail = (head_ + size_) % cap_;
+        return std::min(cap_ - size_, cap_ - tail);
+    }
+    void commitSpan(size_t n) noexcept { size_ += std::min(n, writable()); }
+
     std::vector<uint8_t> buf_;
     size_t cap_  = 0;
     size_t head_ = 0;
@@ -1621,17 +1670,16 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             return dispatched();
         }
 
-        size_t want = std::min(c->rbuf.writeSpan(),
-                               static_cast<size_t>(bytesLeft));
-        if (want == 0) {
+        auto slot = c->rbuf.reserve(static_cast<size_t>(bytesLeft));
+        if (!slot) {
             // The ring has wrapped and its tail is full: come back after a
             // round has consumed something.
             scheduleRead(c);
             return dispatched();
         }
-        ssize_t n = ::recv(c->fd, c->rbuf.writePtr(), want, 0);
+        ssize_t n = ::recv(c->fd, slot.data(), slot.size(), 0);
         if (n > 0) {
-            c->rbuf.commit(static_cast<size_t>(n));
+            slot.commit(static_cast<size_t>(n));
             bytesLeft -= static_cast<int>(n);
             // Only ever read by drainInputThenClose(), which zeroes it first:
             // it has to know how much of what this call served was input that

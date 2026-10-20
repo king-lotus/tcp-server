@@ -62,6 +62,8 @@ build() {
     # so this suite is the only one that finishes before a kernel is involved.
     g++ "${base_flags[@]}" "$@" verify/close_state_machine.cpp \
         -o /tmp/close_state_machine
+    # Also socket-free: the ring buffer's write side, asserted directly.
+    g++ "${base_flags[@]}" "$@" verify/ring_buffer.cpp -o /tmp/ring_buffer
 }
 
 run_all() {
@@ -90,7 +92,8 @@ run_all() {
                    "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread" \
                    "config_budget:/tmp/config_budget" \
                    "harness_selftest:/tmp/harness_selftest" \
-                   "close_state_machine:/tmp/close_state_machine"; do
+                   "close_state_machine:/tmp/close_state_machine" \
+                   "ring_buffer:/tmp/ring_buffer"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
