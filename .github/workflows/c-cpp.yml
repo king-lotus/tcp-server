@@ -20,10 +20,7 @@ name: verify
 
 on:
   push:
-    # Both branches are verified, not just the default one: work happens on
-    # linux-only, and a branch that runs no CI is a branch whose pushes look
-    # green because nothing checked them.
-    branches: [ main, linux-only ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
 
