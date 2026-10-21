@@ -69,3 +69,7 @@ Testing/
 
 # Local agent configuration (not part of the library)
 .workbuddy-ai/
+
+# Editor workspace files (local, not part of the library)
+.workspace
+*.code-workspace
