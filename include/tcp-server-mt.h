@@ -33,6 +33,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -537,6 +538,21 @@ class MultiReactorServer;
 // loop's cap check is advisory by nature (the load races the reservation by
 // definition). The ++/-- operator forms would quietly mean seq_cst.
 namespace detail {
+// The compiler's idea of a cache line, where it has one. libstdc++ did not
+// ship the constant until GCC 12, so on older toolchains the fallback is a
+// literal -- but it is a fallback, not the answer: wherever the standard
+// library reports a number, that number wins. 64 is what every x86-64 and
+// arm64 part this has run on uses; the static_assert is there so a port to
+// something with a 32-byte line cannot silently inherit it.
+#if defined(__cpp_lib_hardware_interference_size)
+constexpr size_t kCacheLineSize = std::hardware_destructive_interference_size;
+#else
+constexpr size_t kCacheLineSize = 64;
+#endif
+static_assert(kCacheLineSize >= 32 &&
+                  (kCacheLineSize & (kCacheLineSize - 1)) == 0,
+              "cache line size must be a power of two");
+
 // Conn names a SubReactor before the class is defined below it, the same
 // way it did at namespace scope.
 class SubReactor;
@@ -973,7 +989,17 @@ class SubReactor {
     // removed (2198 -> 2605 MB/s). The alignment is not decoration: a counter
     // sharing a line with this reactor's other hot fields puts the bouncing
     // back at a different address, which is what the first attempt at this did.
-    alignas(64) uint64_t framesRecvLocal_ = 0;
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 12
+    // The value is ABI-dependent, so GCC 12+ warns when it reaches a layout
+    // decision. Taking the compiler's number is the point: the alternative is
+    // a literal that is wrong wherever the line size is not 64.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winterference-size"
+#endif
+    alignas(kCacheLineSize) uint64_t framesRecvLocal_ = 0;
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 12
+#pragma GCC diagnostic pop
+#endif
 
     int                 idx_;
     MultiReactorServer* server_;
