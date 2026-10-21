@@ -73,3 +73,6 @@ Testing/
 # Editor workspace files (local, not part of the library)
 .workspace
 *.code-workspace
+
+# Editor configuration
+.vscode/
