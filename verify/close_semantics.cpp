@@ -234,6 +234,11 @@ int main() {
     // interleaved failure log is worse than none.
     setvbuf(stdout, nullptr, _IONBF, 0);
 
+    // Everything this run is about to do, measured from zero. Taking the
+    // baseline here rather than after start() means the snapshot covers the
+    // whole run, including whatever bring-up moves.
+    const auto baseline = industrial::StatsSnapshot();
+
     gZeroLinger = kernelHonoursZeroLinger();
     std::printf("== kernel turns SO_LINGER{on,0} into an observable RST: %s ==\n",
                 gZeroLinger ? "yes" : "NO - case C cannot assert it");
@@ -603,6 +608,31 @@ int main() {
         expect(st.accepted.load() == st.closed.load(),
                "accepted == closed after all connections ended");
         expect(st.accepted.load() >= 3, "all three clients were accepted");
+        // decide() and the hand-written branches must have agreed about every
+        // close this run performed. This is the only place that reads the
+        // counter: a non-zero value is not something a peer can provoke, it
+        // means the table and the branches have drifted, so the assertion is
+        // about the refactor rather than about the server. It has to be here
+        // and not in close_state_machine.cpp, because only a real run reaches
+        // expectClose() at all.
+        expect(st.closeStateMismatch.load() == 0,
+               "decide() and the close branches agreed on every transition");
+
+        // The same numbers, as a delta. This is what the snapshot exists for:
+        // before it, "what moved during this run" meant reading 23 fields
+        // twice by hand, and no assertion could be written about the result.
+        const industrial::StatsDelta d = industrial::diff(baseline, st.snapshot());
+        // A note, not an assertion: a "no counter moved backwards" check
+        // would be vacuous here, because the baseline is an all-zero snapshot
+        // and every counter is a count. The assertion that can actually fail
+        // is the one below, which compares two independent counters.
+        expect(d.accepted == d.closed,
+               "the delta agrees with the totals: accepted == closed");
+        std::printf("  delta: accepted=%lld closed=%lld bytesRecv=%lld "
+                    "bytesSent=%lld aborted=%lld\n",
+                    (long long)d.accepted, (long long)d.closed,
+                    (long long)d.bytesRecv, (long long)d.bytesSent,
+                    (long long)d.aborted);
         std::printf("  accepted=%llu closed=%llu aborted=%llu dropped=%llu handled=%d\n",
                     (unsigned long long)st.accepted.load(),
                     (unsigned long long)st.closed.load(),

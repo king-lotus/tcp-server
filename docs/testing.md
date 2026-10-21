@@ -1,6 +1,6 @@
 # Testing
 
-Nine suites, eleven runs, three configurations. `verify/run.sh` is the
+Eleven suites, thirteen runs, three configurations. `verify/run.sh` is the
 authority; `CMakeLists.txt` mirrors it for `ctest`. What follows is how a suite
 is written, and why the client half of every one of them now lives in a single
 file.
