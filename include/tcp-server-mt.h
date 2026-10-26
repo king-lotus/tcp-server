@@ -48,6 +48,10 @@ namespace industrial {
 constexpr uint16_t FRAME_MAGIC       = 0xEB90;
 constexpr size_t   FRAME_HEADER_SIZE = 8;
 constexpr uint32_t MAX_FRAME_PAYLOAD = 64 * 1024;
+// The largest frame that can appear on the wire: one header plus the maximum
+// payload. Buffers that must hold any legal frame are sized from this rather
+// than from a rounded number that happens to be close.
+constexpr size_t   MAX_FRAME_SIZE = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
 
 enum class FrameType : uint16_t {
     DATA = 0x0001,
@@ -163,7 +167,7 @@ class RingBuffer {
         if (cap_ == 0) return 0;   // uninitialised: see init()
         size_t w = std::min(n, writable());
         if (w == 0) return 0;
-        size_t tail  = (head_ + size_) % cap_;
+        size_t tail  = writeTail();
         size_t first = std::min(w, cap_ - tail);
         std::memcpy(buf_.data() + tail, p, first);
         if (w > first) std::memcpy(buf_.data(), p + first, w - first);
@@ -336,6 +340,10 @@ struct ServerStats {
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
     std::atomic<uint64_t> closed{0};
+    // Counted when a frame is parsed. Reactors batch the count in a local
+    // line-aligned tally and publish it once per loop iteration (and once on
+    // loop exit), so it is exact at idle and can lag one iteration while
+    // traffic flows.
     std::atomic<uint64_t> framesRecv{0};
     // Counted when a frame's last byte reaches the kernel (drainWbufToSocket),
     // the same point as bytesSent. Counted on entering wbuf instead, frames an
@@ -979,6 +987,10 @@ class SubReactor {
                      const CloseFacts& f) noexcept;
     bool enqueue(std::function<void()> task) noexcept;
     void cleanup() noexcept;
+    // Publish framesRecvLocal_ to the shared counter, then reset it. Called
+    // once per loop iteration and once on loop exit, so framesRecv is exact at
+    // idle and can lag one iteration while traffic flows.
+    void publishFramesRecv() noexcept;
     void scheduleRead(Conn* c) noexcept;
     void unscheduleRead(Conn* c) noexcept;
     Conn* readHead_ = nullptr;
@@ -1001,8 +1013,8 @@ class SubReactor {
 #pragma GCC diagnostic pop
 #endif
 
-    int                 idx_;
-    MultiReactorServer* server_;
+    alignas(64) int      idx_;
+    MultiReactorServer*  server_;
 
     int               epollFd_ = -1;
     int               wakeFd_  = -1;
@@ -1083,19 +1095,20 @@ class MultiReactorServer {
         int         maxConnections  = 10000;
         int         idleTimeoutMs   = 120000;
         int         tickMs          = 500;
-        size_t      rbufCapacity    = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        size_t      rbufCapacity    = MAX_FRAME_SIZE;
         // One maximum frame, not 256KB. The write buffer is allocated per
         // accepted connection, so it is most of the per-connection memory cost:
         // 324.7KB at 256KB, 128.8KB here, with no throughput change in the
-        // ingest benchmark. The floor is FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD
-        // rather than a rounded number: sendTo refuses a frame that does not
-        // fit, so a smaller buffer makes a maximum-size reply impossible to
-        // write, on an idle connection, forever.
-        size_t      wbufCapacity    = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        // ingest benchmark. The default is MAX_FRAME_SIZE rather than a
+        // rounded number: sendTo refuses a frame that does not fit, so a
+        // smaller buffer makes a maximum-size reply impossible to write, on an
+        // idle connection, forever. start() still accepts a smaller one on
+        // purpose -- send_results relies on that to exercise the send limits.
+        size_t      wbufCapacity    = MAX_FRAME_SIZE;
         // Matches the buffer above rather than repeating 256KB: start() clamps
         // this down to wbufCapacity anyway, so a larger default would only be a
         // number that reads as a promise it does not keep.
-        size_t      maxPendingBytes = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        size_t      maxPendingBytes = MAX_FRAME_SIZE;
         size_t      writeBudgetBytes = 256 * 1024;
         // Grace period for a half-closed connection: after our FIN went out we
         // keep reading until the peer's FIN, but never longer than this. Bounds
@@ -2759,6 +2772,13 @@ inline void SubReactor::doTick() noexcept {
     for (auto& c : expired) closeConn(c.get(), "close linger expired", false);
 }
 
+inline void SubReactor::publishFramesRecv() noexcept {
+    if (framesRecvLocal_ == 0) return;
+    server_->statsRef().framesRecv.fetch_add(
+        framesRecvLocal_, std::memory_order_relaxed);
+    framesRecvLocal_ = 0;
+}
+
 inline void SubReactor::loop() noexcept {
     MultiReactorServer::CallbackScope callbacks(server_);
     try {
@@ -2781,11 +2801,7 @@ inline void SubReactor::loop() noexcept {
                 auto c = it->second;
                 handleRead(c.get());
             }
-            if (framesRecvLocal_ != 0) {
-                server_->statsRef().framesRecv.fetch_add(
-                    framesRecvLocal_, std::memory_order_relaxed);
-                framesRecvLocal_ = 0;
-            }
+            publishFramesRecv();
             int n = ::epoll_wait(epollFd_, events.data(),
                                  static_cast<int>(events.size()),
                                  readHead_ ? 0 : tickMs);
@@ -2844,11 +2860,7 @@ inline void SubReactor::loop() noexcept {
                 doTick();
             }
         }
-        if (framesRecvLocal_ != 0) {
-            server_->statsRef().framesRecv.fetch_add(
-                framesRecvLocal_, std::memory_order_relaxed);
-            framesRecvLocal_ = 0;
-        }
+        publishFramesRecv();
     } catch (...) {
         server_->statsRef().reactorFailures.fetch_add(
             1, std::memory_order_relaxed);
@@ -2942,7 +2954,7 @@ inline bool MultiReactorServer::validateConfig() const noexcept {
     // component left over from a previous run is as much a reason to refuse as
     // a nonsensical number is.
     if (!reactors_.empty() || acceptThread_.joinable() ||
-        cfg_.rbufCapacity < FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD ||
+        cfg_.rbufCapacity < MAX_FRAME_SIZE ||
         cfg_.wbufCapacity < FRAME_HEADER_SIZE ||
         cfg_.maxPendingBytes < FRAME_HEADER_SIZE ||
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 ||

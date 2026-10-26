@@ -582,7 +582,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
         const auto& gst = gserver.stats();
-        const uint64_t wire = industrial::FRAME_HEADER_SIZE + industrial::MAX_FRAME_PAYLOAD;
+        const uint64_t wire = industrial::MAX_FRAME_SIZE;
         const uint64_t fsent = gst.framesSent.load();
         const uint64_t bsent = gst.bytesSent.load();
         std::printf("      framesSent=%llu bytesSent=%llu bytesDropped=%llu aborted=%llu\n",
