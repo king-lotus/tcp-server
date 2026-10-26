@@ -133,13 +133,13 @@ class RingBuffer {
     RingBuffer() noexcept = default;
     explicit RingBuffer(size_t cap) { init(cap); }
 
-    // May throw bad_alloc; the caller chooses the policy (once per connection,
-    // at setup)
-    // A Conn is default-constructed and initialised a few lines later, so for a
-    // short while cap_ really is 0. Every `+= N % cap_` below is UB for that
-    // value -- integer division by zero, which is a trap rather than a wrong
-    // answer -- so it is rejected here instead of being argued about per
-    // method.
+    // May throw bad_alloc; the caller chooses the policy (once per
+    // connection, at setup).
+    // A Conn is default-constructed and initialised a few lines later, so
+    // for a short while cap_ really is 0. Every `+= N % cap_` below is UB for
+    // that value -- integer division by zero, which is a trap rather than a
+    // wrong answer -- so it is rejected here instead of being argued about
+    // per method.
     void init(size_t cap) {
         // resizing over live data would drop it silently
         assert(empty());
@@ -362,6 +362,7 @@ struct Conn {
 
     // Owned by the reactor thread; nothing below here is touched from
     // elsewhere.
+    //
     // Last time a byte arrived from this peer, not last time a frame was
     // completed: an idle deadline is a promise about silence, and a peer
     // dribbling one large frame over a slow link is not silent. Stamped only
@@ -437,9 +438,8 @@ struct Conn {
     // drainInputThenClose() may spend queue rounds on them, because handleRead
     // stops at a fixed per-call budget and one pass cannot be assumed to have
     // served a whole backlog -- but on nothing beyond them, so a peer that
-    // keeps
-    // sending cannot hold the close open with fresh input. Negative means "not
-    // measured yet". Reactor-thread-only.
+    // keeps sending cannot hold the close open with fresh input. Negative
+    // means "not measured yet". Reactor-thread-only.
     int64_t    closeInputBytes = -1;
     // Bytes this connection's handleRead() has taken off the socket since
     // drainInputThenClose() zeroed it, which is always either nobody or the
@@ -462,13 +462,13 @@ struct Conn {
     //
     // Lifecycle, which has to be read as the three places it is touched rather
     // than the one place it happens to stay level:
-    //   1. reserve    -- enqueueing a frame adds its length (PONG included);
-    //   2. migrate    -- moving a frame from a queued task into wbuf changes
-    //                    nothing, and that is the only reason some paths nearby
-    //                    do not visibly adjust it;
+    //   1. reserve -- enqueueing a frame adds its length (PONG included);
+    //   2. migrate -- moving a frame from a queued task into wbuf changes
+    //                 nothing, and that is the only reason some paths nearby
+    //                 do not visibly adjust it;
     //   3. release -- subtracting what was actually written, what was dropped
-    //                    whole (capacity reject, closing connection, refused
-    //                    PONG), and what was still unsent when we tore down.
+    //                 whole (capacity reject, closing connection, refused
+    //                 PONG), and what was still unsent when we tore down.
     //
     // Every release runs on the connection's owning reactor, so release/release
     // never races. Reserving races between application threads and that same
@@ -565,40 +565,31 @@ class SubReactor {
     void drainWakeup() noexcept;
     void processPending() noexcept;
     // Returns the number of frames this call handed to the message handler.
-    // Zero
-    // means the read produced no work at all, which drainInputThenClose() uses
-    // to
-    // tell "the peer asked for nothing more" from "answers are queued behind
-    // us".
+    // Zero means the read produced no work at all, which drainInputThenClose()
+    // uses to tell "the peer asked for nothing more" from "answers are queued
+    // behind us".
     int  handleRead(Conn* c) noexcept;
     void handleWrite(Conn* c) noexcept;
     void parseFrames(Conn* c, int& framesLeft) noexcept;
     // graceful=true: whatever we still owe the peer is delivered before the
-    // FIN,
-    //                and the socket is closed only after the peer's own FIN (or
-    //                closeLingerMs). Use it whenever the peer is a legitimate
-    //                counterparty that should not lose its last reply.
+    // FIN, and the socket is closed only after the peer's own FIN (or
+    // closeLingerMs). Use it whenever the peer is a legitimate counterparty
+    // that should not lose its last reply.
     // graceful=false: abort now -- pending output is dropped and an RST is
-    //                requested. For protocol violations, resource exhaustion
-    //                and
-    //                fault paths, where delivering a half-processed stream
-    //                would
-    //                be worse than the reset.
+    // requested. For protocol violations, resource exhaustion and fault paths,
+    // where delivering a half-processed stream would be worse than the reset.
     // Default graceful=true: see the definition for what the two modes mean.
     void closeConn(Conn* c, const char* reason, bool graceful = true) noexcept;
     void teardownClosed(Conn* c, const char* reason, bool graceful) noexcept;
     void parkClose(Conn* c, const char* reason) noexcept;
     bool tryBeginWriteShutdown(Conn* c) noexcept;
     // A graceful close asked for while the peer's request is still unread:
-    // reads
-    // and answers it before the FIN goes out. See the definition for why the
-    // FIN
-    // has to wait a queue round, and why it waits at most one.
+    // reads and answers it before the FIN goes out. See the definition for why
+    // the FIN has to wait a queue round, and why it waits at most one.
     void drainInputThenClose(Conn* c) noexcept;
     // Precondition: parseFrames has already drained every complete frame, so
-    // any
-    // reply it triggered is queued ahead of the FIN this may send. handleRead
-    // establishes that before calling in; it is not checked here.
+    // any reply it triggered is queued ahead of the FIN this may send.
+    // handleRead establishes that before calling in; it is not checked here.
     void finishPeerClosed(Conn* c) noexcept;
     void unregisterConn(Conn* c, bool graceful = true) noexcept;
     // The rest of a rollback for a connection that never took its place here.
@@ -1212,7 +1203,7 @@ inline void SubReactor::handleTask(
                 1, std::memory_order_relaxed);
             server_->statsRef().rejected.fetch_add(
                 1, std::memory_order_relaxed);
-            return;  // The task's socket guard closes the descriptor.
+            return;  // The task's FdGuard closes the descriptor.
         }
         c->fd = t.fd.release();
 
@@ -1220,13 +1211,10 @@ inline void SubReactor::handleTask(
             fdIndex_[c->fd] = c.get();
             conns_[t.id] = c;
         } catch (...) {
-            // Roll back through the same path every other failure uses,
-            // so
-            // the epoll registration does not outlive the map entry and
-            // get
-            // silently re-attributed when the fd number is recycled --
-            // and so the map entry does not outlive the descriptor
-            // either:
+            // Roll back through the same path every other failure uses, so
+            // the epoll registration does not outlive the map entry and the
+            // fd number is not silently re-attributed when it is recycled --
+            // and the map entry does not outlive the descriptor either:
             // unregisterConn() alone left a ghost behind.
             discardRejectedConn(c.get());
             server_->statsRef().rejected.fetch_add(
@@ -1240,35 +1228,25 @@ inline void SubReactor::handleTask(
             return;
         }
         // Counted only once the socket is fully owned by both maps: an
-        // accepted client must not inflate accepted when the reactor
-        // then
-        // rejects it, otherwise accepted - closed stops matching
-        // reality.
+        // accepted client must not inflate accepted when the reactor then
+        // rejects it, otherwise accepted - closed stops matching reality.
         server_->statsRef().accepted.fetch_add(
             1, std::memory_order_relaxed);
 
-        // Nothing after this line may count rejected. Every earlier
-        // failure returns while the socket is still unregistered or
-        // rolls
-        // back through discardRejectedConn(); from here the connection
-        // is
-        // in both maps, owns its epoll registration, answers
-        // connectionCount(), can be sent to, and will be counted in
-        // closed when it goes. So if the state callback throws now,
-        // incrementing rejected too would make the two counters
-        // contradict each other about one live connection -- and
-        // accepted
-        // is the one telling the truth, which leaves rejected as the
-        // counter an operator reads to look for clients being turned
-        // away. (Nothing counts the throw either: ServerStats has no
-        // slot
-        // for "the application's callback threw" that would not read as
-        // a
-        // claim about this server, and the caller's own handler is
-        // where
-        // the exception belongs -- swallowing it here is exactly what
-        // lets
-        // whoever wrote it find out.)
+        // Nothing after this line may count rejected. Every earlier failure
+        // returns while the socket is still unregistered or rolls back
+        // through discardRejectedConn(); from here the connection is in both
+        // maps, owns its epoll registration, answers connectionCount(), can
+        // be sent to, and will be counted in closed when it goes. So if the
+        // state callback throws now, incrementing rejected too would make
+        // the two counters contradict each other about one live connection
+        // -- and accepted is the one telling the truth, which leaves
+        // rejected as the counter an operator reads to look for clients
+        // being turned away. (Nothing counts the throw either: ServerStats
+        // has no slot for "the application's callback threw" that would not
+        // read as a claim about this server, and the caller's own handler is
+        // where the exception belongs -- swallowing it here is exactly what
+        // lets whoever wrote it find out.)
         auto& sh = server_->stateHandlerRef();
         if (sh) {
             try {
@@ -1295,12 +1273,10 @@ inline void SubReactor::handleTask(SendTask& task) noexcept {
     auto it = conns_.find(id);
     if (it == conns_.end()) return;
     Conn* c = it->second.get();
-    // A parked close still accepts the reply that was queued before it:
-    // submitClose only marks the connection and then returns to this
-    // batch,
-    // so this task runs first. Anything arriving after that point is
-    // refused here -- the FIN is already reserved for what we owe the
-    // peer.
+    // A parked close still accepts the reply queued before it: submitClose
+    // only marks the connection and then returns to this batch, so this
+    // task runs first. Anything arriving after that point is refused here
+    // -- the FIN is already reserved for what we owe the peer.
     if (c->isClosed.load(std::memory_order_acquire) ||
         c->closing.load(std::memory_order_acquire)) {
         c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
@@ -1317,12 +1293,10 @@ inline void SubReactor::handleTask(SendTask& task) noexcept {
         return;
     }
 
-    // Whole frames are written atomically: short capacity drops the
-    // frame
+    // Whole frames are written atomically: short capacity drops the frame
     // rather than splitting it and corrupting the stream.
     //
-    // Reachable in principle, not in any configuration this file
-    // accepts:
+    // Reachable in principle, not in any configuration this file accepts:
     // start() clamps maxPendingBytes down to wbufCapacity, a frame's
     // reservation stays in pendingBytes until it is written, and wbuf's
     // contents are a subset of what pendingBytes covers -- so
@@ -1330,11 +1304,9 @@ inline void SubReactor::handleTask(SendTask& task) noexcept {
     // under 8 concurrent producers, 38MB actually sent, to the point of
     // 35369 refusals elsewhere: this branch fired 0 times.
     //
-    // Kept rather than asserted away, because the alternative to
-    // refusing
+    // Kept rather than asserted away, because the alternative to refusing
     // is a partial frame in wbuf, which corrupts the stream. It records
-    // both counters now, as the close branch above does: a refusal is
-    // one
+    // both counters now, as the close branch above does: a refusal is one
     // event that operations may want to read either way, and recording
     // whichever one this branch reached is what made them incomparable.
     if (c->wbuf.writable() < f.size()) {
@@ -1347,22 +1319,17 @@ inline void SubReactor::handleTask(SendTask& task) noexcept {
     }
     c->wbuf.write(f.data(), f.size());
     // No release here: this is step 2 above, the byte count moving from
-    // "reserved by this task" to "reserved in wbuf". The drop branch
-    // just
+    // "reserved by this task" to "reserved in wbuf". The drop branch just
     // above does subtract, and the drain in handleWrite subtracts again
     // later -- so "unchanged" is a statement about this path, not about
     // the counter's behaviour anywhere else.
-    // No "was empty" test: armWrite is an idempotent move toward a
-    // target state,
-    // so arming twice has no effect -- while wbuf.empty() cannot see
-    // the
-    // part of pendingBytes that is reserved but not yet written, and
-    // deciding whether to arm from it loses a real write interest when
-    // it
+    // No "was empty" test: armWrite is an idempotent move toward a target
+    // state, so arming twice has no effect -- while wbuf.empty() cannot see
+    // the part of pendingBytes that is reserved but not yet written, and
+    // deciding whether to arm from it loses a real write interest when it
     // races disarmWrite, stranding frames already sitting in wbuf.
     // framesSent is not counted here either: a frame is counted as it
-    // leaves wbuf for the kernel (see drainWbufToSocket), the same
-    // point
+    // leaves wbuf for the kernel (see drainWbufToSocket), the same point
     // as bytesSent.
     armWrite(c);
 }
@@ -1370,9 +1337,8 @@ inline void SubReactor::handleTask(SendTask& task) noexcept {
 // The owner-thread half of sendTo(). A message handler already runs on the
 // reactor that owns the connection, so the frame can go into wbuf without the
 // global submission/connection locks, the task queue, its eventfd wakeup, or
-// the frame vector the queued path allocates. The queue is
-// still the only path for application threads and for connections owned by
-// another reactor.
+// the frame vector the queued path allocates. The queue is still the only
+// path for application threads and for connections owned by another reactor.
 inline bool SubReactor::trySendLocal(MultiReactorServer* expected,
                                      uint64_t id, const void* data, size_t len,
                                      SendResult* out) noexcept {
@@ -1439,18 +1405,14 @@ inline void SubReactor::handleTask(CloseTask& task) noexcept {
     const uint64_t id = task.id;
     auto it = conns_.find(id);
     if (it != conns_.end()) {
-        // Copy out and reset the map handle before closing: the
-        // deferred
+        // Copy out and reset the map handle before closing: the deferred
         // close callbacks must not run while this frame holds the conn.
         std::shared_ptr<Conn> c = it->second;
         Conn* raw = c.get();
         c.reset();
-        // Default (graceful): this is an application-level "we are
-        // done",
-        // so the reply queued just before it must still reach the peer
-        // --
-        // and so must answers to requests the peer already sent but
-        // this
+        // Default (graceful): this is an application-level "we are done",
+        // so the reply queued just before it must still reach the peer --
+        // and so must answers to requests the peer already sent but this
         // reactor has not read yet.
         drainInputThenClose(raw);
     }
@@ -3186,7 +3148,7 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
     // Owner-thread fast path: a handler runs on the reactor that owns its
     // connection, so it can write straight into wbuf. This bypasses the
     // global submission/connection locks, the task queue and its eventfd
-    // wakeup, and the frame/task allocations the queued path needs. It does
+    // wakeup, and the queued path's frame copy. It does
     // not race stop(): this thread is the reactor stop() has to join.
 #ifndef INDUSTRIAL_TCP_NO_SEND_FASTPATH
     if (SubReactor* local = SubReactor::current()) {
