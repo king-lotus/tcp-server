@@ -91,8 +91,10 @@ looks like; an optimisation of the algorithm would have kept the cores.
   line with the reactor's other hot fields bounces exactly like the atomic it
   replaced.
 - **`recv()` fills `rbuf` in place.** The 16KB stack buffer and the copy
-  through it are gone; the ring hands out its contiguous writable span, and the
-  read is rescheduled when the tail is full.
+  through it are gone; the ring hands out its contiguous writable span. At the
+  end of the ring a read is offered only the shorter contiguous piece, down to
+  one byte, and the next read continues at the wrapped tail -- never split
+  across the wrap.
 
 Two things about how these were found are worth keeping.
 
