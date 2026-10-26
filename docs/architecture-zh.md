@@ -207,8 +207,10 @@ eventfd。`closeRequested` 保证“先 closeConnection 再 sendTo”仍按队�
 close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf 而改变语义。
 
 非 owner 队列路径的 submission 屏障和连接表按 `connId` 分成 16 个 shard：发送/
-关闭只锁自己的 shard，`stop()` 一次性取全部 shard 把在途调用排空。该路径仍然
-每帧分配 frame vector 和 `std::function` 任务；owner 快路径不分配。
+关闭只锁自己的 shard，`stop()` 一次性取全部 shard 把在途调用排空。队列用 typed
+task（variant）：Send/Close/延迟任务内联，新连接任务用 `unique_ptr`（每连接
+一次），因此每帧不再分配 `std::function`；发送仍分配 frame vector，owner 快路径
+两者都不分配。
 
 `SendResult` 的语义：
 
@@ -615,7 +617,10 @@ python3 -m cpplint include/tcp-server-mt.h
   每客户端 2 万条，10 次中位数；延迟受调度影响，不是承诺。
 - 非 owner 队列路径（`-DINDUSTRIAL_TCP_NO_SEND_FASTPATH`）分片锁前后：2/2
   p50 18.4→13.9us、p99 62.1→41.4us、吞吐 92k→131k/s；1/1 与 4/4 在噪声内。
-  该路径仍每帧分配 frame/task。
+  该路径仍每帧分配 frame buffer；任务本身已在队列内联。
+- typed task 与 `std::function` 的 10 次 A/B：1/1 与 2/2 基本持平或略好
+  （2/2 130.8k vs 118.6k/s），4/4 在噪声内偏慢（102k vs 110k/s）；主要收益是
+  去掉每帧 `std::function` 分配，不是延迟。
 - 读路径已经不是瓶颈；剩余差异主要在 kernel 和测试客户端。
 
 ---
@@ -626,9 +631,9 @@ python3 -m cpplint include/tcp-server-mt.h
   实现。
 - **`sendTo` 的 `Ok` 不是送达确认**。它只表示帧已被接受（owner 线程写入
   wbuf，或其它线程入队）；关机、断连、关闭中的连接都可能让它最终没有发出。
-- **非 owner 发送仍每帧分配**：队列路径（应用线程 / 其它 reactor）仍分配 frame
-  vector 和 `std::function` 任务；owner reactor 上的 handler 快路径不分配。
-  性能敏感且从非 owner 线程发送时，优先把发送放在 handler 里。
+- **非 owner 发送仍每帧分配 frame buffer**：队列路径的 typed task 不再分配
+  `std::function`，但帧本身的 vector 仍分配；owner reactor 上的 handler 快路径
+  两者都不分配。性能敏感且从非 owner 线程发送时，优先把发送放在 handler 里。
 - **`stop()` 是立即中止**：它不等待在途回复；需要零丢失退出时用
   `stopGracefully(timeoutMs)`，并给 `closeLingerMs` 留出时间。
 - **优雅关闭可能被已有积压延迟**，但只服务关闭时已经缓冲的输入；新到的数据不能
