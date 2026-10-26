@@ -22,6 +22,10 @@ run it -- `verify/` is that machine.
   first, drains the replies already queued, and only then FINs. That semantic is
   where eight rounds of review landed most often and where the probes are
   densest.
+- **Idle is measured in bytes, and a partial frame has its own deadline.** A
+  peer that keeps dribbling a frame is not idle; `frameAssemblyTimeoutMs`
+  (default: 5 x `idleTimeoutMs`) aborts it and counts it separately from
+  `idleTimeouts`.
 - **The counters live in `ServerStats`**, each annotated with when it moves and
   with the branches that should reach it but cannot. Reading those comments
   beats reading this summary.

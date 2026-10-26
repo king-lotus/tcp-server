@@ -24,6 +24,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -273,6 +274,9 @@ struct ServerStats {
     std::atomic<uint64_t> framesDroppedOnClose{0};
     std::atomic<uint64_t> parseErrors{0};
     std::atomic<uint64_t> idleTimeouts{0};
+    // A partial frame did not complete within frameAssemblyTimeoutMs. Unlike
+    // idleTimeouts, this fires while bytes are still arriving.
+    std::atomic<uint64_t> frameAssemblyTimeouts{0};
     std::atomic<uint64_t> epollCtlErrors{0};
     // reactor threads that crashed or exited abnormally
     std::atomic<uint64_t> reactorFailures{0};
@@ -361,6 +365,10 @@ struct Conn {
     // rbufCapacity is closed as incomplete) and by TCP keepalive, not by the
     // idle tick.
     int64_t    lastRecvMs = 0;
+    // When the first byte of the frame currently being assembled arrived; 0
+    // means no partial frame. Later bytes do not refresh it: this deadline is
+    // about progress, not silence. Reactor-thread-only.
+    int64_t    frameStartedAtMs = 0;
     RingBuffer rbuf;
     RingBuffer wbuf;
     // Target state of this socket's EPOLLOUT bit, owned by the worker thread.
@@ -680,6 +688,12 @@ class MultiReactorServer {
         int         maxConnections  = 10000;
         int         idleTimeoutMs   = 120000;
         int         tickMs          = 500;
+        // A frame must complete within this deadline once its first byte
+        // arrives; 0 means 5 x idleTimeoutMs. Unlike idleTimeoutMs this
+        // measures progress, so a peer that keeps dribbling a partial frame
+        // cannot hold the connection forever. Must be >= 0 (start() refuses
+        // negative).
+        int         frameAssemblyTimeoutMs = 0;
         size_t      rbufCapacity    = MAX_FRAME_SIZE;
         // One maximum frame, not 256KB. The write buffer is allocated per
         // accepted connection, so it is most of the per-connection memory cost:
@@ -705,6 +719,15 @@ class MultiReactorServer {
         // Ceiling on reactors. Beyond a handful past the core count the only
         // thing extra workers buy is more cross-thread hand-off.
         static constexpr int kMaxReactors = 64;
+
+        // 0 means "five idle periods"; a positive value is an absolute
+        // override. int64_t because 5 * idleTimeoutMs can exceed int.
+        int64_t resolvedFrameAssemblyTimeoutMs() const noexcept {
+            if (frameAssemblyTimeoutMs > 0) {
+                return static_cast<int64_t>(frameAssemblyTimeoutMs);
+            }
+            return 5LL * static_cast<int64_t>(idleTimeoutMs);
+        }
 
         // What this configuration actually resolves to, with "0 means decide
         // for
@@ -1738,10 +1761,17 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
                 1, std::memory_order_relaxed);
             closeConn(c, "frame too large", false); return;
         }
-        // partial frame, wait for more
-        if (c->rbuf.readable() < FRAME_HEADER_SIZE + len) return;
+        // Partial frame, wait for more. Start the assembly deadline on the
+        // first byte of this frame; later bytes do not refresh it, or a peer
+        // could hold the connection forever by dribbling.
+        if (c->rbuf.readable() < FRAME_HEADER_SIZE + len) {
+            if (c->frameStartedAtMs == 0) c->frameStartedAtMs = nowMs();
+            return;
+        }
 
         c->rbuf.consume(FRAME_HEADER_SIZE);
+        // This frame is complete; the next partial one starts a new deadline.
+        c->frameStartedAtMs = 0;
         // No per-frame clock read here. lastRecvMs is stamped once per recv()
         // (handleRead), which is when bytes actually arrive; re-stamping it
         // while parsing only refreshes the idle deadline with the age of data
@@ -1828,6 +1858,13 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             auto& mh = server_->msgHandlerRef();
             if (mh) mh(c->id, frameScratch_.data(), len);
         }
+    }
+
+    // A header that has not arrived in full is also a frame in progress.
+    if (c->rbuf.readable() > 0 &&
+        c->rbuf.readable() < FRAME_HEADER_SIZE &&
+        c->frameStartedAtMs == 0) {
+        c->frameStartedAtMs = nowMs();
     }
 }
 
@@ -2263,6 +2300,8 @@ inline void SubReactor::doTick() noexcept {
     const int64_t now   = nowMs();
     const int64_t cutoff = now - server_->idleTimeoutMs();
     const int64_t linger = server_->closeLingerMs();
+    const int64_t frameTimeout =
+        server_->cfg_.resolvedFrameAssemblyTimeoutMs();
     // Every due close is collected during the walk and performed after it,
     // because closeConn is not always content to park the connection. Three
     // ways in reach from a single call all erase from conns_ -- the map this
@@ -2283,6 +2322,7 @@ inline void SubReactor::doTick() noexcept {
     // reference across that gap.
     std::vector<std::shared_ptr<Conn>> idle;   // graceful: may still owe bytes
     std::vector<std::shared_ptr<Conn>> expired;   // past its deadline: forced
+    std::vector<std::shared_ptr<Conn>> stalled;   // frame never completed
     for (auto& kv : conns_) {
         Conn* c = kv.second.get();
         if (c->closing.load(std::memory_order_acquire)) {
@@ -2305,10 +2345,22 @@ inline void SubReactor::doTick() noexcept {
             // until
             // what we owe it is out.
             idle.push_back(kv.second);
+            continue;
+        }
+        // Bytes keep arriving but the frame never completes. This is the case
+        // idleTimeoutMs deliberately does not catch; abort rather than park so
+        // the slot is released now.
+        if (c->frameStartedAtMs != 0 && frameTimeout > 0 &&
+            now - c->frameStartedAtMs >= frameTimeout) {
+            server_->statsRef().frameAssemblyTimeouts.fetch_add(
+                1, std::memory_order_relaxed);
+            stalled.push_back(kv.second);
         }
     }
     for (auto& c : idle)    closeConn(c.get(), "idle timeout");
     for (auto& c : expired) closeConn(c.get(), "close linger expired", false);
+    for (auto& c : stalled)
+        closeConn(c.get(), "frame assembly timeout", false);
 }
 
 inline void SubReactor::publishFramesRecv() noexcept {
@@ -2498,21 +2550,26 @@ inline bool MultiReactorServer::start() noexcept {
         cfg_.maxPendingBytes < FRAME_HEADER_SIZE ||
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 ||
         cfg_.idleTimeoutMs <= 0 || cfg_.writeBudgetBytes == 0 ||
-        cfg_.closeLingerMs <= 0 || cfg_.backlog <= 0) {
+        cfg_.closeLingerMs <= 0 || cfg_.backlog <= 0 ||
+        cfg_.frameAssemblyTimeoutMs < 0) {
         life_.store(Life::Stopped, std::memory_order_release);
         return false;
     }
 
-    // Deadline granularity: both timeouts only fire on tick boundaries, so a
+    // Deadline granularity: these timeouts only fire on tick boundaries, so a
     // tick coarser than the deadline silently stretches it by up to a full
     // tick. Warn rather than refuse -- a coarse tick with long deadlines is a
     // legitimate choice; a coarse tick with a 200ms promise is a surprise.
-    if (cfg_.tickMs > cfg_.closeLingerMs || cfg_.tickMs > cfg_.idleTimeoutMs) {
+    if (cfg_.tickMs > cfg_.closeLingerMs || cfg_.tickMs > cfg_.idleTimeoutMs ||
+        static_cast<int64_t>(cfg_.tickMs) >
+            cfg_.resolvedFrameAssemblyTimeoutMs()) {
         std::fprintf(stderr,
                      "[warn] tickMs=%d is coarser than closeLingerMs=%d / "
-                     "idleTimeoutMs=%d: both deadlines only fire on tick "
-                     "boundaries, so each can land up to a full tick late\n",
-                     cfg_.tickMs, cfg_.closeLingerMs, cfg_.idleTimeoutMs);
+                     "idleTimeoutMs=%d / frameAssemblyTimeoutMs=%" PRId64
+                     ": these deadlines only fire on tick boundaries, so each "
+                     "can land up to a full tick late\n",
+                     cfg_.tickMs, cfg_.closeLingerMs, cfg_.idleTimeoutMs,
+                     cfg_.resolvedFrameAssemblyTimeoutMs());
     }
 
     // Configuration validation

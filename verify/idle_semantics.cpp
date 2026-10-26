@@ -26,6 +26,11 @@
 //
 // A and C must survive; B must not.
 //
+// D and E cover what happens after that decision. A half-frame that stops is
+// reclaimed by the idle clock. One that keeps sending is not silent, so it is
+// reclaimed by the separate frameAssemblyTimeoutMs and counted as a
+// frame-assembly timeout, not an idle one.
+//
 // Build (Linux only):
 //   g++ -std=c++17 -Wall -Wextra -pthread verify/idle_semantics.cpp -o idle_semantics
 //
@@ -65,6 +70,9 @@ MultiReactorServer::Config idleConfig() {
     cfg.tickMs        = 50;
     cfg.idleTimeoutMs = 600;
     cfg.closeLingerMs = 1000;
+    // This suite is about the idle clock. Keep the separate frame-assembly
+    // deadline far away so case E can exercise it on its own.
+    cfg.frameAssemblyTimeoutMs = 600000;
     return cfg;
 }
 
@@ -261,16 +269,73 @@ void caseHalfFrameThenSilent() {
     peer.close();
 }
 
+// A. and D. are about silence. A peer that keeps sending bytes but never
+// completes a frame is not silent, so it needs its own deadline: this case
+// makes that deadline the short one and confirms the close is counted as a
+// frame-assembly timeout, not an idle one.
+MultiReactorServer::Config stuckFrameConfig() {
+    MultiReactorServer::Config cfg = idleConfig();
+    cfg.idleTimeoutMs = 5000;             // the frame deadline must win
+    cfg.frameAssemblyTimeoutMs = 300;     // not the 5 x idle default
+    return cfg;
+}
+
+void caseStuckFrame() {
+    std::printf("E. stuck frame: bytes keep arriving, frame never completes\n");
+    harness::Fixture server(stuckFrameConfig(),
+                            [](uint64_t, const uint8_t*, size_t) {});
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
+
+    harness::Peer peer;
+    if (!peer.connect(server.port())) {
+        harness::expect(false, "client connected");
+        return;
+    }
+
+    const size_t kTotal = 2000;
+    uint8_t hdr[industrial::FRAME_HEADER_SIZE];
+    industrial::writeFrameHeader(hdr, FrameType::DATA, kTotal);
+    if (!peer.sendRaw(hdr, sizeof hdr)) {
+        harness::expect(false, "header sent");
+        return;
+    }
+
+    // One byte every 50ms: the peer is demonstrably alive, but the declared
+    // frame cannot finish inside 300ms. Send until the far side hangs up.
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        uint8_t b = static_cast<uint8_t>(120);
+        if (!peer.sendRaw(&b, 1)) break;
+    }
+
+    const harness::Status st = peer.expectClose(harness::Close::Any, 1000);
+    const unsigned long long frameTimeouts =
+        server.stats().frameAssemblyTimeouts.load();
+    const unsigned long long idle = server.stats().idleTimeouts.load();
+    std::printf("      frameAssemblyTimeouts %llu, idleTimeouts %llu\n",
+                frameTimeouts, idle);
+
+    harness::expect(static_cast<bool>(st),
+                    "the stuck frame was closed", st.why);
+    harness::expect(frameTimeouts >= 1,
+                    "counted as a frame assembly timeout");
+    harness::expect(idle == 0, "not as an idle timeout");
+
+    peer.close();
+}
+
 }  // namespace
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("idleTimeoutMs=600, tickMs=50; every case runs ~1.6s at the same\n"
-                "byte rate. Only whether the bytes form frames differs.\n\n");
+    std::printf("idleTimeoutMs=600, tickMs=50; cases A-D run ~1.6s at the\n"
+                "same byte rate. Case E sets a 300ms frame-assembly "
+                "deadline.\n\n");
     caseHalfFrame();
     caseSilent();
     caseFullFrames();
     caseHalfFrameThenSilent();
+    caseStuckFrame();
     std::printf("\n");
     return harness::finish();
 }
