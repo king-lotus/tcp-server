@@ -627,7 +627,7 @@ class SubReactor {
     struct FinishPeerClosedTask { uint64_t id = 0; };
     struct DrainInputTask { uint64_t id = 0; };
     struct ParkCloseTask { uint64_t id = 0; };
-    // processPending switches on the alternative index; keep this order in
+    // kTaskDispatch is indexed by the alternative index; keep this order in
     // sync if a task type is added or reordered.
     using Task = std::variant<std::unique_ptr<NewConnTask>, SendTask,
                               CloseTask, FinishPeerClosedTask,
@@ -639,6 +639,15 @@ class SubReactor {
     void handleTask(FinishPeerClosedTask& task) noexcept;
     void handleTask(DrainInputTask& task) noexcept;
     void handleTask(ParkCloseTask& task) noexcept;
+    using TaskDispatch = void (*)(SubReactor*, Task&) noexcept;
+    template <size_t I>
+    static void dispatchTask(SubReactor* self, Task& task) noexcept {
+        self->handleTask(std::get<I>(task));
+    }
+    static constexpr std::array<TaskDispatch, 6> kTaskDispatch = {
+        &dispatchTask<0>, &dispatchTask<1>, &dispatchTask<2>,
+        &dispatchTask<3>, &dispatchTask<4>, &dispatchTask<5>,
+    };
     void cleanup() noexcept;
     // Publish the per-reactor traffic counters to the shared stats, then
     // reset them. Called once per loop iteration and once on loop exit, so
@@ -1136,16 +1145,8 @@ inline void SubReactor::processPending() noexcept {
     }
     for (auto& t : activeTasks_) {
         if (!running_.load() || !server_->isRunning()) break;
-        // A direct switch avoids std::visit's dispatch table on this
-        // per-send hot path.
-        switch (t.index()) {
-            case 0: handleTask(std::get<0>(t)); break;
-            case 1: handleTask(std::get<1>(t)); break;
-            case 2: handleTask(std::get<2>(t)); break;
-            case 3: handleTask(std::get<3>(t)); break;
-            case 4: handleTask(std::get<4>(t)); break;
-            case 5: handleTask(std::get<5>(t)); break;
-        }
+        // One indirect call through the table, indexed by the alternative.
+        kTaskDispatch[t.index()](this, t);
         flushCloseCallbacks();
     }
     activeTasks_.clear();
