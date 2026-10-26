@@ -66,3 +66,13 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Local agent configuration (not part of the library)
+.workbuddy-ai/
+
+# Editor workspace files (local, not part of the library)
+.workspace
+*.code-workspace
+
+# Editor configuration
+.vscode/

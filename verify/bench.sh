@@ -70,7 +70,14 @@ for line in open(sys.argv[1], encoding="utf-8"):
                               if k in ("connections", "reactors", "clients", "payload",
                                        "wbuf", "mode"))))
     for name, value in kv.items():
-        if name in ("connections", "reactors", "clients", "payload"):
+        # `mode` belongs to the group key, not to the measurements. It used to
+        # fall through to here, fail float(), and leave an empty list behind --
+        # `groups[key][name]` is evaluated before the exception, so defaultdict
+        # had already created it. median() then died on that empty list, which
+        # is why this summariser never printed a full table for any run that
+        # emitted a mode= field. The other four are excluded for the same
+        # reason; mode was simply missed when it was added.
+        if name in ("connections", "reactors", "clients", "payload", "mode"):
             continue
         try:
             groups[key][name].append(float(value))
