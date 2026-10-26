@@ -63,8 +63,18 @@ void caseHealthy() {
         else ++malformed;
     }
 
-    const unsigned long long framesSent = server.stats().framesSent.load();
-    const unsigned long long bytesSent  = server.stats().bytesSent.load();
+    // Traffic counters are published once per reactor loop, so the last PONG
+    // can be visible to this side before the server has published its count.
+    unsigned long long framesSent = 0;
+    unsigned long long bytesSent  = 0;
+    for (int i = 0; i < 100; ++i) {
+        framesSent = server.stats().framesSent.load();
+        bytesSent  = server.stats().bytesSent.load();
+        if (framesSent == static_cast<unsigned long long>(kPings) &&
+            bytesSent == static_cast<unsigned long long>(kPings) *
+                             industrial::FRAME_HEADER_SIZE) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
     std::printf("      PONG %d of %d (malformed %d), framesSent %llu bytesSent %llu\n",
                 got, kPings, malformed, framesSent, bytesSent);
 
@@ -115,6 +125,8 @@ void caseWhileClosing() {
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
         dropped = server.stats().framesDroppedOnClose.load();
     }
+    // Give the last pre-close PONG a loop to be published before the baseline.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     const unsigned long long sentAfterCloseBegan = server.stats().framesSent.load();
 
     for (int i = 0; i < 5; ++i) {

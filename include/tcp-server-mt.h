@@ -256,16 +256,20 @@ struct ServerStats {
     // line-aligned tally and publish it once per loop iteration (and once on
     // loop exit), so it is exact at idle and can lag one iteration while
     // traffic flows.
-    std::atomic<uint64_t> framesRecv{0};
+    alignas(64) std::atomic<uint64_t> framesRecv{0};
     // Counted when a frame's last byte reaches the kernel (drainWbufToSocket),
     // the same point as bytesSent. Counted on entering wbuf instead, frames an
     // abort threw away would sit in the total forever with nowhere to deduct
     // them -- in one measured abort the counter claimed 511 frames while 48 had
-    // actually reached the peer.
-    std::atomic<uint64_t> framesSent{0};
-    std::atomic<uint64_t> bytesRecv{0};
-    std::atomic<uint64_t> bytesSent{0};
-    std::atomic<uint64_t> queueDrops{0};       // whole-frame enqueues refused
+    // actually reached the peer. Reactors batch it in a local line-aligned
+    // tally and publish it once per loop iteration (and once on loop exit), so
+    // it is exact at idle and can lag one iteration while traffic flows.
+    alignas(64) std::atomic<uint64_t> framesSent{0};
+    // Batched the same way: each reactor accumulates locally and publishes
+    // once per loop iteration.
+    alignas(64) std::atomic<uint64_t> bytesRecv{0};
+    alignas(64) std::atomic<uint64_t> bytesSent{0};
+    alignas(64) std::atomic<uint64_t> queueDrops{0};  // whole frames refused
     // bytes still unsent when the connection closed
     std::atomic<uint64_t> bytesDropped{0};
     // forced disconnects (RST), not a graceful close
@@ -285,8 +289,10 @@ struct ServerStats {
     // without it the only symptom is that it stopped accepting connections and
     // never said a word about it.
     std::atomic<uint64_t> acceptErrors{0};
-    std::atomic<uint64_t> pendingTasksTotal{0};  // every submission ever queued
-    std::atomic<uint64_t> pendingTasksDepth{0};  // current queue depth (gauge)
+    // Slow-path task counters. The owner-thread sendTo() fast path does not
+    // queue, so it does not touch either.
+    alignas(64) std::atomic<uint64_t> pendingTasksTotal{0};
+    alignas(64) std::atomic<uint64_t> pendingTasksDepth{0};  // queue gauge
     // recv returned 0 (peer's FIN). Under level-triggered epoll a peer that has
     // half-closed makes epoll_wait hand back the same EPOLLIN every time, so
     // this doubles as a probe for whether the reactor is spinning on one FIN:
@@ -605,23 +611,28 @@ class SubReactor {
     DrainOutcome drainWbufToSocket(Conn* c) noexcept;
     bool enqueue(std::function<void()> task) noexcept;
     void cleanup() noexcept;
-    // Publish framesRecvLocal_ to the shared counter, then reset it. Called
-    // once per loop iteration and once on loop exit, so framesRecv is exact at
-    // idle and can lag one iteration while traffic flows.
-    void publishFramesRecv() noexcept;
+    // Publish the per-reactor traffic counters to the shared stats, then
+    // reset them. Called once per loop iteration and once on loop exit, so
+    // each counter is exact at idle and can lag one iteration while traffic
+    // flows.
+    void publishStats() noexcept;
     void scheduleRead(Conn* c) noexcept;
     void unscheduleRead(Conn* c) noexcept;
     Conn* readHead_ = nullptr;
     Conn* readTail_ = nullptr;
 
-    // Frames parsed since the last publish, alone on a cache line: the next
-    // member is aligned to the same boundary, so nothing else shares this line.
-    // Publishing the shared atomic once per frame was 18.5% slower than
-    // removing the counter entirely (2198 -> 2605 MB/s); batching recovers
-    // nearly all of that gain. The alignment is not decoration: a counter
-    // sharing a line with the reactor's other hot fields bounces at a
-    // different address, which is what the first attempt did.
+    // Per-reactor traffic counters, each on its own cache line and published
+    // by publishStats() once per loop iteration (and once on exit). Publishing
+    // the shared atomic once per frame was 18.5% slower than removing the
+    // counter entirely (2198 -> 2605 MB/s); batching recovers nearly all of
+    // that gain. The alignment is not decoration: a counter sharing a line
+    // with the reactor's other hot fields bounces at a different address,
+    // which is what the first attempt did. idx_ is aligned too so the last
+    // counter is alone on its line.
     alignas(64) uint64_t framesRecvLocal_ = 0;
+    alignas(64) uint64_t framesSentLocal_ = 0;
+    alignas(64) uint64_t bytesRecvLocal_ = 0;
+    alignas(64) uint64_t bytesSentLocal_ = 0;
 
     alignas(64) int      idx_;
     MultiReactorServer*  server_;
@@ -1493,17 +1504,14 @@ inline DrainOutcome SubReactor::drainWbufToSocket(Conn* c) noexcept {
                 c->sendFrameRemain -= take;
                 left -= take;
                 off += take;
-                if (c->sendFrameRemain == 0)
-                    server_->statsRef().framesSent.fetch_add(
-                        1, std::memory_order_relaxed);
+                if (c->sendFrameRemain == 0) ++framesSentLocal_;
             }
         }
         c->wbuf.consume(static_cast<size_t>(k));
         budget -= static_cast<size_t>(k);
         c->pendingBytes.fetch_sub(
             static_cast<size_t>(k), std::memory_order_relaxed);
-        server_->statsRef().bytesSent.fetch_add(static_cast<uint64_t>(k),
-                                                  std::memory_order_relaxed);
+        bytesSentLocal_ += static_cast<uint64_t>(k);
     }
     return DrainOutcome::Drained;
 }
@@ -1562,8 +1570,7 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             // quiet and bytesRecv was still climbing. "Idle" means no bytes,
             // and this is where bytes appear.
             c->lastRecvMs = nowMs();
-            server_->statsRef().bytesRecv.fetch_add(
-                static_cast<uint64_t>(n), std::memory_order_relaxed);
+            bytesRecvLocal_ += static_cast<uint64_t>(n);
         } else if (n == 0) {
             // Peer's FIN. If we still owe it a reply, closing here would turn
             // the
@@ -2448,11 +2455,28 @@ inline void SubReactor::doTick() noexcept {
         closeConn(c.get(), "frame assembly timeout", false);
 }
 
-inline void SubReactor::publishFramesRecv() noexcept {
-    if (framesRecvLocal_ == 0) return;
-    server_->statsRef().framesRecv.fetch_add(
-        framesRecvLocal_, std::memory_order_relaxed);
-    framesRecvLocal_ = 0;
+inline void SubReactor::publishStats() noexcept {
+    ServerStats& stats = server_->statsRef();
+    if (framesRecvLocal_ != 0) {
+        stats.framesRecv.fetch_add(
+            framesRecvLocal_, std::memory_order_relaxed);
+        framesRecvLocal_ = 0;
+    }
+    if (framesSentLocal_ != 0) {
+        stats.framesSent.fetch_add(
+            framesSentLocal_, std::memory_order_relaxed);
+        framesSentLocal_ = 0;
+    }
+    if (bytesRecvLocal_ != 0) {
+        stats.bytesRecv.fetch_add(
+            bytesRecvLocal_, std::memory_order_relaxed);
+        bytesRecvLocal_ = 0;
+    }
+    if (bytesSentLocal_ != 0) {
+        stats.bytesSent.fetch_add(
+            bytesSentLocal_, std::memory_order_relaxed);
+        bytesSentLocal_ = 0;
+    }
 }
 
 inline void SubReactor::loop() noexcept {
@@ -2478,7 +2502,7 @@ inline void SubReactor::loop() noexcept {
                 auto c = it->second;
                 handleRead(c.get());
             }
-            publishFramesRecv();
+            publishStats();
             int n = ::epoll_wait(epollFd_, events.data(),
                                  static_cast<int>(events.size()),
                                  readHead_ ? 0 : tickMs);
@@ -2537,7 +2561,7 @@ inline void SubReactor::loop() noexcept {
                 doTick();
             }
         }
-        publishFramesRecv();
+        publishStats();
     } catch (...) {
         server_->statsRef().reactorFailures.fetch_add(
             1, std::memory_order_relaxed);

@@ -30,7 +30,9 @@ run it -- `verify/` is that machine.
   `idleTimeouts`.
 - **The counters live in `ServerStats`**, each annotated with when it moves and
   with the branches that should reach it but cannot. Reading those comments
-  beats reading this summary.
+  beats reading this summary. The four traffic counters are batched per reactor
+  and published once per loop iteration: exact at idle, up to one iteration
+  behind under traffic.
 
 ## Verifying
 

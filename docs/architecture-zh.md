@@ -348,9 +348,9 @@ close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf �
 | `accepted` | 连接在 reactor 中完成注册（不是 accept 返回时） |
 | `rejected` | 超过 `maxConnections`，或注册失败 |
 | `closed` | 连接完成销毁 |
-| `framesRecv` | 解析出一个完整帧；多 reactor 批量发布，空闲精确、繁忙最多滞后一轮 |
-| `framesSent` | 帧的最后一个字节到达内核（不是入队时） |
-| `bytesRecv` / `bytesSent` | 实际 recv/send 到内核的字节数 |
+| `framesRecv` | 解析出一个完整帧；每 reactor 本地累加，每轮发布，空闲精确、繁忙最多滞后一轮 |
+| `framesSent` | 帧的最后一个字节到达内核（不是入队时）；同样本地累加、每轮发布 |
+| `bytesRecv` / `bytesSent` | 实际 recv/send 到内核的字节数；同样本地累加、每轮发布 |
 | `queueDrops` | 整帧被拒绝：单连接 `maxPendingBytes` 到顶，或 reactor 队列满 |
 | `bytesDropped` | 连接关闭时仍未发出的字节 |
 | `aborted` | 强制断开（RST），不是优雅关闭 |
@@ -367,6 +367,12 @@ close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf �
 | `closeRequestsDropped` | `closeConnection` 请求没送到 owner |
 | `epipeWrites` | `sendmsg` 返回 EPIPE（预期为 0，用于验证不可达路径） |
 | `closeCallbacksDropped` | 关闭回调因分配失败被丢弃（预期为 0） |
+
+四个流量计数器（`framesRecv`、`framesSent`、`bytesRecv`、`bytesSent`）都是
+“每 reactor 本地累加 + 每轮循环发布一次”：空闲时精确，有流量时最多滞后一轮。
+`ServerStats` 的热计数器按 64 字节隔离，避免不同 reactor 更新不同计数器时的
+false sharing；同一个计数器（例如 `framesSent`）仍由多个 reactor 更新，但频率
+从每帧降到每轮一次。
 
 ---
 
@@ -587,9 +593,9 @@ python3 -m cpplint include/tcp-server-mt.h
 - 最大帧 **64 KiB + 8 字节头**。
 - 在开发 VM 上，4 KB 批量 ingest 约 **2.8 GB/s**，占用 8 核中的约 0.83 核；
   这些数字依赖机器、内核和编译选项，不是承诺。
-- 发送 echo（owner-thread 快路径，`bench_send` 多客户端）：1/1 p50 34us /
-  p99 86us；2/2 p50 12us / p99 45us；4/4 p50 27us / p99 87us。VM 8 vCPU，
-  每客户端 2 万条，5 次中位数；延迟受调度影响，不是承诺。
+- 发送 echo（owner-thread 快路径，`bench_send` 多客户端）：1/1 p50 35us /
+  p99 63us；2/2 p50 17us / p99 56us；4/4 p50 26us / p99 70us。VM 8 vCPU，
+  每客户端 2 万条，10 次中位数；延迟受调度影响，不是承诺。
 - 读路径已经不是瓶颈；剩余差异主要在 kernel 和测试客户端。
 
 ---
