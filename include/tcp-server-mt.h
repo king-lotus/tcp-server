@@ -47,6 +47,10 @@ namespace industrial {
 constexpr uint16_t FRAME_MAGIC       = 0xEB90;
 constexpr size_t   FRAME_HEADER_SIZE = 8;
 constexpr uint32_t MAX_FRAME_PAYLOAD = 64 * 1024;
+// The largest frame that can appear on the wire: one header plus the maximum
+// payload. Buffers that must hold any legal frame are sized from this rather
+// than from a rounded number that happens to be close.
+constexpr size_t   MAX_FRAME_SIZE = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
 
 enum class FrameType : uint16_t {
     DATA = 0x0001,
@@ -156,7 +160,7 @@ class RingBuffer {
         if (cap_ == 0) return 0;   // uninitialised: see init()
         size_t w = std::min(n, writable());
         if (w == 0) return 0;
-        size_t tail  = (head_ + size_) % cap_;
+        size_t tail  = writeTail();
         size_t first = std::min(w, cap_ - tail);
         std::memcpy(buf_.data() + tail, p, first);
         if (w > first) std::memcpy(buf_.data(), p + first, w - first);
@@ -190,14 +194,17 @@ class RingBuffer {
     // is offered; a ring that has wrapped has a second piece at buf_[0].
     uint8_t* writePtr() noexcept {
         if (cap_ == 0) return nullptr;
-        return buf_.data() + ((head_ + size_) % cap_);
+        return buf_.data() + writeTail();
     }
     size_t writeSpan() const noexcept {
         if (cap_ == 0) return 0;
-        const size_t tail = (head_ + size_) % cap_;
+        const size_t tail = writeTail();
         return std::min(cap_ - size_, cap_ - tail);
     }
-    void commit(size_t n) noexcept { size_ += std::min(n, writable()); }
+    // Marks n bytes written through writePtr(). Clamped to the span that was
+    // offered, not to writable(): bytes past the end of the ring were never
+    // written contiguously, and claiming them readable would expose stale data.
+    void commit(size_t n) noexcept { size_ += std::min(n, writeSpan()); }
 
     void consume(size_t n) noexcept {
         size_t r = std::min(n, size_);
@@ -227,6 +234,12 @@ class RingBuffer {
     void clear() noexcept { head_ = 0; size_ = 0; }
 
  private:
+    // Offset of the write end. Defined as 0 for the uninitialised ring; every
+    // public method checks cap_ == 0 before it gets here.
+    size_t writeTail() const noexcept {
+        return cap_ == 0 ? 0 : (head_ + size_) % cap_;
+    }
+
     std::vector<uint8_t> buf_;
     size_t cap_  = 0;
     size_t head_ = 0;
@@ -238,6 +251,10 @@ struct ServerStats {
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
     std::atomic<uint64_t> closed{0};
+    // Counted when a frame is parsed. Reactors batch the count in a local
+    // line-aligned tally and publish it once per loop iteration (and once on
+    // loop exit), so it is exact at idle and can lag one iteration while
+    // traffic flows.
     std::atomic<uint64_t> framesRecv{0};
     // Counted when a frame's last byte reaches the kernel (drainWbufToSocket),
     // the same point as bytesSent. Counted on entering wbuf instead, frames an
@@ -336,10 +353,9 @@ struct Conn {
     // elsewhere.
     // Last time a byte arrived from this peer, not last time a frame was
     // completed: an idle deadline is a promise about silence, and a peer
-    // dribbling one large frame over a slow link is not silent. Refreshed as
-    // soon as recv() hands us bytes (handleRead), and again in parseFrames as
-    // each frame completes -- the second is redundant for the timeout and kept
-    // because it is the only stamp a frame carries.
+    // dribbling one large frame over a slow link is not silent. Stamped only
+    // where bytes arrive (handleRead); parsing does not touch it, so a frame
+    // that completes late cannot extend the deadline.
     // Consequence: a peer that sends bytes which never complete a frame is now
     // never idle-reclaimed. It is bounded by rbuf (a frame larger than
     // rbufCapacity is closed as incomplete) and by TCP keepalive, not by the
@@ -561,20 +577,26 @@ class SubReactor {
     DrainOutcome drainWbufToSocket(Conn* c) noexcept;
     bool enqueue(std::function<void()> task) noexcept;
     void cleanup() noexcept;
+    // Publish framesRecvLocal_ to the shared counter, then reset it. Called
+    // once per loop iteration and once on loop exit, so framesRecv is exact at
+    // idle and can lag one iteration while traffic flows.
+    void publishFramesRecv() noexcept;
     void scheduleRead(Conn* c) noexcept;
     void unscheduleRead(Conn* c) noexcept;
     Conn* readHead_ = nullptr;
     Conn* readTail_ = nullptr;
 
-    // Frames parsed since the last publish, on its own cache line. Publishing
-    // the shared atomic once per frame measured 18.5% of throughput when it was
-    // removed (2198 -> 2605 MB/s). The alignment is not decoration: a counter
-    // sharing a line with this reactor's other hot fields puts the bouncing
-    // back at a different address, which is what the first attempt at this did.
+    // Frames parsed since the last publish, alone on a cache line: the next
+    // member is aligned to the same boundary, so nothing else shares this line.
+    // Publishing the shared atomic once per frame was 18.5% slower than
+    // removing the counter entirely (2198 -> 2605 MB/s); batching recovers
+    // nearly all of that gain. The alignment is not decoration: a counter
+    // sharing a line with the reactor's other hot fields bounces at a
+    // different address, which is what the first attempt did.
     alignas(64) uint64_t framesRecvLocal_ = 0;
 
-    int                 idx_;
-    MultiReactorServer* server_;
+    alignas(64) int      idx_;
+    MultiReactorServer*  server_;
 
     int               epollFd_ = -1;
     int               wakeFd_  = -1;
@@ -658,19 +680,20 @@ class MultiReactorServer {
         int         maxConnections  = 10000;
         int         idleTimeoutMs   = 120000;
         int         tickMs          = 500;
-        size_t      rbufCapacity    = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        size_t      rbufCapacity    = MAX_FRAME_SIZE;
         // One maximum frame, not 256KB. The write buffer is allocated per
         // accepted connection, so it is most of the per-connection memory cost:
         // 324.7KB at 256KB, 128.8KB here, with no throughput change in the
-        // ingest benchmark. The floor is FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD
-        // rather than a rounded number: sendTo refuses a frame that does not
-        // fit, so a smaller buffer makes a maximum-size reply impossible to
-        // write, on an idle connection, forever.
-        size_t      wbufCapacity    = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        // ingest benchmark. The default is MAX_FRAME_SIZE rather than a
+        // rounded number: sendTo refuses a frame that does not fit, so a
+        // smaller buffer makes a maximum-size reply impossible to write, on an
+        // idle connection, forever. start() still accepts a smaller one on
+        // purpose -- send_results relies on that to exercise the send limits.
+        size_t      wbufCapacity    = MAX_FRAME_SIZE;
         // Matches the buffer above rather than repeating 256KB: start() clamps
         // this down to wbufCapacity anyway, so a larger default would only be a
         // number that reads as a promise it does not keep.
-        size_t      maxPendingBytes = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        size_t      maxPendingBytes = MAX_FRAME_SIZE;
         size_t      writeBudgetBytes = 256 * 1024;
         // Grace period for a half-closed connection: after our FIN went out we
         // keep reading until the peer's FIN, but never longer than this. Bounds
@@ -1408,14 +1431,13 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             return dispatched();
         }
 
+        // writable() was checked above and tail < cap_ always, so writeSpan()
+        // offers at least one byte. Near the end of the ring it offers only the
+        // contiguous piece, down to one byte; the next recv() starts at the
+        // wrapped tail. A read is never split across the wrap.
         size_t want = std::min(c->rbuf.writeSpan(),
                                static_cast<size_t>(bytesLeft));
-        if (want == 0) {
-            // The ring has wrapped and its tail is full: come back after a
-            // round has consumed something.
-            scheduleRead(c);
-            return dispatched();
-        }
+        assert(want > 0);
         ssize_t n = ::recv(c->fd, c->rbuf.writePtr(), want, 0);
         if (n > 0) {
             c->rbuf.commit(static_cast<size_t>(n));
@@ -1426,12 +1448,11 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             // same
             // read as the backlog must be charged to the close budget too.
             c->drainReadBytes += static_cast<size_t>(n);
-            // Stamped here, on arrival, rather than only when the bytes
-            // complete
-            // a frame: with the stamp in parseFrames alone, a frame that took
-            // longer than idleTimeoutMs to arrive was closed while it was still
-            // arriving -- the peer had never gone quiet and bytesRecv was still
-            // climbing. "Idle" means no bytes, and this is where bytes appear.
+            // Stamped here, on arrival, not when a frame completes: a frame
+            // that took longer than idleTimeoutMs to arrive would otherwise be
+            // closed while it was still arriving -- the peer had never gone
+            // quiet and bytesRecv was still climbing. "Idle" means no bytes,
+            // and this is where bytes appear.
             c->lastRecvMs = nowMs();
             server_->statsRef().bytesRecv.fetch_add(
                 static_cast<uint64_t>(n), std::memory_order_relaxed);
@@ -2290,6 +2311,13 @@ inline void SubReactor::doTick() noexcept {
     for (auto& c : expired) closeConn(c.get(), "close linger expired", false);
 }
 
+inline void SubReactor::publishFramesRecv() noexcept {
+    if (framesRecvLocal_ == 0) return;
+    server_->statsRef().framesRecv.fetch_add(
+        framesRecvLocal_, std::memory_order_relaxed);
+    framesRecvLocal_ = 0;
+}
+
 inline void SubReactor::loop() noexcept {
     MultiReactorServer::CallbackScope callbacks(server_);
     try {
@@ -2312,11 +2340,7 @@ inline void SubReactor::loop() noexcept {
                 auto c = it->second;
                 handleRead(c.get());
             }
-            if (framesRecvLocal_ != 0) {
-                server_->statsRef().framesRecv.fetch_add(
-                    framesRecvLocal_, std::memory_order_relaxed);
-                framesRecvLocal_ = 0;
-            }
+            publishFramesRecv();
             int n = ::epoll_wait(epollFd_, events.data(),
                                  static_cast<int>(events.size()),
                                  readHead_ ? 0 : tickMs);
@@ -2375,11 +2399,7 @@ inline void SubReactor::loop() noexcept {
                 doTick();
             }
         }
-        if (framesRecvLocal_ != 0) {
-            server_->statsRef().framesRecv.fetch_add(
-                framesRecvLocal_, std::memory_order_relaxed);
-            framesRecvLocal_ = 0;
-        }
+        publishFramesRecv();
     } catch (...) {
         server_->statsRef().reactorFailures.fetch_add(
             1, std::memory_order_relaxed);
@@ -2473,7 +2493,7 @@ inline bool MultiReactorServer::start() noexcept {
     life_.store(Life::Starting, std::memory_order_release);
     failed_.store(false, std::memory_order_release);
     if (!reactors_.empty() || acceptThread_.joinable() ||
-        cfg_.rbufCapacity < FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD ||
+        cfg_.rbufCapacity < MAX_FRAME_SIZE ||
         cfg_.wbufCapacity < FRAME_HEADER_SIZE ||
         cfg_.maxPendingBytes < FRAME_HEADER_SIZE ||
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 ||

@@ -9,10 +9,11 @@
 // this is the case that notices.
 //
 // The upper bound is a memory budget. The lower bound is not: sendTo() refuses
-// a frame that does not fit in wbuf, so a buffer smaller than
-// FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD makes the largest legal reply
-// impossible to write at all -- and 64 * 1024, a number that reads as "64KB",
-// is 8 bytes too small. That is how this case came to exist.
+// a frame that does not fit in wbuf, so a buffer smaller than MAX_FRAME_SIZE
+// makes the largest legal reply impossible to write at all -- and 64 * 1024, a
+// number that reads as "64KB", is 8 bytes too small. That is how this case came
+// to exist. A caller may still choose a smaller buffer, but then the largest
+// reply is refused; the default must not.
 //
 // Only the configuration half is fatal. RSS depends on the allocator and on the
 // sanitizer the suite is built with, so a threshold there would fail on
@@ -50,8 +51,7 @@ int main() {
     MultiReactorServer::Config cfg;
     char detail[192];
 
-    const size_t frameCeiling =
-        industrial::FRAME_HEADER_SIZE + industrial::MAX_FRAME_PAYLOAD;
+    const size_t frameCeiling = industrial::MAX_FRAME_SIZE;
 
     std::printf("== what a default Config promises ==\n");
 
@@ -79,6 +79,22 @@ int main() {
 
     std::snprintf(detail, sizeof detail, "maxConnections=%d", cfg.maxConnections);
     harness::expect(cfg.maxConnections > 0, "maxConnections admits something", detail);
+
+    // The in-place write API has one caller today, but a commit that trusted
+    // its argument instead of the span it offered would mark bytes it never
+    // wrote as readable -- stale data handed to parseFrames.
+    industrial::RingBuffer ring(8);
+    const uint8_t six[6] = {0, 1, 2, 3, 4, 5};
+    ring.write(six, sizeof six);
+    ring.consume(4);   // head_ = 4, size_ = 2, so only [6, 8) is contiguous
+    std::snprintf(detail, sizeof detail, "writeSpan=%zu writable=%zu",
+                  ring.writeSpan(), ring.writable());
+    harness::expect(ring.writeSpan() == 2,
+                    "writeSpan offers only the contiguous tail", detail);
+    ring.commit(6);    // more than the ring offered
+    std::snprintf(detail, sizeof detail, "readable=%zu", ring.readable());
+    harness::expect(ring.readable() == 4,
+                    "commit clamps to the offered span", detail);
 
     std::printf("== measured cost (evidence, not a verdict) ==\n");
 
