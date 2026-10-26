@@ -30,6 +30,12 @@ run it -- `verify/` is that machine.
   peer that keeps dribbling a frame is not idle; `frameAssemblyTimeoutMs`
   (default: 5 x `idleTimeoutMs`) aborts it and counts it separately from
   `idleTimeouts`.
+- **Slow work can leave the reactor without reordering a connection.**
+  `Config::handlerThreads > 0` starts an optional pool; `offload(connId, fn)`
+  queues work that runs serially per connection and in parallel across
+  connections, and returns `false` when the pool is off or the shared
+  `handlerQueueLimit` is full. The message handler itself still runs on the
+  reactor; it copies what the task needs and returns.
 - **The counters live in `ServerStats`**, each annotated with when it moves and
   with the branches that should reach it but cannot. Reading those comments
   beats reading this summary. The four traffic counters are batched per reactor
@@ -128,7 +134,7 @@ shrinking; that one is open.
 ## Layout
 
 ```
-include/tcp-server-mt.h   the only deliverable, 2988 lines
+include/tcp-server-mt.h   the only deliverable, 3414 lines
 verify/                   runtime suites, the peer harness, one-off probes
 docs/testing.md           how a suite is written, and how the harness is tested
 docs/review/              eight rounds of review, with an index

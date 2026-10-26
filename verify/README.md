@@ -95,7 +95,7 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 8192 一帧不差 —— 卡住的位置正好是那条常量。它是故意先红着提交的（`f8a6523`）。
 
-## `send_results.cpp` —— sendTo 的五种回答，外加两个计数器
+## `send_results.cpp` —— sendTo 的五种回答、两个计数器，外加 offload
 
 `sendTo()` 是应用往连接上放字节的唯一入口，`SendResult` 是它能拿回的全部信息。但第六轮之前，
 四个失败态（`NotConnected` / `TooLarge` / `Overloaded` / `InvalidArgument`）**整个 verify/ 里没有任何
@@ -108,6 +108,7 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 | 五种回答 | 每个值各一条，且都落在真正产生它的状态上；`Overloaded` 用"帧大于 32 字节上限"达成，不去和排空赛跑 |
 | 关闭中发送 | `Closed`，且不留 `queueDrops` / `bytesDropped`（R6-3） |
 | `acceptErrors` | 子进程把 `RLIMIT_NOFILE` 的**硬**限制压到 20，父进程连 40 个peer 撑爆它；拒绝的 accept 必须被计数 |
+| handler offload | 两条同连接请求由 offload 任务返回，顺序与到达一致；任务睡眠期间另一连接的 PING 仍被 reactor 及时应答 |
 
 `acceptErrors` 那条必须 fork：描述符上限是**每进程**的，得让"耗尽的一方"和"不停敲门的一方"是两个进程。
 压的是硬限制而不是软限制——`start()` 会把软限制往硬限制抬，抬得上去的 ceiling 不是 ceiling。

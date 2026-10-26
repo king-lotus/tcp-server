@@ -24,6 +24,8 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +40,7 @@
 #include <thread>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 #include <array>
@@ -776,9 +779,18 @@ class MultiReactorServer {
         // close leaks the fd and its admission slot forever.
         int         closeLingerMs    = 5000;
 
+        // Optional handler offload pool. 0 (default) keeps the message handler
+        // inline on the reactor; N > 0 lets a handler copy its payload and
+        // call offload() so slow work does not block the reactor. Tasks
+        // submitted for one connection run serially on the pool.
+        int         handlerThreads = 0;
+        // Bound on queued offload tasks; offload() returns false when full.
+        size_t      handlerQueueLimit = 8192;
+
         // Ceiling on reactors. Beyond a handful past the core count the only
         // thing extra workers buy is more cross-thread hand-off.
         static constexpr int kMaxReactors = 64;
+        static constexpr int kMaxHandlerThreads = 64;
 
         // 0 means "five idle periods"; a positive value is an absolute
         // override. int64_t because 5 * idleTimeoutMs can exceed int.
@@ -871,6 +883,13 @@ class MultiReactorServer {
     // close nobody was told about is how a connection outlives its own owner.
     bool       closeConnection(uint64_t connId) noexcept;
 
+    // Runs fn on a handler-pool worker; tasks submitted for one connection run
+    // in order. Returns false when no pool is configured/running or its queue
+    // is full. A message handler can copy its payload and call this, then
+    // return; the reactor is not blocked. fn runs off the reactor thread, so
+    // sendTo from it uses the queued path.
+    bool offload(uint64_t connId, std::function<void()> fn) noexcept;
+
     size_t connectionCount() const noexcept;
     std::vector<uint64_t> connectionIds() const;
 
@@ -944,6 +963,10 @@ class MultiReactorServer {
     // Stop the accept thread and leave the reactors running. Idempotent; used
     // by stopGracefully() before it closes the live connections, and by stop().
     void stopAccepting() noexcept;
+    // Optional handler offload pool; no-op when Config::handlerThreads == 0.
+    bool startHandlerPool() noexcept;
+    void stopHandlerPool() noexcept;
+    void handlerWorker() noexcept;
 
     bool        initListenSocket() noexcept;
     // The one place the listening socket is closed, so that "no socket" and "no
@@ -1006,6 +1029,16 @@ class MultiReactorServer {
 
     std::vector<std::unique_ptr<SubReactor>> reactors_;
     std::thread                              acceptThread_;
+
+    std::vector<std::thread> handlerThreads_;
+    std::mutex               handlerMutex_;
+    std::condition_variable  handlerCv_;
+    std::unordered_map<uint64_t, std::deque<std::function<void()>>>
+        handlerQueues_;
+    std::unordered_set<uint64_t> handlerActive_;
+    std::deque<uint64_t>         handlerReady_;
+    std::atomic<bool>            handlerRunning_{false};
+    std::atomic<size_t>          handlerQueued_{0};
 
     ServerStats      stats_;
     MessageHandler   msgHandler_;
@@ -2684,7 +2717,10 @@ inline bool MultiReactorServer::start() noexcept {
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 ||
         cfg_.idleTimeoutMs <= 0 || cfg_.writeBudgetBytes == 0 ||
         cfg_.closeLingerMs <= 0 || cfg_.backlog <= 0 ||
-        cfg_.frameAssemblyTimeoutMs < 0) {
+        cfg_.frameAssemblyTimeoutMs < 0 ||
+        cfg_.handlerThreads < 0 ||
+        cfg_.handlerThreads > Config::kMaxHandlerThreads ||
+        (cfg_.handlerThreads > 0 && cfg_.handlerQueueLimit == 0)) {
         life_.store(Life::Stopped, std::memory_order_release);
         return false;
     }
@@ -2824,15 +2860,16 @@ inline bool MultiReactorServer::start() noexcept {
             acceptLoop(*ready);
         });
         if (fut.get()) {
-            if (!failed_.load(std::memory_order_acquire)) {
+            if (!failed_.load(std::memory_order_acquire) &&
+                startHandlerPool()) {
                 return true;
             }
         }
     } catch (...) {
     }
     accepting_.store(false, std::memory_order_release);
-
     life_.store(Life::Stopping, std::memory_order_release);
+    stopHandlerPool();
     if (acceptThread_.joinable()) acceptThread_.join();
     for (auto& r : reactors_) r->stop();
     reactors_.clear();
@@ -2885,6 +2922,7 @@ inline void MultiReactorServer::stop() noexcept {
     // closeConnection
     for (auto& r : reactors_) r->stop();
     reactors_.clear();
+    stopHandlerPool();
 
     for (auto& shard : connShards_) {
         std::unique_lock<std::shared_mutex> lk(shard.mutex);
@@ -2943,6 +2981,111 @@ inline void MultiReactorServer::wakeAcceptLoop() noexcept {
         uint64_t v = 1;
         ssize_t r = ::write(wakeFd_, &v, sizeof(v));
         (void)r;
+    }
+}
+
+inline bool MultiReactorServer::startHandlerPool() noexcept {
+    if (cfg_.handlerThreads <= 0) return true;
+    handlerRunning_.store(true, std::memory_order_release);
+    try {
+        handlerThreads_.reserve(
+            static_cast<size_t>(cfg_.handlerThreads));
+        for (int i = 0; i < cfg_.handlerThreads; ++i) {
+            handlerThreads_.emplace_back([this] { handlerWorker(); });
+        }
+        return true;
+    } catch (...) {
+        stopHandlerPool();
+        return false;
+    }
+}
+
+inline void MultiReactorServer::stopHandlerPool() noexcept {
+    {
+        std::lock_guard<std::mutex> lk(handlerMutex_);
+        const bool was = handlerRunning_.exchange(
+            false, std::memory_order_acq_rel);
+        if (!was && handlerThreads_.empty()) return;
+    }
+    handlerCv_.notify_all();
+    for (auto& t : handlerThreads_) {
+        if (t.joinable()) t.join();
+    }
+    handlerThreads_.clear();
+    {
+        std::lock_guard<std::mutex> lk(handlerMutex_);
+        handlerQueues_.clear();
+        handlerActive_.clear();
+        handlerReady_.clear();
+        handlerQueued_.store(0, std::memory_order_relaxed);
+    }
+}
+
+inline void MultiReactorServer::handlerWorker() noexcept {
+    for (;;) {
+        std::function<void()> task;
+        uint64_t connId = 0;
+        {
+            std::unique_lock<std::mutex> lk(handlerMutex_);
+            handlerCv_.wait(lk, [this] {
+                return !handlerRunning_.load(std::memory_order_acquire) ||
+                       !handlerReady_.empty();
+            });
+            if (!handlerRunning_.load(std::memory_order_acquire)) return;
+            if (handlerReady_.empty()) continue;
+            connId = handlerReady_.front();
+            handlerReady_.pop_front();
+            auto it = handlerQueues_.find(connId);
+            if (it == handlerQueues_.end() || it->second.empty()) continue;
+            task = std::move(it->second.front());
+            it->second.pop_front();
+            handlerActive_.insert(connId);
+            handlerQueued_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        {
+            CallbackScope scope(this);
+            try {
+                task();
+            } catch (...) {
+                // An offloaded task must not kill a pool worker; the same
+                // "do not throw" contract as an inline handler.
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(handlerMutex_);
+            handlerActive_.erase(connId);
+            auto it = handlerQueues_.find(connId);
+            if (it != handlerQueues_.end()) {
+                if (!it->second.empty()) handlerReady_.push_back(connId);
+                else handlerQueues_.erase(it);
+            }
+        }
+        handlerCv_.notify_one();
+    }
+}
+
+inline bool MultiReactorServer::offload(uint64_t connId,
+                                        std::function<void()> fn) noexcept {
+    if (!handlerRunning_.load(std::memory_order_acquire)) return false;
+    try {
+        std::lock_guard<std::mutex> lk(handlerMutex_);
+        if (!handlerRunning_.load(std::memory_order_acquire)) return false;
+        if (handlerQueued_.load(std::memory_order_relaxed) >=
+            cfg_.handlerQueueLimit) {
+            return false;
+        }
+        auto& q = handlerQueues_[connId];
+        const bool wasEmpty = q.empty();
+        q.push_back(std::move(fn));
+        handlerQueued_.fetch_add(1, std::memory_order_relaxed);
+        if (wasEmpty &&
+            handlerActive_.find(connId) == handlerActive_.end()) {
+            handlerReady_.push_back(connId);
+            handlerCv_.notify_one();
+        }
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 

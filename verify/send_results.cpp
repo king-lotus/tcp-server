@@ -1,4 +1,5 @@
-// verify/send_results.cpp -- sendTo()'s five answers, and two counters, asserted.
+// verify/send_results.cpp -- sendTo()'s five answers, two counters, and the
+// optional handler offload pool, asserted.
 //
 // sendTo() is the whole of how an application puts bytes on a connection, and
 // SendResult is the whole of what it learns back. Four of the five values had no
@@ -32,6 +33,11 @@
 //      connection at all is checked first, because an abort that arrives as an
 //      ordinary FIN never reaches the branch, and asserting against a break the
 //      host cannot produce would be asserting against the host.
+//   5. The handler offload pool: offload() is refused when the pool is off or
+//      its queue is full, tasks for one connection stay ordered even when a
+//      later task is faster, a PING is answered while an offloaded task
+//      sleeps -- the reactor is not the one doing the sleeping -- and a
+//      throwing task is swallowed without taking its worker with it.
 //
 // Build (Linux only):
 //   g++ -std=c++17 -Wall -Wextra -pthread verify/send_results.cpp -o send_results
@@ -52,6 +58,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -139,6 +146,10 @@ void caseFiveOutcomes() {
                                              industrial::MAX_FRAME_PAYLOAD + 1);
     const SendResult noData  = server.server().sendTo(id, nullptr, 5);
     const SendResult over    = server.server().sendTo(id, big.data(), big.size());
+    const bool offloadOff =
+        server.server().offload(id, [] {});
+    harness::expect(!offloadOff,
+                    "offload with handlerThreads == 0: refused, not queued");
 
     std::printf("      Ok=%s NotConnected=%s TooLarge=%s InvalidArgument=%s "
                 "Overloaded=%s\n",
@@ -334,6 +345,140 @@ void caseHupErr() {
     server.stop();
 }
 
+// Offloading a handler must move the slow work off the reactor without
+// reordering a connection's frames. A's first task sleeps longer than its
+// second, so concurrent execution for one connection would show up as replies
+// out of order. B's PING, handled by the reactor, must still be answered while
+// the first task runs.
+void caseOffload() {
+    std::printf("handler offload: serial per connection, off the reactor\n");
+    MultiReactorServer::Config bad = baseConfig();
+    bad.handlerThreads   = 1;
+    bad.handlerQueueLimit = 0;
+    MultiReactorServer refused(bad);
+    harness::expect(!refused.start(),
+                    "handlerThreads without a queue limit: start() refuses");
+
+    MultiReactorServer::Config cfg = baseConfig();
+    cfg.handlerThreads   = 2;
+    cfg.handlerQueueLimit = 32;
+
+    std::atomic<MultiReactorServer*> srv{nullptr};
+    std::atomic<int> offloaded{0};
+    harness::Fixture server(
+        cfg, [&](uint64_t id, const uint8_t* p, size_t n) {
+            std::vector<uint8_t> payload(p, p + n);
+            MultiReactorServer* s = srv.load();
+            if (!s) return;
+            const bool ok = s->offload(id, [s, id, payload] {
+                // The first request is deliberately the slower one.
+                const int delayMs =
+                    (!payload.empty() && payload[0] == '1') ? 300 : 100;
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(delayMs));
+                (void)s->sendTo(id, payload.data(), payload.size());
+            });
+            if (ok) offloaded.fetch_add(1);
+        });
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
+    srv.store(&server.server());
+
+    harness::Peer a, b;
+    if (!a.connect(server.port()) || !b.connect(server.port())) {
+        harness::expect(false, "clients connected");
+        return;
+    }
+
+    const std::string first(4, '1');
+    const std::string second(4, '2');
+    harness::expect(static_cast<bool>(
+                        a.send(FrameType::DATA, first.data(), first.size())),
+                    "first request sent");
+    harness::expect(static_cast<bool>(
+                        a.send(FrameType::DATA, second.data(), second.size())),
+                    "second request sent");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto t0 = std::chrono::steady_clock::now();
+    harness::expect(static_cast<bool>(b.send(FrameType::PING, nullptr, 0)),
+                    "B sends PING");
+    harness::Frame pong;
+    const harness::Status ps = b.expectFrame(&pong, 800);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    harness::expect(static_cast<bool>(ps), "B got a PONG", ps.why);
+    harness::expect(pong.type == FrameType::PONG, "the answer is a PONG");
+    harness::expect(elapsed < 250,
+                    "the reactor answered while the offload task slept");
+
+    harness::Frame f1, f2;
+    const harness::Status s1 = a.expectFrame(&f1, 3000);
+    const harness::Status s2 = a.expectFrame(&f2, 3000);
+    harness::expect(static_cast<bool>(s1), "first reply arrived", s1.why);
+    harness::expect(static_cast<bool>(s2), "second reply arrived", s2.why);
+    harness::expect(std::string(f1.payload.begin(), f1.payload.end()) == first,
+                    "first reply is the first request");
+    harness::expect(std::string(f2.payload.begin(), f2.payload.end()) == second,
+                    "second reply is the second request");
+    harness::expect(offloaded.load() == 2, "both frames were offloaded");
+    server.server().stop();
+}
+
+// The queue limit is shared by every connection. One worker blocked in a task,
+// one more task queued behind it, and the third submission has nowhere to go.
+void caseOffloadQueueLimit() {
+    std::printf("handler offload: the global queue limit\n");
+    MultiReactorServer::Config cfg = baseConfig();
+    cfg.handlerThreads   = 1;
+    cfg.handlerQueueLimit = 1;
+    MultiReactorServer server(cfg);
+    if (!server.start()) { harness::expect(false, "start() ok"); return; }
+
+    std::atomic<bool> started{false};
+    std::promise<void> gate;
+    const std::shared_future<void> released = gate.get_future().share();
+    const bool first = server.offload(1, [&, released] {
+        started.store(true);
+        released.wait();
+    });
+    for (int i = 0; i < 500 && !started.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    harness::expect(started.load(), "the blocking task reached a worker");
+
+    const bool second = server.offload(2, [] {});
+    const bool third  = server.offload(3, [] {});
+    gate.set_value();
+    server.stop();
+
+    harness::expect(first, "the blocking task was accepted");
+    harness::expect(second, "one queued task fits the limit");
+    harness::expect(!third, "a task past the global limit is refused");
+}
+
+// An offloaded task that throws must not take the pool worker with it; the
+// next task still runs. The exception is swallowed, as documented.
+void caseOffloadThrowingTask() {
+    std::printf("handler offload: a throwing task leaves the worker alive\n");
+    MultiReactorServer::Config cfg = baseConfig();
+    cfg.handlerThreads   = 1;
+    cfg.handlerQueueLimit = 8;
+    MultiReactorServer server(cfg);
+    if (!server.start()) { harness::expect(false, "start() ok"); return; }
+
+    std::atomic<bool> ranAfter{false};
+    const bool threw = server.offload(1, [] { throw 1; });
+    const bool next  = server.offload(2, [&] { ranAfter.store(true); });
+    for (int i = 0; i < 500 && !ranAfter.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    server.stop();
+
+    harness::expect(threw, "the throwing task was accepted");
+    harness::expect(next, "the following task was accepted");
+    harness::expect(ranAfter.load(), "the worker survived the exception");
+}
+
 }  // namespace
 
 int main() {
@@ -341,6 +486,9 @@ int main() {
     caseFiveOutcomes();
     caseAcceptErrors();
     caseHupErr();
+    caseOffload();
+    caseOffloadQueueLimit();
+    caseOffloadThrowingTask();
     std::printf("\n");
     return harness::finish();
 }

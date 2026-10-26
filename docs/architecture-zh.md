@@ -65,6 +65,9 @@ industrial::MultiReactorServer server(cfg);
 - **owner-thread 快速路径**：handler 本来就在连接所属 reactor 上，调用 `sendTo`
   时可以直接写 wbuf，绕过全局锁、任务队列和 eventfd；只有非 owner 线程、其它
   reactor 的连接，或 wbuf 暂时没空间时才走队列。
+- **可选 handler 池**：`Config::handlerThreads > 0` 时额外创建 N 条 worker 线程，
+  只执行 `offload()` 提交的任务（见 4.1）。它们不属于任何 reactor，也不直接持有
+  连接；任务里的 `sendTo` 走队列路径回到 owner。
 - **轮转分配**：`pickReactor()` 用 `nextReactor_` 递增取模，连接均匀落到各
   reactor。`reactor_spread` 套件断言了这一点。
 
@@ -169,8 +172,54 @@ epoll LT EPOLLIN
 - **`framesRecv` 是批量发布的**：每个 reactor 先在本地 `framesRecvLocal_` 累加，
   每轮循环（以及退出时）发布一次到共享原子量。空闲时是精确值；有流量时最多滞后
   一轮。
-- **handler 在 reactor 线程上同步执行**。`payload` 指向 reactor 自己的
-  `frameScratch_`，只在本次回调期间有效；要保留必须自己拷贝。
+- **handler 默认在 reactor 线程上同步执行**。`payload` 指向 reactor 自己的
+  `frameScratch_`，只在本次回调期间有效；要保留必须自己拷贝。需要把慢工作移出
+  reactor 时，用可选的 handler 池（见 4.1）。
+
+### 4.1 慢 handler 卸载（offload）
+
+`Config::handlerThreads == 0`（默认）时没有池，`offload()` 恒返回 `false`。
+设为 N（上限 64）后，`start()` 创建 N 个 worker；message handler 仍在 reactor
+上执行，但它可以复制需要的数据，把阻塞部分交给 `offload(connId, fn)`：
+
+```cpp
+cfg.handlerThreads    = 4;
+cfg.handlerQueueLimit = 8192;   // 所有连接共享的排队上限
+
+server.setMessageHandler(
+    [&server](uint64_t id, const uint8_t* data, size_t len) {
+        std::vector<uint8_t> copy(data, data + len);   // payload 是借用的
+        const bool accepted = server.offload(
+            id, [srv = &server, id, copy = std::move(copy)] {
+                const std::string reply = slowWork(copy);
+                (void)srv->sendTo(id, reply.data(), reply.size());
+            });
+        if (!accepted) {
+            // 池未启用或队列已满：拒绝、关闭或自行降级处理
+        }
+    });
+```
+
+契约：
+
+- **同一个 `connId` 的任务严格串行、先进先出**；不同连接的任务可以并行。
+  这保证一条连接的消息不会被两个 worker 同时处理。
+- `handlerQueueLimit` 是所有连接排队任务总数的上限（默认 8192）。满时
+  `offload()` 返回 `false`，任务不会入队；没有单独的统计计数器，由调用方按
+  返回值处理。
+- 任务在池 worker 上运行，不在 reactor 上。从 worker 调用 `sendTo()` 走第 5 节
+  的队列路径，仍然线程安全。worker 里同样设置了 `CallbackScope`：在 offload
+  任务里调用 `stop()` 只发出停止请求。
+- 任务抛出的异常会被 worker 捕获并丢弃，不会杀死池线程；这与 inline handler
+  的“不要抛”契约一致，但错误不会自动上报。
+- `stop()` 在 reactor 停止后设置池停止标志、join worker，并丢弃**尚未开始**的
+  任务；已经开始的任务会先完成。因此关机时不保证已入队的 offload 任务一定执行，
+  需要可靠完成的工作应在应用层确认。
+- **连接关闭不会取消已入队的任务**：它们仍会执行，此时任务里的 `sendTo()`
+  返回 `NotConnected` 或 `Closed`。需要随连接取消的工作由应用自己在任务里检查。
+- **没有跨路径的额外排序**：handler 在 `offload()` 之后的同步 `sendTo` 与
+  offload 任务里的 `sendTo` 之间按实际提交时刻决定；两个 offload 任务之间才按
+  提交顺序。
 
 ---
 
@@ -336,6 +385,8 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `maxPendingBytes` | `MAX_FRAME_SIZE` (65544) | 单连接待发软上限；启动时会被压到 `<= wbufCapacity` |
 | `writeBudgetBytes` | `262144` | 单次 drain 最多写多少字节，必须非 0 |
 | `closeLingerMs` | `5000` | 优雅关闭等对端 FIN 的上限，必须 > 0 |
+| `handlerThreads` | `0` | 可选的 offload 池线程数；0 = 不启用；上限 64 |
+| `handlerQueueLimit` | `8192` | 所有连接共享的 offload 排队上限；启用池时必须 > 0 |
 
 `start()` 在以下情况返回 `false`：
 
@@ -347,7 +398,8 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
   任一 <= 0；
 - `frameAssemblyTimeoutMs < 0`（0 合法，表示 `5 × idleTimeoutMs`）；
 - `writeBudgetBytes == 0`；
-- 监听 socket、epoll/eventfd、reactor 线程或 accept 线程创建失败。
+- `handlerThreads < 0`、`> 64`，或 `handlerThreads > 0 && handlerQueueLimit == 0`；
+- 监听 socket、epoll/eventfd、reactor 线程、accept 线程或 handler 池创建失败。
 
 `start()` 成功只表示 accept 线程已经就绪且此刻没有组件失败；`port()` 只有在
 `start()` 成功之后、`stop()` 之前才有意义。
@@ -466,10 +518,11 @@ int main() {
 - 回调在多个 reactor 线程上并发执行，必须自己保证线程安全。
 - **不要抛异常**。异常逃出回调会被 reactor 顶层捕获，`reactorFailures++`，
   `isRunning()` 转假。
-- **不要在回调里阻塞**。回调在 owner reactor 线程上同步执行；一次慢调用（数据库、
+- **不要让回调阻塞**。回调在 owner reactor 线程上同步执行；一次慢调用（数据库、
   磁盘、锁、同步 RPC）会拖住该 reactor 上的所有连接，表现为其它连接的 PONG/应答
-  延迟、空闲超时和尾延迟上升。需要阻塞工作时，交给应用自己的线程池，并保持同一
-  连接的消息顺序。
+  延迟、空闲超时和尾延迟上升。需要阻塞工作时，用 `offload()`（需
+  `handlerThreads > 0`）或应用自己的线程池；两者都要保持同一连接的消息顺序。
+  `offload()` 已经保证同一 `connId` 串行，见 4.1。
 - `payload`、`peer`、`reason` 都是借用，只在本次回调期间有效；要保留就拷贝。
 - 回调里可以调用 `sendTo()`、`closeConnection()`、`connectionIds()`、
   `stats()`。
@@ -489,6 +542,14 @@ bool queued = server.closeConnection(id);
 // 整机优雅关闭：停止 accept、逐连接 close，最多等 timeoutMs。
 // true = 全部排空；false = 超时后剩余连接被 stop() 中止。
 bool drained = server.stopGracefully(3000);
+
+// 可选的慢 handler 卸载；需要 cfg.handlerThreads > 0。
+// true = 已入队；false = 池未启用或全局排队上限已满。
+bool accepted = server.offload(id, [id, &server] {
+    // 不在 reactor 线程上；同一连接的 offload 任务串行执行。
+    const std::string reply = slowWork();
+    (void)server.sendTo(id, reply.data(), reply.size());
+});
 ```
 
 ### 10.5 客户端侧
@@ -594,7 +655,7 @@ python3 -m cpplint include/tcp-server-mt.h
 | `close_semantics` | 线上可见的关闭行为：FIN vs RST、关闭时未读请求、计数闭合 |
 | `idle_semantics` | 空闲按字节而不是按帧判断 |
 | `ping_pong` | PING/PONG、关闭途中到达的 PING |
-| `send_results` | `SendResult` 每个值、`acceptErrors`、关闭中发送 |
+| `send_results` | `SendResult` 每个值、`acceptErrors`、关闭中发送、offload 串行且不阻塞 reactor |
 | `backpressure` | 广播时的队列上限与 `queueDrops` |
 | `fault_injection` | reactor/accept 线程异常后的恢复（需要 `INDUSTRIAL_TCP_TESTING`） |
 | `reactor_spread` | 轮转分配确实把连接分到不同 reactor |
@@ -646,6 +707,9 @@ python3 -m cpplint include/tcp-server-mt.h
   内存/死连接的第二道约束。如果合法客户端需要更久来装配一个最大帧，应显式调大
   该值。
 - **handler 不能抛异常**，也不能在回调里销毁 server。
+- **offload 池是可选的**：`handlerThreads == 0` 时 `offload()` 恒返回 `false`；
+  `handlerQueueLimit` 是全局排队上限，满时任务不入队。`stop()` 会丢弃尚未开始的
+  offload 任务，任务异常也被吞掉；需要可观测性或可靠完成时由应用层保证。
 - **`maxPendingBytes` 是软上限**：并发 `sendTo` 与 PONG 预占同时发生时，可能
   短暂看到略旧的值；代价是多拒一帧，不是正确性问题。
 - **`wbufCapacity` 可以小于 `MAX_FRAME_SIZE`**，但此时最大帧的回复会被拒绝。
