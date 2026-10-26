@@ -23,7 +23,9 @@ run it -- `verify/` is that machine.
 - **Closing is staged, not `close(fd)`.** A connection is marked `closing`
   first, drains the replies already queued, and only then FINs. That semantic is
   where eight rounds of review landed most often and where the probes are
-  densest.
+  densest. `stop()` is the immediate exception: it aborts whatever is still
+  open. `stopGracefully(ms)` stops accepting, closes every connection
+  gracefully, and waits up to `ms` before that same stop.
 - **Idle is measured in bytes, and a partial frame has its own deadline.** A
   peer that keeps dribbling a frame is not idle; `frameAssemblyTimeoutMs`
   (default: 5 x `idleTimeoutMs`) aborts it and counts it separately from

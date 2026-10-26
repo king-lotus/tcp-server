@@ -817,6 +817,12 @@ class MultiReactorServer {
 
     bool start() noexcept;
     void stop()  noexcept;
+    // Stop accepting, ask every open connection to close gracefully, and wait
+    // up to timeoutMs for them to disappear before the normal (abortive) stop.
+    // Returns true if every connection drained; false if the deadline was hit
+    // and the remainder were aborted. Call from the controlling thread, not a
+    // callback.
+    bool stopGracefully(int timeoutMs) noexcept;
     void requestStop() noexcept { requestStopInternal(); }
 #ifdef INDUSTRIAL_TCP_TESTING
     std::atomic<bool> failWorkerForTest{false};
@@ -906,6 +912,9 @@ class MultiReactorServer {
         }
     }
     void wakeAcceptLoop() noexcept;
+    // Stop the accept thread and leave the reactors running. Idempotent; used
+    // by stopGracefully() before it closes the live connections, and by stop().
+    void stopAccepting() noexcept;
 
     bool        initListenSocket() noexcept;
     // The one place the listening socket is closed, so that "no socket" and "no
@@ -927,6 +936,10 @@ class MultiReactorServer {
 
     std::atomic<Life>     life_{Life::Stopped};
     std::atomic<bool>     failed_{false};
+    // True while the accept thread may hand new connections to reactors.
+    // Cleared before a graceful drain so no new connection arrives after the
+    // snapshot; stop() clears it as well.
+    std::atomic<bool>     accepting_{false};
     std::atomic<uint64_t> nextConnId_{1};
     std::atomic<size_t>   nextReactor_{0};
     // Lifecycle calls are serialized; submissions hold their barrier only until
@@ -941,15 +954,29 @@ class MultiReactorServer {
             : previous(callbackServer_) { callbackServer_ = server; }
         ~CallbackScope() { callbackServer_ = previous; }
     };
-    std::shared_mutex submissionMutex_;
+    // The non-owner send/close path used to serialize on one submission lock
+    // and one connection-map lock per call. Shard both by connection id: a
+    // sender contends only with senders for the same shard, and stop() takes
+    // every shard once to drain them all. The shards are line-aligned so two
+    // locks never share a cache line.
+    static constexpr size_t kConnShards = 16;
+    struct alignas(64) SubmissionShard {
+        std::shared_mutex mutex;
+    };
+    struct alignas(64) ConnShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<uint64_t, std::shared_ptr<Conn>> map;
+    };
+    static size_t connShardFor(uint64_t id) noexcept {
+        return static_cast<size_t>(id) % kConnShards;
+    }
+    std::array<SubmissionShard, kConnShards> submissionShards_;
+    std::array<ConnShard, kConnShards> connShards_;
     // Queued accepted sockets + live connections, owned by Admission tickets.
     std::atomic<size_t> admitted_{0};
 
     std::vector<std::unique_ptr<SubReactor>> reactors_;
     std::thread                              acceptThread_;
-
-    mutable std::shared_mutex                           connsMutex_;
-    std::unordered_map<uint64_t, std::shared_ptr<Conn>> conns_;
 
     ServerStats      stats_;
     MessageHandler   msgHandler_;
@@ -2794,6 +2821,7 @@ inline bool MultiReactorServer::start() noexcept {
     // bring-up raises failed_ instead of rewriting the lifecycle state, so the
     // verdict returned here cannot be flipped out from under the caller.
     // Running itself was published further up, before any worker existed.
+    accepting_.store(true, std::memory_order_release);
     try {
         auto ready = std::make_shared<std::promise<bool>>();
         auto fut = ready->get_future();
@@ -2807,6 +2835,7 @@ inline bool MultiReactorServer::start() noexcept {
         }
     } catch (...) {
     }
+    accepting_.store(false, std::memory_order_release);
 
     life_.store(Life::Stopping, std::memory_order_release);
     if (acceptThread_.joinable()) acceptThread_.join();
@@ -2836,13 +2865,17 @@ inline void MultiReactorServer::stop() noexcept {
     if (life_.load(std::memory_order_acquire) == Life::Stopped) return;
     life_.store(Life::Stopping, std::memory_order_release);
     {
-        std::unique_lock<std::shared_mutex> submissions(submissionMutex_);
+        std::array<std::unique_lock<std::shared_mutex>, kConnShards> drains;
+        for (size_t i = 0; i < kConnShards; ++i) {
+            drains[i] = std::unique_lock<std::shared_mutex>(
+                submissionShards_[i].mutex);
+        }
         // Drain callers that passed the running check before shutdown began.
     }
 
-    // Wake the accept thread so it exits
-    wakeAcceptLoop();
-    if (acceptThread_.joinable()) acceptThread_.join();
+    // Wake the accept thread so it exits (idempotent if stopGracefully()
+    // already did this)
+    stopAccepting();
 
     // The accept thread is gone; the fds it owned are safe to close now
     if (wakeFd_   >= 0) {
@@ -2858,15 +2891,51 @@ inline void MultiReactorServer::stop() noexcept {
     for (auto& r : reactors_) r->stop();
     reactors_.clear();
 
-    std::unique_lock<std::shared_mutex> lk(connsMutex_);
-    conns_.clear();
+    for (auto& shard : connShards_) {
+        std::unique_lock<std::shared_mutex> lk(shard.mutex);
+        shard.map.clear();
+    }
     failed_.store(false, std::memory_order_release);
     life_.store(Life::Stopped, std::memory_order_release);
+}
+
+inline bool MultiReactorServer::stopGracefully(int timeoutMs) noexcept {
+    if (callbackServer_ == this) {
+        // A reactor thread cannot join itself; request the normal stop and let
+        // the controlling thread do the drain.
+        requestStop();
+        return false;
+    }
+
+    // No new connections after this point. The accept thread owns its fds, so
+    // joining it is also what makes the listen socket closed.
+    stopAccepting();
+
+    const int64_t deadline = nowMs() + (timeoutMs > 0 ? timeoutMs : 0);
+    while (nowMs() < deadline) {
+        const std::vector<uint64_t> ids = connectionIds();
+        if (ids.empty() && admitted_.load(std::memory_order_acquire) == 0) {
+            break;
+        }
+        for (uint64_t id : ids) (void)closeConnection(id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    const bool drained = connectionCount() == 0 &&
+                         admitted_.load(std::memory_order_acquire) == 0;
+    stop();
+    return drained;
 }
 
 inline void MultiReactorServer::wait() noexcept {
     while (isRunning())
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+}
+
+inline void MultiReactorServer::stopAccepting() noexcept {
+    accepting_.store(false, std::memory_order_release);
+    wakeAcceptLoop();
+    if (acceptThread_.joinable()) acceptThread_.join();
 }
 
 inline void MultiReactorServer::wakeAcceptLoop() noexcept {
@@ -2923,7 +2992,7 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
     }
 
     std::array<struct epoll_event, 64> events{};
-    while (ok && isRunning()) {
+    while (ok && accepting_.load(std::memory_order_acquire) && isRunning()) {
 #ifdef INDUSTRIAL_TCP_TESTING
         if (failAcceptForTest.exchange(false)) throw 1;
 #endif
@@ -3056,8 +3125,9 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
 inline bool MultiReactorServer::onConnectionOpened(
     uint64_t id, std::shared_ptr<Conn> c) noexcept {
     try {
-        std::unique_lock<std::shared_mutex> lk(connsMutex_);
-        conns_[id] = std::move(c);
+        ConnShard& shard = connShards_[connShardFor(id)];
+        std::unique_lock<std::shared_mutex> lk(shard.mutex);
+        shard.map[id] = std::move(c);
         return true;
     } catch (...) {
         // No counter here either. queueDrops is "a frame was refused at
@@ -3069,8 +3139,9 @@ inline bool MultiReactorServer::onConnectionOpened(
 }
 
 inline void MultiReactorServer::onConnectionClosed(uint64_t id) noexcept {
-    std::unique_lock<std::shared_mutex> lk(connsMutex_);
-    conns_.erase(id);
+    ConnShard& shard = connShards_[connShardFor(id)];
+    std::unique_lock<std::shared_mutex> lk(shard.mutex);
+    shard.map.erase(id);
 }
 
 inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
@@ -3084,19 +3155,24 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
     // global submission/connection locks, the task queue and its eventfd
     // wakeup, and the frame/task allocations the queued path needs. It does
     // not race stop(): this thread is the reactor stop() has to join.
+#ifndef INDUSTRIAL_TCP_NO_SEND_FASTPATH
     if (SubReactor* local = SubReactor::current()) {
         SendResult fast = SendResult::Ok;
         if (local->trySendLocal(this, connId, data, len, &fast)) return fast;
     }
+#endif
 
-    std::shared_lock<std::shared_mutex> submissions(submissionMutex_);
+    const size_t shard = connShardFor(connId);
+    std::shared_lock<std::shared_mutex> submissions(
+        submissionShards_[shard].mutex);
     if (!isRunning()) return SendResult::Closed;
 
     std::shared_ptr<Conn> c;
     {
-        std::shared_lock<std::shared_mutex> lk(connsMutex_);
-        auto it = conns_.find(connId);
-        if (it == conns_.end()) return SendResult::NotConnected;
+        ConnShard& cs = connShards_[shard];
+        std::shared_lock<std::shared_mutex> lk(cs.mutex);
+        auto it = cs.map.find(connId);
+        if (it == cs.map.end()) return SendResult::NotConnected;
         c = it->second;
     }
     // The same two conditions submitSend() will apply on the owner's thread,
@@ -3142,13 +3218,16 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
 
 inline bool MultiReactorServer::closeConnection(uint64_t connId) noexcept {
     if (!isRunning()) return false;
-    std::shared_lock<std::shared_mutex> submissions(submissionMutex_);
+    const size_t shard = connShardFor(connId);
+    std::shared_lock<std::shared_mutex> submissions(
+        submissionShards_[shard].mutex);
     if (!isRunning()) return false;
     std::shared_ptr<Conn> c;
     {
-        std::shared_lock<std::shared_mutex> lk(connsMutex_);
-        auto it = conns_.find(connId);
-        if (it == conns_.end()) return false;
+        ConnShard& cs = connShards_[shard];
+        std::shared_lock<std::shared_mutex> lk(cs.mutex);
+        auto it = cs.map.find(connId);
+        if (it == cs.map.end()) return false;
         c = it->second;
     }
     // Every exit from here reports itself in the same counter. The loss used to
@@ -3176,15 +3255,21 @@ inline uint16_t MultiReactorServer::port() const noexcept {
 }
 
 inline size_t MultiReactorServer::connectionCount() const noexcept {
-    std::shared_lock<std::shared_mutex> lk(connsMutex_);
-    return conns_.size();
+    size_t n = 0;
+    for (const auto& shard : connShards_) {
+        std::shared_lock<std::shared_mutex> lk(shard.mutex);
+        n += shard.map.size();
+    }
+    return n;
 }
 
 inline std::vector<uint64_t> MultiReactorServer::connectionIds() const {
-    std::shared_lock<std::shared_mutex> lk(connsMutex_);
     std::vector<uint64_t> out;
-    out.reserve(conns_.size());
-    for (auto& kv : conns_) out.push_back(kv.first);
+    for (const auto& shard : connShards_) {
+        std::shared_lock<std::shared_mutex> lk(shard.mutex);
+        out.reserve(out.size() + shard.map.size());
+        for (const auto& kv : shard.map) out.push_back(kv.first);
+    }
     return out;
 }
 

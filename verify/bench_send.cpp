@@ -10,6 +10,9 @@
 // path scales, and the multi-client mode exists to expose the locks and
 // statistics that the fast path bypasses.
 //
+// Build with -DINDUSTRIAL_TCP_NO_SEND_FASTPATH to measure the queued path
+// (application-thread sends) instead of the owner-thread fast path.
+//
 // The clients run in this process on purpose. A separate process would make the
 // absolute number look better and tell us nothing about which side was the
 // limit; keeping them together means the number is a floor for both halves

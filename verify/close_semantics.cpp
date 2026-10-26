@@ -594,6 +594,68 @@ int main() {
         gserver.stop();
     }
 
+    // ---- H: whole-server graceful stop -------------------------------------
+    //
+    // stop() is abortive: whatever is still open is aborted. stopGracefully()
+    // first stops accepting, then asks every connection to close, and waits
+    // for the replies already queued to leave before the normal stop.
+    {
+        std::printf("H. graceful whole-server stop\n");
+        MultiReactorServer::Config hcfg;
+        hcfg.bindAddr        = "127.0.0.1";
+        hcfg.port            = 0;
+        hcfg.numReactors     = 2;
+        hcfg.tickMs          = 20;
+        hcfg.idleTimeoutMs   = 60000;
+        hcfg.closeLingerMs   = 2000;
+        hcfg.wbufCapacity    = 1 << 20;
+        hcfg.maxPendingBytes = 1 << 20;
+
+        std::atomic<MultiReactorServer*> hserver{nullptr};
+        std::atomic<bool> replied{false};
+        harness::Fixture hfix(
+            hcfg, [&](uint64_t id, const uint8_t*, size_t) {
+                if (MultiReactorServer* hs = hserver.load())
+                    (void)hs->sendTo(id, "reply", 5);
+                replied.store(true);
+            });
+        if (!hfix.started()) {
+            expect(false, "graceful server starts");
+        } else {
+            hserver.store(&hfix.server());
+            harness::Peer peer;
+            if (!peer.connect(hfix.port())) {
+                expect(false, "graceful client connects");
+            } else {
+                peer.send(FrameType::DATA, "go", 2);
+                expect(waitFor(2000, [&] { return replied.load(); }),
+                       "graceful handler ran and queued its reply");
+
+                bool drained = false;
+                std::thread stopper([&] {
+                    drained = hfix.server().stopGracefully(3000);
+                });
+
+                harness::Frame f;
+                const harness::Status fs = peer.expectFrame(&f, 2000);
+                if (!fs) std::printf("      expectFrame: %s\n", fs.why.c_str());
+                expect(static_cast<bool>(fs), "the queued reply arrived");
+                expect(f.payload.size() == 5,
+                       "the reply is the payload the handler queued");
+                const harness::Status cs =
+                    peer.expectClose(harness::Close::Fin, 2000);
+                if (!cs) std::printf("      expectClose: %s\n", cs.why.c_str());
+                expect(static_cast<bool>(cs), "the peer saw a FIN");
+
+                peer.close();
+                stopper.join();
+                expect(drained, "stopGracefully drained every connection");
+                expect(hfix.server().connectionCount() == 0,
+                       "no connections left after the drain");
+            }
+        }
+    }
+
     // ---- D: accounting ------------------------------------------------------
     {
         std::printf("D. accounting\n");

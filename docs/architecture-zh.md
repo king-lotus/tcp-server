@@ -188,7 +188,7 @@ epoll LT EPOLLIN
   │         └─ armWrite → Ok
   │       （wbuf 没空间或已排队 close 时回退到下面的队列路径）
   └─ 队列路径（非 owner 线程、其它 reactor、或快路径回退）：
-       ├─ 查全局 conns_ 得到 shared_ptr<Conn>
+       ├─ 查按 connId 分片的 conns_ 得到 shared_ptr<Conn>
        ├─ 校验连接未关闭/未进入 closing
        ├─ 分配 frame = 8 字节头 + 载荷
        ├─ 预占 pendingBytes（<= maxPendingBytes）
@@ -205,6 +205,10 @@ reactor 线程（队列路径）
 owner-thread 快路径是常见 echo 用的路径：它不分配 frame/task，不跨队列和
 eventfd。`closeRequested` 保证“先 closeConnection 再 sendTo”仍按队列顺序落到
 close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf 而改变语义。
+
+非 owner 队列路径的 submission 屏障和连接表按 `connId` 分成 16 个 shard：发送/
+关闭只锁自己的 shard，`stop()` 一次性取全部 shard 把在途调用排空。该路径仍然
+每帧分配 frame vector 和 `std::function` 任务；owner 快路径不分配。
 
 `SendResult` 的语义：
 
@@ -260,7 +264,8 @@ close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf �
 
 ### 6.2 中止（内部路径）
 
-协议错误、`hup/err`、linger 到期、帧装配超时、PONG 发不出去等走
+协议错误、`hup/err`、linger 到期、帧装配超时、PONG 发不出去，以及未排空的
+`stop()` 等走
 `closeConn(..., graceful=false)`：设置 `SO_LINGER{1,0}`，丢弃待发数据并让内核
 发 RST。对端看到的是重置，不是有序 FIN。
 
@@ -273,12 +278,20 @@ close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf �
 `stop()` 的语义：
 
 - 幂等；重复调用或 `start()` 失败后调用都直接返回。
-- 停止 accept 线程、各 reactor，清空 `conns_`，`port()` 归 0。
+- 停止 accept 线程、各 reactor，清空分片连接表，`port()` 归 0。
+- **它对其余连接是中止性的**：仍在关闭中的连接不再等待，由 reactor 的 cleanup
+  中止。
 - **从回调里调用 `stop()` 只发出停止请求**，不会 join 自己所在线程；控制线程
   必须随后再调用一次 `stop()`（或销毁 server）来完成 join。
 - **不要在回调里销毁 `MultiReactorServer`**：析构时 `stop()` 无法 join 当前
   线程，`std::thread` 析构会 `std::terminate()`。最后一个外部 owner 必须在控制
   线程的 `stop()` 返回之后再释放。
+- `stopGracefully(timeoutMs)` 是整机排空版本：先停止 accept（join 后监听套接字
+  已关闭），再反复对当前连接调用 `closeConnection()`，直到
+  `connectionCount()==0` 且没有 pending 的新连接，或 `timeoutMs` 到期；最后执行
+  正常的 `stop()`。返回 `true` 表示全部排空，`false` 表示超时后剩余连接被
+  `stop()` 中止。必须从控制线程调用；从回调里调用只会 `requestStop()` 并返回
+  `false`。
 
 ---
 
@@ -470,6 +483,10 @@ industrial::SendResult r = server.sendTo(id, reply.data(), reply.size());
 // 优雅关闭：先送完已排队的回复，再 FIN。
 // true = 请求到达 reactor 队列；false = 没送到，连接仍然活着。
 bool queued = server.closeConnection(id);
+
+// 整机优雅关闭：停止 accept、逐连接 close，最多等 timeoutMs。
+// true = 全部排空；false = 超时后剩余连接被 stop() 中止。
+bool drained = server.stopGracefully(3000);
 ```
 
 ### 10.5 客户端侧
@@ -596,6 +613,9 @@ python3 -m cpplint include/tcp-server-mt.h
 - 发送 echo（owner-thread 快路径，`bench_send` 多客户端）：1/1 p50 35us /
   p99 63us；2/2 p50 17us / p99 56us；4/4 p50 26us / p99 70us。VM 8 vCPU，
   每客户端 2 万条，10 次中位数；延迟受调度影响，不是承诺。
+- 非 owner 队列路径（`-DINDUSTRIAL_TCP_NO_SEND_FASTPATH`）分片锁前后：2/2
+  p50 18.4→13.9us、p99 62.1→41.4us、吞吐 92k→131k/s；1/1 与 4/4 在噪声内。
+  该路径仍每帧分配 frame/task。
 - 读路径已经不是瓶颈；剩余差异主要在 kernel 和测试客户端。
 
 ---
@@ -604,8 +624,13 @@ python3 -m cpplint include/tcp-server-mt.h
 
 - **Linux only**：`epoll`、`eventfd`、`accept4`、`SO_LINGER` 的行为都按 Linux
   实现。
-- **`sendTo` 的 `Ok` 不是送达确认**。它只表示帧进入了目标 reactor 的队列；
-  关机、断连、关闭中的连接都可能让它最终没有发出。
+- **`sendTo` 的 `Ok` 不是送达确认**。它只表示帧已被接受（owner 线程写入
+  wbuf，或其它线程入队）；关机、断连、关闭中的连接都可能让它最终没有发出。
+- **非 owner 发送仍每帧分配**：队列路径（应用线程 / 其它 reactor）仍分配 frame
+  vector 和 `std::function` 任务；owner reactor 上的 handler 快路径不分配。
+  性能敏感且从非 owner 线程发送时，优先把发送放在 handler 里。
+- **`stop()` 是立即中止**：它不等待在途回复；需要零丢失退出时用
+  `stopGracefully(timeoutMs)`，并给 `closeLingerMs` 留出时间。
 - **优雅关闭可能被已有积压延迟**，但只服务关闭时已经缓冲的输入；新到的数据不能
   无限延长关闭，最终由 `closeLingerMs` 兜底。
 - **空闲超时看字节，但帧有独立的装配期限**：一个持续发送但永远不发完一帧的
