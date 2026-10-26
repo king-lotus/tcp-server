@@ -401,6 +401,11 @@ struct Conn {
     // (see submitSend) -- sendTo answering Ok to one would promise something
     // the owner has already decided not to do.
     std::atomic<bool> closing{false};
+    // A close request has been queued but the owner may not have parked it
+    // yet. The owner-thread sendTo() fast path falls back to the queued path
+    // when this is set, so a send issued after closeConnection() keeps the
+    // existing queue order (and its existing drop) instead of overtaking it.
+    std::atomic<bool> closeRequested{false};
     bool       finSent = false;
     // A graceful close whose final read dispatched requests still has their
     // replies queued, and the FIN waits for them. At most one queue round may
@@ -530,9 +535,24 @@ class SubReactor {
     bool submitSend(uint64_t id, std::vector<uint8_t> frame) noexcept;
     bool submitClose(uint64_t id) noexcept;
 
+    // The reactor thread this call is running on, if any. sendTo() uses it for
+    // the owner-thread fast path; application and accept threads see null.
+    static SubReactor* current() noexcept { return current_; }
+    // Try to write a DATA frame straight into the connection's wbuf. Only
+    // valid on the owning reactor thread. expected is the server sendTo() was
+    // called on: two servers in one process share reactor threads and
+    // connection ids, so a mismatch must take the slow path, not this map.
+    // Returns false when the id is not in this reactor's map, or when wbuf has
+    // no room right now (the caller then takes the queued path, which owns the
+    // backpressure accounting).
+    bool trySendLocal(MultiReactorServer* expected, uint64_t id,
+                      const void* data, size_t len,
+                      SendResult* out) noexcept;
+
     int idx() const noexcept { return idx_; }
 
  private:
+    inline static thread_local SubReactor* current_ = nullptr;
     void loop() noexcept;
     void wakeup() noexcept;
     void drainWakeup() noexcept;
@@ -793,7 +813,8 @@ class MultiReactorServer {
 #endif
     void wait()  noexcept;
 
-    // Ok means queued, not delivered. Shutdown or disconnection can discard
+    // Ok means accepted (written straight to wbuf on the owner thread, or
+    // queued otherwise), not delivered. Shutdown or disconnection can discard
     // work.
     SendResult sendTo(uint64_t connId, const void* data, size_t len) noexcept;
     // True means the request reached the owning reactor's queue. False means it
@@ -1269,6 +1290,70 @@ inline bool SubReactor::submitSend(uint64_t id,
     }
 
     return enqueue(std::move(task));
+}
+
+// The owner-thread half of sendTo(). A message handler already runs on the
+// reactor that owns the connection, so the frame can go into wbuf without the
+// global submission/connection locks, the task queue, its eventfd wakeup, or
+// the frame vector and std::function the queued path allocates. The queue is
+// still the only path for application threads and for connections owned by
+// another reactor.
+inline bool SubReactor::trySendLocal(MultiReactorServer* expected,
+                                     uint64_t id, const void* data, size_t len,
+                                     SendResult* out) noexcept {
+    if (server_ != expected) return false;   // another server owns this thread
+    auto it = conns_.find(id);
+    if (it == conns_.end()) return false;   // another reactor owns it
+
+    Conn* c = it->second.get();
+    if (c->isClosed.load(std::memory_order_acquire) ||
+        c->closing.load(std::memory_order_acquire)) {
+        *out = SendResult::Closed;
+        return true;
+    }
+    // A close is already queued ahead of this send: take the queued path so
+    // the frame is ordered after it and dropped, exactly as before.
+    if (c->closeRequested.load(std::memory_order_acquire)) return false;
+
+    const size_t frameSize = FRAME_HEADER_SIZE + len;
+    // No room now: take the queued path, which reserves the frame and lets the
+    // task decide later. That is what preserves the existing backpressure
+    // accounting for a full wbuf.
+    if (c->wbuf.writable() < frameSize) return false;
+
+    size_t old = c->pendingBytes.load(std::memory_order_relaxed);
+    for (;;) {
+        if (old > server_->cfg_.maxPendingBytes ||
+            frameSize > server_->cfg_.maxPendingBytes - old) {
+            server_->statsRef().queueDrops.fetch_add(
+                1, std::memory_order_relaxed);
+            *out = SendResult::Overloaded;
+            return true;
+        }
+        if (c->pendingBytes.compare_exchange_weak(
+                old, old + frameSize,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) break;
+    }
+
+    uint8_t hdr[FRAME_HEADER_SIZE];
+    writeFrameHeader(hdr, FrameType::DATA, len);
+    const size_t hdrWrote = c->wbuf.write(hdr, sizeof hdr);
+    const size_t bodyWrote =
+        len ? c->wbuf.write(static_cast<const uint8_t*>(data), len) : 0;
+    if (hdrWrote != sizeof hdr || (len != 0 && bodyWrote != len)) {
+        // The capacity check above makes this unreachable; if it ever happens,
+        // do not leave a partial frame in the stream.
+        c->pendingBytes.fetch_sub(frameSize, std::memory_order_relaxed);
+        closeConn(c, "wbuf short write", false);
+        *out = SendResult::Overloaded;
+        return true;
+    }
+    // framesSent is counted as the frame leaves wbuf for the kernel, the same
+    // point as the queued path and bytesSent.
+    armWrite(c);
+    *out = SendResult::Ok;
+    return true;
 }
 
 inline bool SubReactor::submitClose(uint64_t id) noexcept {
@@ -2371,6 +2456,7 @@ inline void SubReactor::publishFramesRecv() noexcept {
 }
 
 inline void SubReactor::loop() noexcept {
+    current_ = this;
     MultiReactorServer::CallbackScope callbacks(server_);
     try {
         std::array<struct epoll_event, 1024> events{};
@@ -2465,6 +2551,7 @@ inline void SubReactor::loop() noexcept {
         running_.store(false, std::memory_order_release);
     }
     cleanup();
+    current_ = nullptr;
 }
 
 // ====================================================================
@@ -2967,6 +3054,17 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId, const void* data,
     if (len > MAX_FRAME_PAYLOAD) return SendResult::TooLarge;
     if (len && !data) return SendResult::InvalidArgument;
     if (!isRunning()) return SendResult::Closed;
+
+    // Owner-thread fast path: a handler runs on the reactor that owns its
+    // connection, so it can write straight into wbuf. This bypasses the
+    // global submission/connection locks, the task queue and its eventfd
+    // wakeup, and the frame/task allocations the queued path needs. It does
+    // not race stop(): this thread is the reactor stop() has to join.
+    if (SubReactor* local = SubReactor::current()) {
+        SendResult fast = SendResult::Ok;
+        if (local->trySendLocal(this, connId, data, len, &fast)) return fast;
+    }
+
     std::shared_lock<std::shared_mutex> submissions(submissionMutex_);
     if (!isRunning()) return SendResult::Closed;
 
@@ -3042,6 +3140,10 @@ inline bool MultiReactorServer::closeConnection(uint64_t connId) noexcept {
         stats_.closeRequestsDropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    // The close is queued. A sendTo() from the same reactor must now use the
+    // queued path too, so it lands after the close task and keeps the existing
+    // ordering semantics.
+    c->closeRequested.store(true, std::memory_order_release);
     return true;
 }
 

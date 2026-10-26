@@ -17,7 +17,9 @@ run it -- `verify/` is that machine.
 
 - **One accept thread plus N sub-reactors**, each reactor running on its own
   thread and owning its own connections. A submission aimed at another thread
-  travels through that reactor's queue, plus an `eventfd` wakeup.
+  travels through that reactor's queue, plus an `eventfd` wakeup; a send from
+  the owning reactor (the common handler echo) writes straight into `wbuf` and
+  skips both.
 - **Closing is staged, not `close(fd)`.** A connection is marked `closing`
   first, drains the replies already queued, and only then FINs. That semantic is
   where eight rounds of review landed most often and where the probes are

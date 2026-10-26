@@ -62,6 +62,9 @@ industrial::MultiReactorServer server(cfg);
   原子字段，或通过 `connectionIds()` / `stats()` 读全局快照。
 - **任务队列 + eventfd**：跨线程提交不是直接操作连接，而是把任务放进目标
   reactor 的队列，再写 eventfd 唤醒它。这保证连接状态始终由 owner 线程修改。
+- **owner-thread 快速路径**：handler 本来就在连接所属 reactor 上，调用 `sendTo`
+  时可以直接写 wbuf，绕过全局锁、任务队列和 eventfd；只有非 owner 线程、其它
+  reactor 的连接，或 wbuf 暂时没空间时才走队列。
 - **轮转分配**：`pickReactor()` 用 `nextReactor_` 递增取模，连接均匀落到各
   reactor。`reactor_spread` 套件断言了这一点。
 
@@ -174,14 +177,23 @@ epoll LT EPOLLIN
 ## 5. 写路径与背压
 
 ```
-应用线程 sendTo(id, data, len)
+应用线程 / handler 调用 sendTo(id, data, len)
   ├─ 校验：len <= MAX_FRAME_PAYLOAD、data、isRunning()
-  ├─ 查 conns_ 得到 shared_ptr<Conn>
-  ├─ 校验连接未关闭/未进入 closing
-  ├─ 分配 frame = 8 字节头 + 载荷
-  ├─ 预占 pendingBytes（<= maxPendingBytes）
-  └─ owner->submitSend(frame)  → reactor 队列 + eventfd
-reactor 线程
+  ├─ 当前线程是 owner reactor（handler 的常见情况）？
+  │    └─ trySendLocal:
+  │         ├─ 在本 reactor 的 conns_ 查找（无全局锁）
+  │         ├─ 未关闭、未 closing、未排队 closeRequested
+  │         ├─ 预占 pendingBytes
+  │         ├─ 直接写 8 字节头 + 载荷到 wbuf
+  │         └─ armWrite → Ok
+  │       （wbuf 没空间或已排队 close 时回退到下面的队列路径）
+  └─ 队列路径（非 owner 线程、其它 reactor、或快路径回退）：
+       ├─ 查全局 conns_ 得到 shared_ptr<Conn>
+       ├─ 校验连接未关闭/未进入 closing
+       ├─ 分配 frame = 8 字节头 + 载荷
+       ├─ 预占 pendingBytes（<= maxPendingBytes）
+       └─ owner->submitSend(frame)  → reactor 队列 + eventfd
+reactor 线程（队列路径）
   ├─ processPending() 取出任务
   ├─ wbuf.write(frame)
   ├─ armWrite(c)（按需打开 EPOLLOUT）
@@ -190,11 +202,15 @@ reactor 线程
        帧的最后一个字节到达内核 → framesSent++、bytesSent += n
 ```
 
+owner-thread 快路径是常见 echo 用的路径：它不分配 frame/task，不跨队列和
+eventfd。`closeRequested` 保证“先 closeConnection 再 sendTo”仍按队列顺序落到
+close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf 而改变语义。
+
 `SendResult` 的语义：
 
 | 值 | 含义 |
 |---|---|
-| `Ok` | **已入队**，不表示已送达；关机或断连仍可能丢弃 |
+| `Ok` | **已接受**（owner 线程直接写 wbuf，或其它线程入队），不表示已送达；关机或断连仍可能丢弃 |
 | `NotConnected` | 没有这个连接 id |
 | `Closed` | 服务已停止，或连接已关闭 / 正在关闭 |
 | `TooLarge` | 载荷超过 `MAX_FRAME_PAYLOAD` |
@@ -442,7 +458,7 @@ int main() {
 ### 10.4 发送与关闭
 
 ```cpp
-// 任意线程可调用。Ok 表示已入队。
+// 任意线程可调用。Ok 表示已接受：owner 线程直接写 wbuf，其它线程入队。
 industrial::SendResult r = server.sendTo(id, reply.data(), reply.size());
 
 // 优雅关闭：先送完已排队的回复，再 FIN。
@@ -571,6 +587,9 @@ python3 -m cpplint include/tcp-server-mt.h
 - 最大帧 **64 KiB + 8 字节头**。
 - 在开发 VM 上，4 KB 批量 ingest 约 **2.8 GB/s**，占用 8 核中的约 0.83 核；
   这些数字依赖机器、内核和编译选项，不是承诺。
+- 发送 echo（owner-thread 快路径，`bench_send` 多客户端）：1/1 p50 34us /
+  p99 86us；2/2 p50 12us / p99 45us；4/4 p50 27us / p99 87us。VM 8 vCPU，
+  每客户端 2 万条，5 次中位数；延迟受调度影响，不是承诺。
 - 读路径已经不是瓶颈；剩余差异主要在 kernel 和测试客户端。
 
 ---
