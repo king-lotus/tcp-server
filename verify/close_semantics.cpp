@@ -3,37 +3,37 @@
 // This is the runtime counterpart to the compile-only check: it asserts on wire
 // behaviour that a compiler cannot see, and that P1-4 changed.
 //
-//   A. sendTo(reply) then closeConnection() -- the ordinary "answer, then hang
+//   A. send_to(reply) then close_connection() -- the ordinary "answer, then hang
 //      up" pattern -- must deliver the reply and end with FIN. Before P1-4 the
 //      close could overtake the queued reply, leaving the client with RST and no
 //      payload.
-//   B. closeConnection() while the client still has an unread request in flight
+//   B. close_connection() while the client still has an unread request in flight
 //      must not turn into RST just because input was pending (close() on a socket
 //      with unread data resets the connection).
 //   C. A protocol violation (bad magic) is still an explicit abort -> RST, so the
 //      peer cannot mistake a truncated stream for a complete one.
 //   D. Every connection ends up accounted for: accepted == closed when idle, and
-//      the reservation for dropped output does not leak into connectionCount.
+//      the reservation for dropped output does not leak into connection_count.
 //   E. A peer that half-closes (request, then shutdown(SHUT_WR)) is still owed
 //      the answer: every reply the handler queued must reach it, ahead of the
 //      FIN. And while that answer drains, the reactor must not busy-poll --
 //      level-triggered EPOLLIN on a FIN'd socket returns from every epoll_wait,
-//      so eofReads (FIN wakes) must stay flat during the drain, not run away.
+//      so eof_reads (FIN wakes) must stay flat during the drain, not run away.
 //   F. Twenty rounds of "close as soon as you know a request arrived". The
 //      window this pokes at is microseconds wide: a request has been read and
 //      handled, but the reply task its handler enqueued has not run yet. A
 //      close landing in it finds nothing further to read, parks immediately,
 //      and every reply task behind it then runs against a connection that is
-//      already `closing` -- which submitSend refuses. Traced once under TSan:
+//      already `closing` -- which submit_send refuses. Traced once under TSan:
 //      SUBMIT_SEND(answer A) SUBMIT_CLOSE SUBMIT_SEND(answer B) TASK_SEND(A)
 //      PARK_IMMEDIATE TASK_SEND(B) -> REFUSE, 11 of 22 bytes delivered.
 //      One round mostly misses it; twenty mostly do not.
-//   G. The two sent-counters must describe one exchange, not two. framesSent
-//      used to move when a frame entered wbuf while bytesSent moved when bytes
+//   G. The two sent-counters must describe one exchange, not two. frames_sent
+//      used to move when a frame entered wbuf while bytes_sent moved when bytes
 //      left the socket, and nothing ever subtracted a frame a later abort
 //      dropped: 255 frames "sent", 96 delivered, no way to reconcile. Both
-//      now move at the kernel boundary, so with uniform frames framesSent
-//      must equal bytesSent / wireSize -- exactly, whatever the socket buffer
+//      now move at the kernel boundary, so with uniform frames frames_sent
+//      must equal bytes_sent / wireSize -- exactly, whatever the socket buffer
 //      happened to absorb.
 //
 // Build (Linux only):
@@ -59,27 +59,27 @@
 #include "harness.h"
 #include "tcp-server-mt.h"
 
-using industrial::FrameType;
-using industrial::MultiReactorServer;
-using industrial::SendResult;
+using industrial::frame_type;
+using industrial::multi_reactor_server;
+using industrial::send_result;
 
 namespace {
 
-int gFailures = 0;
+int g_failures = 0;
 // Answered once, up front: everything else in this file reads the wire, and how
 // much of the wire there is to read depends on this.
-bool gZeroLinger = true;
+bool g_zero_linger = true;
 
 void expect(bool ok, const char* what) {
     std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++gFailures;
+    if (!ok) ++g_failures;
 }
 
 // ---- client side -----------------------------------------------------------
 
 // Is anything listening on this port at all? Used to tell "server failed to
 // bind" apart from "server bound but the accept loop never ran".
-bool portIsListening(uint16_t port) {
+bool port_is_listening(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return false;
     struct sockaddr_in sa{};
@@ -96,38 +96,38 @@ bool portIsListening(uint16_t port) {
 // caller who only asks "was it a reset?", and only the third is what case C is
 // actually about. Collapsing them is how a missing RST hides behind a clean FIN
 // and looks like a server that merely forgot to abort.
-enum class ReadEnd { Invalid, Fin, Timeout, Reset };
+enum class read_end { invalid, fin, timeout, reset };
 
-const char* readEndName(ReadEnd e) {
+const char* read_end_name(read_end e) {
     switch (e) {
-        case ReadEnd::Fin:     return "FIN (orderly)";
-        case ReadEnd::Timeout: return "nothing arrived within the timeout";
-        case ReadEnd::Reset:   return "RST";
+        case read_end::fin:     return "FIN (orderly)";
+        case read_end::timeout: return "nothing arrived within the timeout";
+        case read_end::reset:   return "RST";
         default:               return "no descriptor";
     }
 }
 
 // Reads until FIN or RST. Returns bytes received and reports which of the three
-// endings it saw. An invalid descriptor reports Invalid rather than either of the
+// endings it saw. An invalid descriptor reports invalid rather than either of the
 // other two, so "no connection" cannot masquerade as a wire outcome either.
-std::vector<uint8_t> readToEnd(int fd, ReadEnd& end, int timeoutMs) {
+std::vector<uint8_t> read_to_end(int fd, read_end& end, int timeout_ms) {
     std::vector<uint8_t> out;
     uint8_t buf[4096];
-    end = ReadEnd::Invalid;
+    end = read_end::invalid;
     if (fd < 0) return out;
 
     struct timeval tv{};
-    tv.tv_sec  = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     for (;;) {
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n > 0) { out.insert(out.end(), buf, buf + n); continue; }
-        if (n == 0) { end = ReadEnd::Fin; break; }         // orderly FIN
+        if (n == 0) { end = read_end::fin; break; }         // orderly FIN
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) { end = ReadEnd::Timeout; break; }
-        end = ReadEnd::Reset;                              // ECONNRESET etc.
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { end = read_end::timeout; break; }
+        end = read_end::reset;                              // ECONNRESET etc.
         break;
     }
     return out;
@@ -140,7 +140,7 @@ std::vector<uint8_t> readToEnd(int fd, ReadEnd& end, int timeoutMs) {
 // on another. Asking first keeps the suite comparable across machines instead of
 // turning a platform limitation into a standing "known failure" that eventually
 // stops being read.
-bool kernelHonoursZeroLinger() {
+bool kernel_honours_zero_linger() {
     int ln = ::socket(AF_INET, SOCK_STREAM, 0);
     if (ln < 0) return false;
     struct sockaddr_in sa{};
@@ -176,7 +176,7 @@ bool kernelHonoursZeroLinger() {
     return honouring;
 }
 
-uint16_t pickPort() {
+uint16_t pick_port() {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
@@ -190,7 +190,7 @@ uint16_t pickPort() {
     return port;
 }
 
-bool waitFor(int ms, const std::function<bool()>& pred) {
+bool wait_for(int ms, const std::function<bool()>& pred) {
     for (int i = 0; i < ms / 10; ++i) {
         if (pred()) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -200,30 +200,30 @@ bool waitFor(int ms, const std::function<bool()>& pred) {
 
 // Every counter, dumped as one line per phase. The whole point is to be able to
 // read a failure off the deltas: accepted/rejected says whether the accept loop
-// handed the connection over, queueDrops says whether the reactor refused the
-// task, epollCtlErrors/rejected inside registers say whether the reactor took it
-// and then dropped it, and reactorFailures says whether the worker is still
-// alive at all. Any one of those three looks identical from the client side.
-void dumpStats(MultiReactorServer& server, const char* phase) {
+// handed the connection over, queue_drops says whether the reactor refused the
+// task, epoll_ctl_errors/rejected inside registers say whether the reactor took it
+// and then dropped it, and reactor_failures says whether the worker is still
+// alive at all. any one of those three looks identical from the client side.
+void dump_stats(multi_reactor_server& server, const char* phase) {
     auto& st = server.stats();
     std::printf("    [%s] conns=%zu run=%d acc=%llu rej=%llu cls=%llu abt=%llu "
                 "perr=%llu qdrop=%llu ctl=%llu rfail=%llu tasks=%llu depth=%llu "
                 "frecv=%llu fsent=%llu eof=%llu\n",
                 phase,
-                server.connectionCount(), (int)server.isRunning(),
+                server.connection_count(), (int)server.is_running(),
                 (unsigned long long)st.accepted.load(),
                 (unsigned long long)st.rejected.load(),
                 (unsigned long long)st.closed.load(),
                 (unsigned long long)st.aborted.load(),
-                (unsigned long long)st.parseErrors.load(),
-                (unsigned long long)st.queueDrops.load(),
-                (unsigned long long)st.epollCtlErrors.load(),
-                (unsigned long long)st.reactorFailures.load(),
-                (unsigned long long)st.pendingTasksTotal.load(),
-                (unsigned long long)st.pendingTasksDepth.load(),
-                (unsigned long long)st.framesRecv.load(),
-                (unsigned long long)st.framesSent.load(),
-                (unsigned long long)st.eofReads.load());
+                (unsigned long long)st.parse_errors.load(),
+                (unsigned long long)st.queue_drops.load(),
+                (unsigned long long)st.epoll_ctl_errors.load(),
+                (unsigned long long)st.reactor_failures.load(),
+                (unsigned long long)st.pending_tasks_total.load(),
+                (unsigned long long)st.pending_tasks_depth.load(),
+                (unsigned long long)st.frames_recv.load(),
+                (unsigned long long)st.frames_sent.load(),
+                (unsigned long long)st.eof_reads.load());
 }
 
 }  // namespace
@@ -234,56 +234,56 @@ int main() {
     // interleaved failure log is worse than none.
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    gZeroLinger = kernelHonoursZeroLinger();
+    g_zero_linger = kernel_honours_zero_linger();
     std::printf("== kernel turns SO_LINGER{on,0} into an observable RST: %s ==\n",
-                gZeroLinger ? "yes" : "NO - case C cannot assert it");
+                g_zero_linger ? "yes" : "NO - case C cannot assert it");
 
     // ---- server wiring -----------------------------------------------------
     std::atomic<int> handled{0};
     // Case A needs close-then-send-safe ordering, i.e. the close *after* the
     // echo. It is driven from the client side below: the handler only echoes.
-    std::atomic<bool> closeAfterReply{false};
-    std::atomic<bool> replyQueued{false};
+    std::atomic<bool> close_after_reply{false};
+    std::atomic<bool> reply_queued{false};
     // Case E: when >0, the handler answers with this many 32KB frames instead of
     // an echo -- an answer far larger than the client's receive buffer, so the
     // drain is still in progress while the client below is asleep.
-    std::atomic<int> bigReplyFrames{0};
+    std::atomic<int> big_reply_frames{0};
 
-    MultiReactorServer::Config cfg;
-    cfg.port = pickPort();
-    cfg.bindAddr = "127.0.0.1";
-    cfg.numReactors = 2;
-    // Switchable because pickReactor() hands connections out round-robin: with
+    multi_reactor_server::config cfg;
+    cfg.port = pick_port();
+    cfg.bind_addr = "127.0.0.1";
+    cfg.num_reactors = 2;
+    // Switchable because pick_reactor() hands connections out round-robin: with
     // CS_REACTORS=1 every client lands on the same reactor, so a fault that
     // belongs to one worker and not another shows up as everything passing.
-    if (const char* r = std::getenv("CS_REACTORS")) cfg.numReactors = std::atoi(r);
-    cfg.closeLingerMs = 300;          // keep the test short
+    if (const char* r = std::getenv("CS_REACTORS")) cfg.num_reactors = std::atoi(r);
+    cfg.close_linger_ms = 300;          // keep the test short
     // Case E needs an answer that cannot drain into the kernel while the client
     // sleeps: loopback autotuning can grow the socket buffers into the
     // megabytes, so both the per-connection wbuf and the pending ceiling are
     // raised to hold an 8MB answer. (backpressure.cpp does the same, for the
     // same reason.)
-    cfg.wbufCapacity    = 32 * 1024 * 1024;
-    cfg.maxPendingBytes = 32 * 1024 * 1024;
-    std::printf("== target port: %u, bindAddr=%s, reactors=%d ==\n",
-                (unsigned)cfg.port, cfg.bindAddr.c_str(), cfg.numReactors);
-    MultiReactorServer server(cfg);
+    cfg.wbuf_capacity    = 32 * 1024 * 1024;
+    cfg.max_pending_bytes = 32 * 1024 * 1024;
+    std::printf("== target port: %u, bind_addr=%s, reactors=%d ==\n",
+                (unsigned)cfg.port, cfg.bind_addr.c_str(), cfg.num_reactors);
+    multi_reactor_server server(cfg);
 
-    server.setMessageHandler([&](uint64_t id, const uint8_t* p, size_t n) {
+    server.set_message_handler([&](uint64_t id, const uint8_t* p, size_t n) {
         handled.fetch_add(1);
-        if (bigReplyFrames.load() > 0) {
+        if (big_reply_frames.load() > 0) {
             const std::vector<uint8_t> chunk(32 * 1024, 0x5A);
-            for (int i = 0, total = bigReplyFrames.load(); i < total; ++i)
-                server.sendTo(id, chunk.data(), chunk.size());
-            replyQueued.store(true);
+            for (int i = 0, total = big_reply_frames.load(); i < total; ++i)
+                server.send_to(id, chunk.data(), chunk.size());
+            reply_queued.store(true);
             return;
         }
-        server.sendTo(id, p, n);                     // queue the reply
-        replyQueued.store(true);
-        if (closeAfterReply.exchange(false)) {
+        server.send_to(id, p, n);                     // queue the reply
+        reply_queued.store(true);
+        if (close_after_reply.exchange(false)) {
             // Exactly the application pattern P1-4 is about: "answer, then hang
             // up". Both calls land on the same reactor queue, reply first.
-            server.closeConnection(id);
+            server.close_connection(id);
         }
     });
 
@@ -293,42 +293,42 @@ int main() {
                     (unsigned)cfg.port);
         return 1;
     }
-    std::printf("== server.start() ok; isRunning=%d ==\n", (int)server.isRunning());
-    if (!server.isRunning()) {
-        std::printf("WARNING: start() returned true but isRunning() is false "
+    std::printf("== server.start() ok; is_running=%d ==\n", (int)server.is_running());
+    if (!server.is_running()) {
+        std::printf("WARNING: start() returned true but is_running() is false "
                     "- a component raised the failure flag during bring-up\n");
     }
 
     // Probe once here so a bind/accept-loop failure is reported before any case
     // runs, instead of being guessed at from a pile of per-case failures.
-    if (!portIsListening(cfg.port)) {
+    if (!port_is_listening(cfg.port)) {
         std::printf("FATAL: nothing is listening on 127.0.0.1:%u after a "
                     "successful start() - the accept loop did not come up\n",
                     (unsigned)cfg.port);
     }
 
-    dumpStats(server, "started");
+    dump_stats(server, "started");
 
     const uint16_t port = cfg.port;
 
     // ---- A: reply queued, then close (answer-then-hang-up) -----------------
     {
         std::printf("A. reply + close\n");
-        dumpStats(server, "A.begin");
-        harness::Peer peer;
+        dump_stats(server, "A.begin");
+        harness::peer peer;
         expect(static_cast<bool>(peer.connect(port)), "client connected");
         const int fd = peer.fd();
-        replyQueued.store(false);
-        closeAfterReply.store(true);
+        reply_queued.store(false);
+        close_after_reply.store(true);
         const std::string payload = "ANSWER-42";
-        peer.send(FrameType::DATA, payload.data(), payload.size());
-        expect(waitFor(2000, [&] { return replyQueued.load(); }), "handler ran");
+        peer.send(frame_type::DATA, payload.data(), payload.size());
+        expect(wait_for(2000, [&] { return reply_queued.load(); }), "handler ran");
 
-        ReadEnd end = ReadEnd::Invalid;
-        auto got = readToEnd(fd, end, 2000);
+        read_end end = read_end::invalid;
+        auto got = read_to_end(fd, end, 2000);
         peer.close();
 
-        expect(end != ReadEnd::Reset, "peer got FIN, not RST");
+        expect(end != read_end::reset, "peer got FIN, not RST");
         expect(got.size() == industrial::FRAME_HEADER_SIZE + payload.size(),
                "peer got exactly one framed reply");
         if (got.size() >= industrial::FRAME_HEADER_SIZE) {
@@ -336,27 +336,27 @@ int main() {
                                payload.data(), payload.size()) == 0,
                    "reply payload intact");
         }
-        expect(waitFor(2000, [&] { return server.connectionCount() == size_t(0); }),
+        expect(wait_for(2000, [&] { return server.connection_count() == size_t(0); }),
                "connection torn down after the FIN exchange");
-        dumpStats(server, "A.end");
+        dump_stats(server, "A.end");
     }
 
     // ---- B: close while the client still has data unread -------------------
     {
         std::printf("B. close with request in flight\n");
-        dumpStats(server, "B.begin");
+        dump_stats(server, "B.begin");
         // Take the ids that already exist: everything below must talk about the
         // connection this block creates. Taking "whichever one is first" used to
         // hand back a stale connection left behind by an earlier case, and each
         // assertion then passed against the wrong socket while the one under test
         // was quietly never closed.
-        const auto preexisting = server.connectionIds();
-        harness::Peer peer;
+        const auto preexisting = server.connection_ids();
+        harness::peer peer;
         expect(static_cast<bool>(peer.connect(port)), "client connected");
         const int fd = peer.fd();
         uint64_t id = 0;
-        expect(waitFor(2000, [&] {
-                   for (uint64_t seen : server.connectionIds()) {
+        expect(wait_for(2000, [&] {
+                   for (uint64_t seen : server.connection_ids()) {
                        bool stale = false;
                        for (uint64_t old : preexisting) if (old == seen) stale = true;
                        if (!stale) { id = seen; return true; }
@@ -370,43 +370,43 @@ int main() {
         // server has been handed but has not necessarily read yet, and whether
         // that stays true until the close lands cannot be left to timing: the
         // client would be asking the network stack to win a race against itself,
-        // and sometimes it loses. bytesRecv says the bytes reached the server;
+        // and sometimes it loses. bytes_recv says the bytes reached the server;
         // whether the reactor has read them is deliberately left open, which is
         // precisely what a graceful close has to cope with.
-        const uint64_t sentAt = server.stats().bytesRecv.load();
-        peer.send(FrameType::DATA, "one", 3);
-        peer.send(FrameType::DATA, "two", 3);
-        waitFor(2000, [&] {
-            return server.stats().bytesRecv.load() >=
-                   sentAt + 2 * (industrial::FRAME_HEADER_SIZE + 3);
+        const uint64_t sent_at = server.stats().bytes_recv.load();
+        peer.send(frame_type::DATA, "one", 3);
+        peer.send(frame_type::DATA, "two", 3);
+        wait_for(2000, [&] {
+            return server.stats().bytes_recv.load() >=
+                   sent_at + 2 * (industrial::FRAME_HEADER_SIZE + 3);
         });
-        server.closeConnection(id);
+        server.close_connection(id);
 
-        ReadEnd end = ReadEnd::Invalid;
-        auto got = readToEnd(fd, end, 2000);
+        read_end end = read_end::invalid;
+        auto got = read_to_end(fd, end, 2000);
         peer.close();
-        expect(end != ReadEnd::Reset, "close did not degenerate into RST");
-        std::printf("      wire ended with: %s\n", readEndName(end));
+        expect(end != read_end::reset, "close did not degenerate into RST");
+        std::printf("      wire ended with: %s\n", read_end_name(end));
         expect(!got.empty(), "at least the first reply was delivered");
-        dumpStats(server, "B.end");
+        dump_stats(server, "B.end");
     }
 
     // ---- C: protocol violation must be an explicit abort -------------------
     {
         std::printf("C. bad magic -> abort\n");
-        dumpStats(server, "C.begin");
-        harness::Peer peer;
+        dump_stats(server, "C.begin");
+        harness::peer peer;
         expect(static_cast<bool>(peer.connect(port)), "client connected");
         const int fd = peer.fd();
         uint8_t junk[16];
         std::memset(junk, 0x11, sizeof(junk));      // never a valid 0xEB90 header
-        peer.sendRaw(junk, sizeof(junk));
+        peer.send_raw(junk, sizeof(junk));
 
-        ReadEnd end = ReadEnd::Invalid;
-        readToEnd(fd, end, 2000);
+        read_end end = read_end::invalid;
+        read_to_end(fd, end, 2000);
         peer.close();
-        if (gZeroLinger) {
-            expect(end == ReadEnd::Reset, "peer observes RST on a protocol violation");
+        if (g_zero_linger) {
+            expect(end == read_end::reset, "peer observes RST on a protocol violation");
         } else {
             // Not assertable here, and not because the server declined to abort:
             // the two counters below say it did. A bare socket pair asked for the
@@ -417,18 +417,18 @@ int main() {
                         "pair), so case C can only assert the server's own "
                         "evidence here\n");
         }
-        expect(waitFor(2000, [&] { return server.stats().parseErrors.load() >= 1; }),
-               "parseErrors counted");
-        expect(waitFor(2000, [&] { return server.stats().aborted.load() >= 1; }),
+        expect(wait_for(2000, [&] { return server.stats().parse_errors.load() >= 1; }),
+               "parse_errors counted");
+        expect(wait_for(2000, [&] { return server.stats().aborted.load() >= 1; }),
                "aborted counted");
-        dumpStats(server, "C.end");
+        dump_stats(server, "C.end");
     }
 
     // ---- E: peer half-closes while its answer is still queued ---------------
     {
         std::printf("E. peer FIN with replies still queued\n");
-        dumpStats(server, "E.begin");
-        harness::Peer peer;
+        dump_stats(server, "E.begin");
+        harness::peer peer;
         expect(static_cast<bool>(peer.connect(port)), "client connected");
         const int fd = peer.fd();
         // Shrink the peer's receive buffer so the answer cannot drain into it
@@ -438,39 +438,39 @@ int main() {
         int rcvbuf = 16384;
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-        replyQueued.store(false);
-        bigReplyFrames.store(250);     // 250 x 32KB = 8MB: cannot drain in one go
+        reply_queued.store(false);
+        big_reply_frames.store(250);     // 250 x 32KB = 8MB: cannot drain in one go
         const std::string req = "half-close-then-answer";
-        peer.send(FrameType::DATA, req.data(), req.size());
+        peer.send(frame_type::DATA, req.data(), req.size());
         // Done sending, still entitled to the answer. This is the HTTP/1.0-style
         // exchange: request, half-close, read until FIN.
         ::shutdown(fd, SHUT_WR);
-        expect(waitFor(2000, [&] { return replyQueued.load(); }), "handler ran");
-        bigReplyFrames.store(0);
+        expect(wait_for(2000, [&] { return reply_queued.load(); }), "handler ran");
+        big_reply_frames.store(0);
 
-        const size_t wantBytes =
+        const size_t want_bytes =
             250 * (industrial::FRAME_HEADER_SIZE + 32 * 1024);
 
         // The parked-drain window: nobody reads at this end for 250ms, so wbuf
-        // stays non-empty the whole time. eofReads counts how often the reactor
+        // stays non-empty the whole time. eof_reads counts how often the reactor
         // woke to the same FIN -- with read interest left armed that is once
         // per epoll_wait, i.e. thousands of times in this window.
-        const uint64_t e0 = server.stats().eofReads.load();
+        const uint64_t e0 = server.stats().eof_reads.load();
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        const uint64_t e1 = server.stats().eofReads.load();
-        std::printf("      eofReads +%llu over the 250ms parked window\n",
+        const uint64_t e1 = server.stats().eof_reads.load();
+        std::printf("      eof_reads +%llu over the 250ms parked window\n",
                     (unsigned long long)(e1 - e0));
         expect(e1 - e0 <= 20, "no busy-poll on the peer's FIN while draining");
 
-        ReadEnd end = ReadEnd::Invalid;
-        auto got = readToEnd(fd, end, 5000);
+        read_end end = read_end::invalid;
+        auto got = read_to_end(fd, end, 5000);
         peer.close();
-        expect(end == ReadEnd::Fin, "wire ends with FIN, not RST or silence");
+        expect(end == read_end::fin, "wire ends with FIN, not RST or silence");
         std::printf("      wire ended with: %s, %zu of %zu bytes\n",
-                    readEndName(end), got.size(), wantBytes);
-        expect(got.size() == wantBytes,
+                    read_end_name(end), got.size(), want_bytes);
+        expect(got.size() == want_bytes,
                "every queued reply survived the peer's half-close");
-        dumpStats(server, "E.end");
+        dump_stats(server, "E.end");
     }
 
     // ---- F: a close racing the reply it is racing ---------------------------
@@ -482,113 +482,113 @@ int main() {
     // been executed yet. When the close arrives in that window, drainInput
     // ThenClose finds nothing left to read, parks immediately, and the reply
     // tasks then run against a connection that is already `closing` -- which
-    // submitSend refuses. From the client this looks like a server that took
+    // submit_send refuses. From the client this looks like a server that took
     // the request in, ran the handler, delivered nothing, and hung up politely.
     {
         std::printf("F. 20 rounds of close racing the reply\n");
-        dumpStats(server, "F.begin");
-        const auto preexisting = server.connectionIds();
+        dump_stats(server, "F.begin");
+        const auto preexisting = server.connection_ids();
         const int rounds = 20;
         // Two requests of three bytes, answered by an echo: exactly these bytes
         // every round, or an answer was produced and then refused.
-        const size_t wantRound = 2 * (industrial::FRAME_HEADER_SIZE + 3);
+        const size_t want_round = 2 * (industrial::FRAME_HEADER_SIZE + 3);
         int lost = 0;
 
         for (int round = 0; round < rounds; ++round) {
-            harness::Peer peer;
+            harness::peer peer;
             if (!peer.connect(port)) {
                 std::printf("      round %d: connect failed\n", round);
                 ++lost;
                 continue;
             }
             const int fd = peer.fd();
-            peer.send(FrameType::DATA, "one", 3);
-            peer.send(FrameType::DATA, "two", 3);
+            peer.send(frame_type::DATA, "one", 3);
+            peer.send(frame_type::DATA, "two", 3);
             // Close the instant the bytes are known to have arrived, which is
             // the earliest the application could know there is anything to wait
             // for -- polling every millimetre rather than every 10ms widens the
             // window from "almost never" to "most attempts".
-            const uint64_t sentAt = server.stats().bytesRecv.load();
+            const uint64_t sent_at = server.stats().bytes_recv.load();
             for (int i = 0; i < 2000; ++i) {
-                if (server.stats().bytesRecv.load() >=
-                    sentAt + 2 * (industrial::FRAME_HEADER_SIZE + 3)) break;
+                if (server.stats().bytes_recv.load() >=
+                    sent_at + 2 * (industrial::FRAME_HEADER_SIZE + 3)) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            for (uint64_t id : server.connectionIds()) {
+            for (uint64_t id : server.connection_ids()) {
                 bool stale = false;
                 for (uint64_t old : preexisting) if (old == id) stale = true;
-                if (!stale) server.closeConnection(id);
+                if (!stale) server.close_connection(id);
             }
 
-            ReadEnd end = ReadEnd::Invalid;
-            auto got = readToEnd(fd, end, 2000);
+            read_end end = read_end::invalid;
+            auto got = read_to_end(fd, end, 2000);
             peer.close();
             // Both requests were served before the close was asked for, so both
             // answers must arrive: anything less is an answer that existed and
             // was then refused. Judging a round on "did anything arrive at all"
             // lets a round that lost one of two replies pass.
-            if (got.size() != wantRound) {
+            if (got.size() != want_round) {
                 ++lost;
                 std::printf("      round %d: %zu of %zu bytes (%s)\n", round,
-                            got.size(), wantRound, readEndName(end));
+                            got.size(), want_round, read_end_name(end));
             }
         }
         std::printf("      %d of %d rounds lost a reply they had produced\n",
                     lost, rounds);
         expect(lost == 0, "no round loses an answer it had already produced");
-        dumpStats(server, "F.end");
+        dump_stats(server, "F.end");
     }
 
     // ---- G: the sent-counters describe one exchange, not two ---------------
     //
     // A peer that never reads forces the close to park on a full wbuf, and the
     // linger deadline then aborts it with output undelivered -- exactly the
-    // situation someone would consult framesSent to understand. Every reply
+    // situation someone would consult frames_sent to understand. Every reply
     // frame here is the same wire size, and at most one frame is ever mid-
-    // flight, so if framesSent really counts frames that left the socket,
-    // bytesSent / wireSize names the same number.
+    // flight, so if frames_sent really counts frames that left the socket,
+    // bytes_sent / wireSize names the same number.
     {
         std::printf("G. counters across an aborted drain\n");
-        MultiReactorServer::Config gcfg;
-        gcfg.bindAddr = "127.0.0.1";
-        gcfg.port = pickPort();
-        gcfg.numReactors = 1;
-        gcfg.idleTimeoutMs = 300;   // parks the close while output is stuck
-        gcfg.closeLingerMs = 200;   // then expires it: abort with wbuf loaded
-        gcfg.tickMs = 20;
-        gcfg.wbufCapacity = 32 * 1024 * 1024;
-        gcfg.maxPendingBytes = 32 * 1024 * 1024;
+        multi_reactor_server::config gcfg;
+        gcfg.bind_addr = "127.0.0.1";
+        gcfg.port = pick_port();
+        gcfg.num_reactors = 1;
+        gcfg.idle_timeout_ms = 300;   // parks the close while output is stuck
+        gcfg.close_linger_ms = 200;   // then expires it: abort with wbuf loaded
+        gcfg.tick_ms = 20;
+        gcfg.wbuf_capacity = 32 * 1024 * 1024;
+        gcfg.max_pending_bytes = 32 * 1024 * 1024;
 
-        MultiReactorServer gserver(gcfg);
-        gserver.setMessageHandler([&](uint64_t id, const uint8_t*, size_t) {
+        multi_reactor_server gserver(gcfg);
+        gserver.set_message_handler([&](uint64_t id, const uint8_t*, size_t) {
             // ~33MB of answer against a peer that will not read a byte: the
             // socket buffer takes what it takes, everything else waits in
             // wbuf for the linger deadline.
             const std::string blob(industrial::MAX_FRAME_PAYLOAD, 'g');
             for (int i = 0; i < 512; ++i)
-                if (gserver.sendTo(id, blob.data(), blob.size()) != SendResult::Ok) break;
+                if (gserver.send_to(id, blob.data(), blob.size()) != send_result::ok) break;
         });
         expect(gserver.start(), "second server starts");
-        harness::Peer peer;
+        harness::peer peer;
         expect(static_cast<bool>(peer.connect(gcfg.port)), "client connects");
-        peer.send(FrameType::DATA, "go", 2);
+        peer.send(frame_type::DATA, "go", 2);
         // Read nothing on purpose: idle (300ms) parks the close, linger
         // (200ms) aborts it, the rest is margin for the tick.
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
         const auto& gst = gserver.stats();
         const uint64_t wire = industrial::MAX_FRAME_SIZE;
-        const uint64_t fsent = gst.framesSent.load();
-        const uint64_t bsent = gst.bytesSent.load();
-        std::printf("      framesSent=%llu bytesSent=%llu bytesDropped=%llu aborted=%llu\n",
+        const uint64_t fsent = gst.frames_sent.load();
+        const uint64_t bsent = gst.bytes_sent.load();
+        std::printf("      frames_sent=%llu bytes_sent=%llu bytes_dropped=%llu aborted=%llu\n",
                     (unsigned long long)fsent, (unsigned long long)bsent,
-                    (unsigned long long)gst.bytesDropped.load(),
+                    (unsigned long long)gst.bytes_dropped.load(),
                     (unsigned long long)gst.aborted.load());
         expect(gst.aborted.load() >= 1, "the linger deadline aborted the parked close");
-        expect(gst.bytesDropped.load() > 0, "output was still undelivered at the abort");
+        expect(gst.bytes_dropped.load() > 0, "output was still undelivered at the abort");
         expect(bsent > 0, "some output did reach the socket");
         expect(fsent == bsent / wire,
-               "framesSent counts frames that left, not frames that were queued");
+               "frames_sent counts frames that left, not frames that were queued");
 
         peer.close();
         gserver.stop();
@@ -596,61 +596,61 @@ int main() {
 
     // ---- H: whole-server graceful stop -------------------------------------
     //
-    // stop() is abortive: whatever is still open is aborted. stopGracefully()
+    // stop() is abortive: whatever is still open is aborted. stop_gracefully()
     // first stops accepting, then asks every connection to close, and waits
     // for the replies already queued to leave before the normal stop.
     {
         std::printf("H. graceful whole-server stop\n");
-        MultiReactorServer::Config hcfg;
-        hcfg.bindAddr        = "127.0.0.1";
+        multi_reactor_server::config hcfg;
+        hcfg.bind_addr        = "127.0.0.1";
         hcfg.port            = 0;
-        hcfg.numReactors     = 2;
-        hcfg.tickMs          = 20;
-        hcfg.idleTimeoutMs   = 60000;
-        hcfg.closeLingerMs   = 2000;
-        hcfg.wbufCapacity    = 1 << 20;
-        hcfg.maxPendingBytes = 1 << 20;
+        hcfg.num_reactors     = 2;
+        hcfg.tick_ms          = 20;
+        hcfg.idle_timeout_ms   = 60000;
+        hcfg.close_linger_ms   = 2000;
+        hcfg.wbuf_capacity    = 1 << 20;
+        hcfg.max_pending_bytes = 1 << 20;
 
-        std::atomic<MultiReactorServer*> hserver{nullptr};
+        std::atomic<multi_reactor_server*> hserver{nullptr};
         std::atomic<bool> replied{false};
-        harness::Fixture hfix(
+        harness::fixture hfix(
             hcfg, [&](uint64_t id, const uint8_t*, size_t) {
-                if (MultiReactorServer* hs = hserver.load())
-                    (void)hs->sendTo(id, "reply", 5);
+                if (multi_reactor_server* hs = hserver.load())
+                    (void)hs->send_to(id, "reply", 5);
                 replied.store(true);
             });
         if (!hfix.started()) {
             expect(false, "graceful server starts");
         } else {
             hserver.store(&hfix.server());
-            harness::Peer peer;
+            harness::peer peer;
             if (!peer.connect(hfix.port())) {
                 expect(false, "graceful client connects");
             } else {
-                peer.send(FrameType::DATA, "go", 2);
-                expect(waitFor(2000, [&] { return replied.load(); }),
+                peer.send(frame_type::DATA, "go", 2);
+                expect(wait_for(2000, [&] { return replied.load(); }),
                        "graceful handler ran and queued its reply");
 
                 bool drained = false;
                 std::thread stopper([&] {
-                    drained = hfix.server().stopGracefully(3000);
+                    drained = hfix.server().stop_gracefully(3000);
                 });
 
-                harness::Frame f;
-                const harness::Status fs = peer.expectFrame(&f, 2000);
-                if (!fs) std::printf("      expectFrame: %s\n", fs.why.c_str());
+                harness::frame f;
+                const harness::status fs = peer.expect_frame(&f, 2000);
+                if (!fs) std::printf("      expect_frame: %s\n", fs.why.c_str());
                 expect(static_cast<bool>(fs), "the queued reply arrived");
                 expect(f.payload.size() == 5,
                        "the reply is the payload the handler queued");
-                const harness::Status cs =
-                    peer.expectClose(harness::Close::Fin, 2000);
-                if (!cs) std::printf("      expectClose: %s\n", cs.why.c_str());
+                const harness::status cs =
+                    peer.expect_close(harness::close_kind::fin, 2000);
+                if (!cs) std::printf("      expect_close: %s\n", cs.why.c_str());
                 expect(static_cast<bool>(cs), "the peer saw a FIN");
 
                 peer.close();
                 stopper.join();
-                expect(drained, "stopGracefully drained every connection");
-                expect(hfix.server().connectionCount() == 0,
+                expect(drained, "stop_gracefully drained every connection");
+                expect(hfix.server().connection_count() == 0,
                        "no connections left after the drain");
             }
         }
@@ -660,7 +660,7 @@ int main() {
     {
         std::printf("D. accounting\n");
         server.stop();
-        dumpStats(server, "D.stopped");
+        dump_stats(server, "D.stopped");
         const auto& st = server.stats();
         expect(st.accepted.load() == st.closed.load(),
                "accepted == closed after all connections ended");
@@ -669,11 +669,11 @@ int main() {
                     (unsigned long long)st.accepted.load(),
                     (unsigned long long)st.closed.load(),
                     (unsigned long long)st.aborted.load(),
-                    (unsigned long long)st.bytesDropped.load(),
+                    (unsigned long long)st.bytes_dropped.load(),
                     handled.load());
     }
 
-    std::printf("%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
-                gFailures, gFailures == 1 ? "" : "s");
-    return gFailures == 0 ? 0 : 1;
+    std::printf("%s (%d failure%s)\n", g_failures == 0 ? "ALL PASS" : "FAILURES",
+                g_failures, g_failures == 1 ? "" : "s");
+    return g_failures == 0 ? 0 : 1;
 }

@@ -5,7 +5,7 @@ thread with N sub-reactors. Everything is in that one file.
 
 ```cpp
 #include "tcp-server-mt.h"          // -I<repo>/include  -std=c++17  -pthread
-industrial::MultiReactorServer server(cfg);
+industrial::multi_reactor_server server(cfg);
 ```
 
 No `.cpp`, nothing to link, no third-party dependencies. To use it, copy
@@ -24,19 +24,19 @@ run it -- `verify/` is that machine.
   first, drains the replies already queued, and only then FINs. That semantic is
   where eight rounds of review landed most often and where the probes are
   densest. `stop()` is the immediate exception: it aborts whatever is still
-  open. `stopGracefully(ms)` stops accepting, closes every connection
+  open. `stop_gracefully(ms)` stops accepting, closes every connection
   gracefully, and waits up to `ms` before that same stop.
 - **Idle is measured in bytes, and a partial frame has its own deadline.** A
-  peer that keeps dribbling a frame is not idle; `frameAssemblyTimeoutMs`
-  (default: 5 x `idleTimeoutMs`) aborts it and counts it separately from
-  `idleTimeouts`.
+  peer that keeps dribbling a frame is not idle; `frame_assembly_timeout_ms`
+  (default: 5 x `idle_timeout_ms`) aborts it and counts it separately from
+  `idle_timeouts`.
 - **Slow work can leave the reactor without reordering a connection.**
-  `Config::handlerThreads > 0` starts an optional pool; `offload(connId, fn)`
+  `config::handler_threads > 0` starts an optional pool; `offload(conn_id, fn)`
   queues work that runs serially per connection and in parallel across
   connections, and returns `false` when the pool is off or the shared
-  `handlerQueueLimit` is full. The message handler itself still runs on the
+  `handler_queue_limit` is full. The message handler itself still runs on the
   reactor; it copies what the task needs and returns.
-- **The counters live in `ServerStats`**, each annotated with when it moves and
+- **The counters live in `server_stats`**, each annotated with when it moves and
   with the branches that should reach it but cannot. Reading those comments
   beats reading this summary. The four traffic counters are batched per reactor
   and published once per loop iteration: exact at idle, up to one iteration
@@ -97,9 +97,9 @@ development VM, and the same run from 1.42 to 0.83 cores of the eight available.
 Faster and cheaper at once is what finding wasted work on the critical path
 looks like; an optimisation of the algorithm would have kept the cores.
 
-- **The idle clock was read once per frame.** `parseFrames` stamped
-  `lastRecvMs`, and `handleRead` already stamps it when the bytes arrive.
-  `perf` put `clock_gettime` at 18% of the reactor and `parseFrames` at 62%;
+- **The idle clock was read once per frame.** `parse_frames` stamped
+  `last_recv_ms`, and `handle_read` already stamps it when the bytes arrive.
+  `perf` put `clock_gettime` at 18% of the reactor and `parse_frames` at 62%;
   removing the per-frame read was worth 62% of throughput.
 - **The frame counter was a shared atomic, once per frame.** It is now a
   per-reactor count published once per loop iteration, `alignas(64)`. The
@@ -120,7 +120,7 @@ Re-measured afterwards they were +18% and +9.8%. A verdict recorded against code
 that has since changed is not evidence, and it will be wrong in either direction.
 
 `perf` decided which of them was worth doing. Guessing cost four rejected
-attempts -- frame budget, read size, a `Spans` struct more expensive than the
+attempts -- frame budget, read size, a `spans_view` struct more expensive than the
 memcpy it replaced, and a header fast path worth 0.6%. One profile named
 `clock_gettime` immediately.
 
@@ -134,7 +134,7 @@ shrinking; that one is open.
 ## Layout
 
 ```
-include/tcp-server-mt.h   the only deliverable, 3429 lines
+include/tcp-server-mt.h   the only deliverable, 3400 lines
 verify/                   runtime suites, the peer harness, one-off probes
 docs/testing.md           how a suite is written, and how the harness is tested
 docs/review/              eight rounds of review, with an index
@@ -165,23 +165,23 @@ were only never executed locally. Two of the three have since been closed:
 
 - **Which reactor a connection lands on -- closed, 2026-10-18.** The note here
   used to say that reactor-count-dependent behaviour had only been run with
-  `numReactors = 1`, which was no longer true and had not been for some rounds:
+  `num_reactors = 1`, which was no longer true and had not been for some rounds:
   `close_semantics` has defaulted to two since the seventh, and the runner also
   takes it down to one on purpose, because with a single worker a fault that
   belongs to one worker is averaged away and reads as a pass. What was really
-  unasserted was narrower and worse -- nothing observed `pickReactor()`'s
+  unasserted was narrower and worse -- nothing observed `pick_reactor()`'s
   round-robin, so returning the first reactor every time left all 21
   configurations green. `verify/reactor_spread.cpp` asks it directly: eight
   connections over four reactors have to be handled by four distinct threads. It
   runs at four reactors and again at two, so the assertion is shown to follow the
   configuration rather than a constant, and both existing two-reactor suites were
-  run against a deliberately broken `pickReactor()` first to confirm they could
+  run against a deliberately broken `pick_reactor()` first to confirm they could
   not have caught it.
 
 One remains open:
 
 - **One count folded into another**: a certain class of residual drops now lands
-  in `queueDrops` / `bytesDropped`, counted the same as a genuine close branch.
+  in `queue_drops` / `bytes_dropped`, counted the same as a genuine close branch.
   Under the current contract that is the same event; separating them would take a
   new counter.
 

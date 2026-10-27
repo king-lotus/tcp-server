@@ -4,7 +4,7 @@
 //
 // Each client keeps one frame in flight: send a DATA frame, wait for the
 // handler's echo, then send the next. With one client that is latency. With
-// several clients it is also a scaling claim: the handler echo takes sendTo()'s
+// several clients it is also a scaling claim: the handler echo takes send_to()'s
 // owner-thread fast path (straight into wbuf), while application-thread sends
 // still take the queue. The clients/reactors ratio shows whether the reply
 // path scales, and the multi-client mode exists to expose the locks and
@@ -40,16 +40,16 @@
 
 #include "tcp-server-mt.h"
 
-using industrial::FrameType;
+using industrial::frame_type;
 using industrial::FRAME_HEADER_SIZE;
-using industrial::MultiReactorServer;
+using industrial::multi_reactor_server;
 
 namespace {
 
-std::atomic<MultiReactorServer*> gServer{nullptr};
-std::atomic<int> gPayload{56};
+std::atomic<multi_reactor_server*> g_server{nullptr};
+std::atomic<int> g_payload{56};
 
-int connectTo(uint16_t port) {
+int connect_to(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_in sa{};
@@ -63,7 +63,7 @@ int connectTo(uint16_t port) {
     return fd;
 }
 
-bool readExactly(int fd, void* p, size_t n) {
+bool read_exactly(int fd, void* p, size_t n) {
     uint8_t* b = static_cast<uint8_t*>(p);
     size_t off = 0;
     while (off < n) {
@@ -77,21 +77,21 @@ bool readExactly(int fd, void* p, size_t n) {
     return true;
 }
 
-struct ClientResult {
+struct client_result {
     std::vector<uint64_t> ns;
     size_t sent = 0;
     bool   connected = false;
 };
 
-void runClient(int messages, const std::vector<uint8_t>& payload,
+void run_client(int messages, const std::vector<uint8_t>& payload,
                uint16_t port, std::atomic<int>* ready,
-               std::atomic<bool>* go, ClientResult* result) {
+               std::atomic<bool>* go, client_result* result) {
     std::vector<uint8_t> frame(FRAME_HEADER_SIZE + payload.size());
-    industrial::encodeFrameInto(frame.data(), FrameType::DATA,
+    industrial::encode_frame_into(frame.data(), frame_type::DATA,
                                 payload.data(), payload.size());
     std::vector<uint8_t> reply(frame.size());
 
-    const int fd = connectTo(port);
+    const int fd = connect_to(port);
     if (fd < 0) {
         ready->fetch_add(1, std::memory_order_release);
         return;
@@ -106,7 +106,7 @@ void runClient(int messages, const std::vector<uint8_t>& payload,
     for (int i = 0; i < 100; ++i) {
         if (::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL) !=
             static_cast<ssize_t>(frame.size())) break;
-        if (!readExactly(fd, reply.data(), frame.size())) break;
+        if (!read_exactly(fd, reply.data(), frame.size())) break;
     }
 
     // Start every client's measured loop at the same point. Without this the
@@ -120,7 +120,7 @@ void runClient(int messages, const std::vector<uint8_t>& payload,
         const auto t0 = std::chrono::steady_clock::now();
         if (::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL) !=
             static_cast<ssize_t>(frame.size())) break;
-        if (!readExactly(fd, reply.data(), frame.size())) break;
+        if (!read_exactly(fd, reply.data(), frame.size())) break;
         const auto t1 = std::chrono::steady_clock::now();
         result->ns.push_back(static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
@@ -135,53 +135,53 @@ void runClient(int messages, const std::vector<uint8_t>& payload,
 
 int main(int argc, char** argv) {
     const int messages = argc > 1 ? std::atoi(argv[1]) : 2000;
-    gPayload.store(argc > 2 ? std::atoi(argv[2]) : 56);
+    g_payload.store(argc > 2 ? std::atoi(argv[2]) : 56);
     const int clients = argc > 3 ? std::atoi(argv[3]) : 1;
     const int reactors = argc > 4 ? std::atoi(argv[4]) : 1;
-    if (messages <= 0 || gPayload.load() <= 0 || clients <= 0 ||
+    if (messages <= 0 || g_payload.load() <= 0 || clients <= 0 ||
         reactors <= 0) {
         std::printf("usage: bench_send <messages> <payload> [clients] "
                     "[reactors]\n");
         return 2;
     }
 
-    MultiReactorServer::Config cfg;
-    cfg.bindAddr      = "127.0.0.1";
+    multi_reactor_server::config cfg;
+    cfg.bind_addr      = "127.0.0.1";
     cfg.port          = 0;
-    cfg.numReactors   = reactors;
-    cfg.tickMs        = 500;
-    cfg.idleTimeoutMs = 600000;
+    cfg.num_reactors   = reactors;
+    cfg.tick_ms        = 500;
+    cfg.idle_timeout_ms = 600000;
 
     // Same knob as bench_rss: the write buffer sizes the reply path, so it has
     // to move with it or the send numbers stop being comparable.
     if (const char* w = std::getenv("BENCH_WBUF_KB")) {
         const int kb = std::atoi(w);
         if (kb > 0) {
-            cfg.wbufCapacity    = static_cast<size_t>(kb) * 1024;
-            cfg.maxPendingBytes = cfg.wbufCapacity;
+            cfg.wbuf_capacity    = static_cast<size_t>(kb) * 1024;
+            cfg.max_pending_bytes = cfg.wbuf_capacity;
         }
     }
 
-    MultiReactorServer server(cfg);
-    gServer.store(&server);
+    multi_reactor_server server(cfg);
+    g_server.store(&server);
 
     // Echo: the point is to pay for a reply, not to compute one.
-    server.setMessageHandler([](uint64_t id, const uint8_t* p, size_t n) {
-        MultiReactorServer* s = gServer.load();
-        if (s) (void)s->sendTo(id, p, n);
+    server.set_message_handler([](uint64_t id, const uint8_t* p, size_t n) {
+        multi_reactor_server* s = g_server.load();
+        if (s) (void)s->send_to(id, p, n);
     });
     if (!server.start()) return 2;
 
-    const std::vector<uint8_t> payload(static_cast<size_t>(gPayload.load()),
+    const std::vector<uint8_t> payload(static_cast<size_t>(g_payload.load()),
                                        0x5a);
-    std::vector<ClientResult> results(static_cast<size_t>(clients));
+    std::vector<client_result> results(static_cast<size_t>(clients));
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
 
     std::vector<std::thread> threads;
     threads.reserve(static_cast<size_t>(clients));
     for (int i = 0; i < clients; ++i) {
-        threads.emplace_back(runClient, messages, std::cref(payload),
+        threads.emplace_back(run_client, messages, std::cref(payload),
                              server.port(), &ready, &go, &results[i]);
     }
     while (ready.load(std::memory_order_acquire) < clients)
@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
     std::printf("send messages=%zu payload=%d clients=%d reactors=%d "
                 "p50_us=%.1f p99_us=%.1f mean_us=%.1f msg_per_s=%.0f "
                 "wbuf=%zu\n",
-                ns.size(), gPayload.load(), clients, reactors, p50, p99,
-                mean, rate, cfg.wbufCapacity / 1024);
+                ns.size(), g_payload.load(), clients, reactors, p50, p99,
+                mean, rate, cfg.wbuf_capacity / 1024);
     return 0;
 }

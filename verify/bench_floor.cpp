@@ -29,17 +29,17 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    const int batchBytes = argc > 1 ? std::atoi(argv[1]) : 4096;
+    const int batch_bytes = argc > 1 ? std::atoi(argv[1]) : 4096;
     const int seconds    = argc > 2 ? std::atoi(argv[2]) : 3;
     // How much one recv() asks for. The server under test reads through a 16KB
     // stack buffer, so the interesting question is whether that alone explains
     // why a 64KB send is served at a third of the speed this loop manages.
-    const int recvBytes  = argc > 3 ? std::atoi(argv[3]) : 64 * 1024;
+    const int recv_bytes  = argc > 3 ? std::atoi(argv[3]) : 64 * 1024;
     // blocking | epoll. The server under test drives its sockets the other way:
     // non-blocking, level-triggered epoll, one recv loop per wakeup. Same bytes,
     // one more syscall per batch -- this is what that model costs, measured
     // without the header in the way.
-    const bool useEpoll = argc > 4 && std::strcmp(argv[4], "epoll") == 0;
+    const bool use_epoll = argc > 4 && std::strcmp(argv[4], "epoll") == 0;
 
     const int srv = ::socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) return 2;
@@ -63,9 +63,9 @@ int main(int argc, char** argv) {
     std::thread server([&] {
         const int c = ::accept(srv, nullptr, nullptr);
         if (c < 0) return;
-        std::vector<char> buf(static_cast<size_t>(recvBytes));
+        std::vector<char> buf(static_cast<size_t>(recv_bytes));
 
-        if (!useEpoll) {
+        if (!use_epoll) {
             while (!stop.load()) {
                 const ssize_t n = ::recv(c, buf.data(), buf.size(), 0);
                 if (n <= 0) break;
@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
             ::close(c);
             return;
         }
-        std::vector<char> payload(static_cast<size_t>(batchBytes), 0x5a);
+        std::vector<char> payload(static_cast<size_t>(batch_bytes), 0x5a);
         while (!stop.load()) {
             if (::send(c, payload.data(), payload.size(), MSG_NOSIGNAL) <= 0) break;
         }
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
 
     const double mbps = static_cast<double>(bytes.load()) / (1024.0 * 1024.0) /
                         static_cast<double>(seconds);
-    std::printf("floor batch=%d recv=%d mode=%s mb_per_s=%.1f\n", batchBytes,
-                recvBytes, useEpoll ? "epoll" : "blocking", mbps);
+    std::printf("floor batch=%d recv=%d mode=%s mb_per_s=%.1f\n", batch_bytes,
+                recv_bytes, use_epoll ? "epoll" : "blocking", mbps);
     return 0;
 }
