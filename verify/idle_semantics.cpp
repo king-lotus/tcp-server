@@ -9,12 +9,12 @@
 //                 large frame over a slow link is active and must be kept.
 //   - frames:     the deadline means "no complete frame arrived". That same peer
 //                 is idle for as long as the frame takes to arrive, and is closed
-//                 mid-transfer while bytesRecv is still climbing.
+//                 mid-transfer while bytes_recv is still climbing.
 //
-// The second one is what the file used to do: lastRecvMs was refreshed only on
-// the line in parseFrames() that consumes a complete frame, so bytes that had
+// The second one is what the file used to do: last_recv_ms was refreshed only on
+// the line in parse_frames() that consumes a complete frame, so bytes that had
 // arrived but had not completed a frame refreshed nothing. A 64KB frame on a
-// link slower than idleTimeoutMs was closed in the middle of itself.
+// link slower than idle_timeout_ms was closed in the middle of itself.
 //
 // Three peers, all at the same byte rate, on a 600ms deadline:
 //
@@ -25,6 +25,11 @@
 //   C. full-frames -- the same pieces, each its own complete frame.
 //
 // A and C must survive; B must not.
+//
+// D and E cover what happens after that decision. A half-frame that stops is
+// reclaimed by the idle clock. One that keeps sending is not silent, so it is
+// reclaimed by the separate frame_assembly_timeout_ms and counted as a
+// frame-assembly timeout, not an idle one.
 //
 // Build (Linux only):
 //   g++ -std=c++17 -Wall -Wextra -pthread verify/idle_semantics.cpp -o idle_semantics
@@ -49,70 +54,73 @@
 #include "harness.h"
 #include "tcp-server-mt.h"
 
-using industrial::FrameType;
-using industrial::MultiReactorServer;
+using industrial::frame_type;
+using industrial::multi_reactor_server;
 
 namespace {
 
 // 600ms idle, checked every 50ms: a transfer that keeps sending crosses the
 // deadline twice over the ~1.6s each case runs, so "the deadline did not fire"
 // cannot be explained by the tick simply not having come around yet.
-MultiReactorServer::Config idleConfig() {
-    MultiReactorServer::Config cfg;
-    cfg.bindAddr      = "127.0.0.1";
+multi_reactor_server::config idle_config() {
+    multi_reactor_server::config cfg;
+    cfg.bind_addr      = "127.0.0.1";
     cfg.port          = 0;   // kernel picks; the fixture reports it
-    cfg.numReactors   = 1;
-    cfg.tickMs        = 50;
-    cfg.idleTimeoutMs = 600;
-    cfg.closeLingerMs = 1000;
+    cfg.num_reactors   = 1;
+    cfg.tick_ms        = 50;
+    cfg.idle_timeout_ms = 600;
+    cfg.close_linger_ms = 1000;
+    // This suite is about the idle clock. Keep the separate frame-assembly
+    // deadline far away so case E can exercise it on its own.
+    cfg.frame_assembly_timeout_ms = 600000;
     return cfg;
 }
 
 // True once the server's FIN has reached the peer.
-bool hungUp(int fd) {
+bool hung_up(int fd) {
     uint8_t probe[64];
     const ssize_t r = ::recv(fd, probe, sizeof(probe), MSG_DONTWAIT);
     return r == 0;
 }
 
-// One frame declared as kTotal bytes, delivered kChunk bytes every 150ms and
+// One frame declared as k_total bytes, delivered k_chunk bytes every 150ms and
 // never finished: everything a slow link does to a large frame, with the peer
 // never once going quiet.
-void caseHalfFrame() {
+void case_half_frame() {
     std::printf("A. half-frame: one frame declared, dribbled, never completed\n");
-    harness::Fixture server(idleConfig(),
+    harness::fixture server(idle_config(),
                             [](uint64_t, const uint8_t*, size_t) {});
     if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    harness::Peer peer;
+    harness::peer peer;
     if (!peer.connect(server.port())) {
         harness::expect(false, "client connected");
         return;
     }
     const int fd = peer.fd();
 
-    const size_t kChunk = 2000;
-    const size_t kTotal = 14000;
+    const size_t k_chunk = 2000;
+    const size_t k_total = 14000;
     uint8_t hdr[industrial::FRAME_HEADER_SIZE];
-    industrial::writeFrameHeader(hdr, FrameType::DATA, kTotal);
-    if (!peer.sendRaw(hdr, sizeof(hdr))) {
+    industrial::write_frame_header(hdr, frame_type::DATA, k_total);
+    if (!peer.send_raw(hdr, sizeof(hdr))) {
         harness::expect(false, "header sent");
         return;
     }
 
     bool   fin   = false;
     size_t sent  = 0;
-    for (int i = 0; i < static_cast<int>(kTotal / kChunk); ++i) {
+    for (int i = 0; i < static_cast<int>(k_total / k_chunk); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        std::vector<uint8_t> body(kChunk, 'x');
-        if (!peer.sendRaw(body.data(), body.size())) break;
-        sent += kChunk;
-        if (hungUp(fd)) { fin = true; break; }
+        std::vector<uint8_t> body(k_chunk, 'x');
+        if (!peer.send_raw(body.data(), body.size())) break;
+        sent += k_chunk;
+        if (hung_up(fd)) { fin = true; break; }
     }
 
-    const unsigned long long recv = server.stats().bytesRecv.load();
-    const unsigned long long idle = server.stats().idleTimeouts.load();
-    std::printf("      sent %zu B, server received %llu B, idleTimeouts %llu\n",
+    const unsigned long long recv = server.stats().bytes_recv.load();
+    const unsigned long long idle = server.stats().idle_timeouts.load();
+    std::printf("      sent %zu B, server received %llu B, idle_timeouts %llu\n",
                 sent, recv, idle);
 
     harness::expect(recv > 0, "the bytes arrived (the peer was not silent)");
@@ -126,13 +134,13 @@ void caseHalfFrame() {
 
 // The control: a peer that really is silent still has to be reclaimed, or the
 // fix for the case above is just the timeout being switched off.
-void caseSilent() {
+void case_silent() {
     std::printf("B. silent: connected, then nothing at all\n");
-    harness::Fixture server(idleConfig(),
+    harness::fixture server(idle_config(),
                             [](uint64_t, const uint8_t*, size_t) {});
     if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    harness::Peer peer;
+    harness::peer peer;
     if (!peer.connect(server.port())) {
         harness::expect(false, "client connected");
         return;
@@ -142,11 +150,11 @@ void caseSilent() {
     bool fin = false;
     for (int i = 0; i < 150 && !fin; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        fin = hungUp(fd);
+        fin = hung_up(fd);
     }
 
-    const unsigned long long idle = server.stats().idleTimeouts.load();
-    std::printf("      idleTimeouts %llu, server FIN'd: %s\n", idle, fin ? "yes" : "no");
+    const unsigned long long idle = server.stats().idle_timeouts.load();
+    std::printf("      idle_timeouts %llu, server FIN'd: %s\n", idle, fin ? "yes" : "no");
     harness::expect(idle >= 1, "a silent peer is still reclaimed");
     harness::expect(fin, "and the peer sees it");
 
@@ -156,36 +164,36 @@ void caseSilent() {
 // Same bytes, same rate, each piece a complete frame: what the clock used to
 // require, kept here so narrowing it to bytes cannot be mistaken for the clock
 // having stopped working.
-void caseFullFrames() {
+void case_full_frames() {
     std::printf("C. full-frames: the same pieces, each a complete frame\n");
     std::atomic<long> frames{0};
-    harness::Fixture server(
-        idleConfig(),
+    harness::fixture server(
+        idle_config(),
         [&frames](uint64_t, const uint8_t*, size_t) { frames.fetch_add(1); });
     if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    harness::Peer peer;
+    harness::peer peer;
     if (!peer.connect(server.port())) {
         harness::expect(false, "client connected");
         return;
     }
     const int fd = peer.fd();
 
-    const size_t kChunk = 2000;
+    const size_t k_chunk = 2000;
     bool   fin = false;
     size_t sent = 0;
     for (int i = 0; i < 7; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        std::vector<uint8_t> f(industrial::FRAME_HEADER_SIZE + kChunk);
-        industrial::encodeFrameInto(f.data(), FrameType::DATA, nullptr, kChunk);
-        std::memset(f.data() + industrial::FRAME_HEADER_SIZE, 'x', kChunk);
-        if (!peer.sendRaw(f.data(), f.size())) break;
+        std::vector<uint8_t> f(industrial::FRAME_HEADER_SIZE + k_chunk);
+        industrial::encode_frame_into(f.data(), frame_type::DATA, nullptr, k_chunk);
+        std::memset(f.data() + industrial::FRAME_HEADER_SIZE, 'x', k_chunk);
+        if (!peer.send_raw(f.data(), f.size())) break;
         sent += f.size();
-        if (hungUp(fd)) { fin = true; break; }
+        if (hung_up(fd)) { fin = true; break; }
     }
 
-    const unsigned long long idle = server.stats().idleTimeouts.load();
-    std::printf("      sent %zu B in %ld frames, idleTimeouts %llu\n",
+    const unsigned long long idle = server.stats().idle_timeouts.load();
+    std::printf("      sent %zu B in %ld frames, idle_timeouts %llu\n",
                 sent, frames.load(), idle);
     harness::expect(!fin,
                     "a peer sending complete frames is not closed for idling");
@@ -207,24 +215,24 @@ void caseFullFrames() {
 // the instant it stops, it is a silent peer again.
 //
 // So: send a legal maximum frame all but one byte of it, then stop talking.
-void caseHalfFrameThenSilent() {
+void case_half_frame_then_silent() {
     std::printf("D. half-frame that stops mid-frame: is it reclaimed then?\n");
-    harness::Fixture server(idleConfig(),
+    harness::fixture server(idle_config(),
                             [](uint64_t, const uint8_t*, size_t) {});
     if (!server.started()) { harness::expect(false, "start() ok"); return; }
 
-    harness::Peer peer;
+    harness::peer peer;
     if (!peer.connect(server.port())) {
         harness::expect(false, "client connected");
         return;
     }
     const int fd = peer.fd();
 
-    const size_t kChunk = 2000;
-    const size_t kTotal = industrial::MAX_FRAME_PAYLOAD;
+    const size_t k_chunk = 2000;
+    const size_t k_total = industrial::MAX_FRAME_PAYLOAD;
     uint8_t hdr[industrial::FRAME_HEADER_SIZE];
-    industrial::writeFrameHeader(hdr, FrameType::DATA, kTotal);
-    if (!peer.sendRaw(hdr, sizeof(hdr))) {
+    industrial::write_frame_header(hdr, frame_type::DATA, k_total);
+    if (!peer.send_raw(hdr, sizeof(hdr))) {
         harness::expect(false, "header sent");
         return;
     }
@@ -232,27 +240,27 @@ void caseHalfFrameThenSilent() {
     // All but the last byte, delivered fast enough that the clock never expires
     // while the peer is still active.
     size_t sent = 0;
-    while (sent + kChunk < kTotal) {
-        std::vector<uint8_t> body(kChunk, 'x');
-        if (!peer.sendRaw(body.data(), body.size())) break;
-        sent += kChunk;
+    while (sent + k_chunk < k_total) {
+        std::vector<uint8_t> body(k_chunk, 'x');
+        if (!peer.send_raw(body.data(), body.size())) break;
+        sent += k_chunk;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    const unsigned long long idleWhileSending = server.stats().idleTimeouts.load();
+    const unsigned long long idle_while_sending = server.stats().idle_timeouts.load();
 
     // Now silent, inside a frame, for well past the deadline.
     bool fin = false;
     for (int i = 0; i < 150 && !fin; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        fin = hungUp(fd);
+        fin = hung_up(fd);
     }
 
-    const unsigned long long idle = server.stats().idleTimeouts.load();
-    std::printf("      sent %zu of %zu bytes, then stopped; idleTimeouts %llu "
+    const unsigned long long idle = server.stats().idle_timeouts.load();
+    std::printf("      sent %zu of %zu bytes, then stopped; idle_timeouts %llu "
                 "(was %llu while sending), FIN'd: %s\n",
-                sent, kTotal, idle, idleWhileSending, fin ? "yes" : "no");
+                sent, k_total, idle, idle_while_sending, fin ? "yes" : "no");
 
-    harness::expect(idleWhileSending == 0,
+    harness::expect(idle_while_sending == 0,
                     "still not reclaimed while it was sending");
     harness::expect(fin, "reclaimed once it went silent, even mid-frame");
     harness::expect(idle >= 1,
@@ -261,16 +269,73 @@ void caseHalfFrameThenSilent() {
     peer.close();
 }
 
+// A. and D. are about silence. A peer that keeps sending bytes but never
+// completes a frame is not silent, so it needs its own deadline: this case
+// makes that deadline the short one and confirms the close is counted as a
+// frame-assembly timeout, not an idle one.
+multi_reactor_server::config stuck_frame_config() {
+    multi_reactor_server::config cfg = idle_config();
+    cfg.idle_timeout_ms = 5000;             // the frame deadline must win
+    cfg.frame_assembly_timeout_ms = 300;     // not the 5 x idle default
+    return cfg;
+}
+
+void case_stuck_frame() {
+    std::printf("E. stuck frame: bytes keep arriving, frame never completes\n");
+    harness::fixture server(stuck_frame_config(),
+                            [](uint64_t, const uint8_t*, size_t) {});
+    if (!server.started()) { harness::expect(false, "start() ok"); return; }
+
+    harness::peer peer;
+    if (!peer.connect(server.port())) {
+        harness::expect(false, "client connected");
+        return;
+    }
+
+    const size_t k_total = 2000;
+    uint8_t hdr[industrial::FRAME_HEADER_SIZE];
+    industrial::write_frame_header(hdr, frame_type::DATA, k_total);
+    if (!peer.send_raw(hdr, sizeof hdr)) {
+        harness::expect(false, "header sent");
+        return;
+    }
+
+    // One byte every 50ms: the peer is demonstrably alive, but the declared
+    // frame cannot finish inside 300ms. Send until the far side hangs up.
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        uint8_t b = static_cast<uint8_t>(120);
+        if (!peer.send_raw(&b, 1)) break;
+    }
+
+    const harness::status st = peer.expect_close(harness::close_kind::any, 1000);
+    const unsigned long long frame_timeouts =
+        server.stats().frame_assembly_timeouts.load();
+    const unsigned long long idle = server.stats().idle_timeouts.load();
+    std::printf("      frame_assembly_timeouts %llu, idle_timeouts %llu\n",
+                frame_timeouts, idle);
+
+    harness::expect(static_cast<bool>(st),
+                    "the stuck frame was closed", st.why);
+    harness::expect(frame_timeouts >= 1,
+                    "counted as a frame assembly timeout");
+    harness::expect(idle == 0, "not as an idle timeout");
+
+    peer.close();
+}
+
 }  // namespace
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("idleTimeoutMs=600, tickMs=50; every case runs ~1.6s at the same\n"
-                "byte rate. Only whether the bytes form frames differs.\n\n");
-    caseHalfFrame();
-    caseSilent();
-    caseFullFrames();
-    caseHalfFrameThenSilent();
+    std::printf("idle_timeout_ms=600, tick_ms=50; cases A-D run ~1.6s at the\n"
+                "same byte rate. Case E sets a 300ms frame-assembly "
+                "deadline.\n\n");
+    case_half_frame();
+    case_silent();
+    case_full_frames();
+    case_half_frame_then_silent();
+    case_stuck_frame();
     std::printf("\n");
     return harness::finish();
 }

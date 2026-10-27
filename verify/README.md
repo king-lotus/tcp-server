@@ -9,7 +9,7 @@ bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加�
 
 ## 能验证什么
 
-- **运行时行为**：关闭语义、背压、空闲判定、故障注入、`sendTo` 的每一种回答
+- **运行时行为**：关闭语义、背压、空闲判定、故障注入、`send_to` 的每一种回答
 - race 与内存错误：ASan + UBSan、TSan 各跑一整套
 - 头文件被多个翻译单元包含时的 ODR/重复定义问题
 
@@ -41,17 +41,17 @@ g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semant
 CS_REACTORS=1 ./close_semantics     # 所有客户端落到同一个 reactor
 ```
 
-`CS_REACTORS` 不是可有可无的旋钮：`pickReactor()` 是轮转分配，多于一个 worker 时，**只发生在某一个
+`CS_REACTORS` 不是可有可无的旋钮：`pick_reactor()` 是轮转分配，多于一个 worker 时，**只发生在某一个
 worker 上的故障会被平均掉** —— 两个 reactor 时表现为"每隔一条连接死一次"。
 
 | 用例 | 断言 |
 |------|------|
-| A | `sendTo` 应答 + `closeConnection`（"先答再挂"）→ 应答完整收到，结束于 FIN 而非 RST |
+| A | `send_to` 应答 + `close_connection`（"先答再挂"）→ 应答完整收到，结束于 FIN 而非 RST |
 | B | 关闭时服务端尚有未读请求 → 不得退化为 RST，且请求不被静默丢弃 |
-| C | 坏 magic → 对端观察到 RST，`parseErrors` / `aborted` 计数 |
+| C | 坏 magic → 对端观察到 RST，`parse_errors` / `aborted` 计数 |
 | D | `accepted == closed`，无连接泄漏 |
 
-> **首轮跑就抓了个 P0。** `accepted=0`、所有 `connect()` 直接失败：accept 线程在 `Running` 发布之前
+> **首轮跑就抓了个 P0。** `accepted=0`、所有 `connect()` 直接失败：accept 线程在 `running` 发布之前
 > 就判定自己该退出，循环一次都没进，顺手把监听套接字关了（CODE-REVIEW.md 的 P0-3）。静态审查没看出来，
 > 因为它取决于调度器先唤谁 —— 只有真机跑才会露头。这条路值得维护。
 >
@@ -59,7 +59,7 @@ worker 上的故障会被平均掉** —— 两个 reactor 时表现为"每隔�
 
 ## `fault_injection.cpp` —— 让 `INDUSTRIAL_TCP_TESTING` 有消费者
 
-`failWorkerForTest` / `failAcceptForTest` 是为"worker 从异常里退出以后该怎么办"准备的，
+`fail_worker_for_test` / `fail_accept_for_test` 是为"worker 从异常里退出以后该怎么办"准备的，
 但在补这个文件之前，**没有任何代码翻动它们**：两个开关，零个消费者。
 没人去扳的开关，和被注释掉的断言一样，都不是测试。
 
@@ -72,7 +72,7 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 | 用例 | 断言 |
 |------|------|
-| A | reactor 异常退出 → `isRunning()` 转假、`reactorFailures` 计数、`stop()` 仍能正常返回 |
+| A | reactor 异常退出 → `is_running()` 转假、`reactor_failures` 计数、`stop()` 仍能正常返回 |
 | B | accept 线程异常退出 → 同上，且它把持的监听套接字被真正释放 |
 | C | 12 轮「启动 → 注入故障 → stop → 再启动」→ 每次都留下一个还能重新起来的服务器 |
 
@@ -82,42 +82,43 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 ## `backpressure.cpp` —— 一次广播排得下吗
 
 `kMaxPendingTasks` 曾经是每 reactor 恒定的 8192。它是一个队列上限，但服务器长大之后就变成了
-**扇出上限**：一次广播填满队列，之后的全被计入 `queueDrops`，而这个计数向运维说的是"对端没收"。
+**扇出上限**：一次广播填满队列，之后的全被计入 `queue_drops`，而这个计数向运维说的是"对端没收"。
 
-用例做两件事来保证自己量到的是那一条机制：把 `maxPendingBytes` 和 `wbufCapacity` 都抬到不可达
+用例做两件事来保证自己量到的是那一条机制：把 `max_pending_bytes` 和 `wbuf_capacity` 都抬到不可达
 （三条拒帧路径里只有被测量的那条能触发），再把 worker 扣在 open 回调里（队列只有在没人排空它时
 才会填满）。修复时它是 **红 → 绿** 的：
 
 ```
-修复前   queued 8192 of 9000 (808 refused), queueDrops=808
-修复后   queued 9000 of 9000 (0 refused),  queueDrops=0
+修复前   queued 8192 of 9000 (808 refused), queue_drops=808
+修复后   queued 9000 of 9000 (0 refused),  queue_drops=0
 ```
 
 8192 一帧不差 —— 卡住的位置正好是那条常量。它是故意先红着提交的（`f8a6523`）。
 
-## `send_results.cpp` —— sendTo 的五种回答，外加两个计数器
+## `send_results.cpp` —— send_to 的五种回答、两个计数器，外加 offload
 
-`sendTo()` 是应用往连接上放字节的唯一入口，`SendResult` 是它能拿回的全部信息。但第六轮之前，
-四个失败态（`NotConnected` / `TooLarge` / `Overloaded` / `InvalidArgument`）**整个 verify/ 里没有任何
+`send_to()` 是应用往连接上放字节的唯一入口，`send_result` 是它能拿回的全部信息。但第六轮之前，
+四个失败态（`not_connected` / `too_large` / `overloaded` / `invalid_argument`）**整个 verify/ 里没有任何
 一条断言碰过**。"正确但无人守护"是最糟的一种状态：任何一次编辑都能改掉它，而所有配置仍然全绿。
 
 覆盖的三件事：
 
 | 用例 | 断言 |
 |------|------|
-| 五种回答 | 每个值各一条，且都落在真正产生它的状态上；`Overloaded` 用"帧大于 32 字节上限"达成，不去和排空赛跑 |
-| 关闭中发送 | `Closed`，且不留 `queueDrops` / `bytesDropped`（R6-3） |
-| `acceptErrors` | 子进程把 `RLIMIT_NOFILE` 的**硬**限制压到 20，父进程连 40 个peer 撑爆它；拒绝的 accept 必须被计数 |
+| 五种回答 | 每个值各一条，且都落在真正产生它的状态上；`overloaded` 用"帧大于 32 字节上限"达成，不去和排空赛跑 |
+| 关闭中发送 | `closed`，且不留 `queue_drops` / `bytes_dropped`（R6-3） |
+| `accept_errors` | 子进程把 `RLIMIT_NOFILE` 的**硬**限制压到 20，父进程连 40 个peer 撑爆它；拒绝的 accept 必须被计数 |
+| handler offload | 两条同连接请求由 offload 任务返回，顺序与到达一致；任务睡眠期间另一连接的 PING 仍被 reactor 及时应答 |
 
-`acceptErrors` 那条必须 fork：描述符上限是**每进程**的，得让"耗尽的一方"和"不停敲门的一方"是两个进程。
+`accept_errors` 那条必须 fork：描述符上限是**每进程**的，得让"耗尽的一方"和"不停敲门的一方"是两个进程。
 压的是硬限制而不是软限制——`start()` 会把软限制往硬限制抬，抬得上去的 ceiling 不是 ceiling。
 
-`hup/err` 分支（`EPOLLHUP|EPOLLERR` → `closeConn(c, "hup/err", false)`）同样补了用例，但它是
+`hup/err` 分支（`EPOLLHUP|EPOLLERR` → `close_conn(c, "hup/err", false)`）同样补了用例，但它是
 **先问后测**：先用一对裸 socket 问内核"被中止的连接在 epoll 上是否可见"。早期开发机（4.4 内核）
 把它报成干净 FIN，`EPOLLHUP|EPOLLERR` 永远不会被投递，于是该分支在这里**无法到达**，用例打印
 `[SKIP]` 并说明它问了什么。**跳过不等于通过**；换到真内核上那条断言自动生效。
 
-这与 C 用例的 `kernelHonoursZeroLinger()` 是同一个规矩：先确定机器能不能造出这个状态，
+这与 C 用例的 `kernel_honours_zero_linger()` 是同一个规矩：先确定机器能不能造出这个状态，
 再决定断言还是跳过。不这么做的话，断言的对象就从头文件变成了宿主机。
 
 ## 七种假阴性（按发现顺序）
@@ -135,15 +136,15 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 3. **流水线本身没在编译** → 宿主 shell 的 PATH 被上层包装脚本弄坏（`ls` / `tr` / `head` 全部
    command not found）时输出为空，而"输出为空"和"零诊断"长得一样。做法：只要调用方式变了、
    或距上次成功过了很久，先编译一个故意写错的**对照文件**，确认它报出精确行号且 exit 1。
-4. **测试抓错了连接。** B 用例用 `connectionIds().front()` 取 id，而当时 `conns_` 里有一条本该
+4. **测试抓错了连接。** B 用例用 `connection_ids().front()` 取 id，而当时 `conns_` 里有一条本该
    消失的连接 —— 于是它关了**错误**的套接字，下面每条断言都在对一个没人测试的连接通过。
    本该抓到丢失应答的用例，正在丢应答的同时报告成功（P0-6 之所以藏了那么久）。现在：
    记录连接前的 id 集合，只认可连接之后新出现的那个。
-5. **把"干净的 FIN"当成"没有 RST"。** 旧版 `readToEnd` 只有一个 `reset` 布尔量，
+5. **把"干净的 FIN"当成"没有 RST"。** 旧版 `read_to_end` 只有一个 `reset` 布尔量，
    FIN、超时（什么都没到）、无效描述符全都折叠成 `false`。于是"服务端没中止"和
    "服务端中止了但内核拒绝发 RST"给出同一个答案。现在返回三态并打印。
-6. **时序决定成败。** B 用例先写两个请求再立刻 `closeConnection`，请求到达与否取决于网络栈，
-   约五把里输一把。现在等 `bytesRecv` —— 把用例锚定到它真正要测的那一刻（字节已抵达、
+6. **时序决定成败。** B 用例先写两个请求再立刻 `close_connection`，请求到达与否取决于网络栈，
+   约五把里输一把。现在等 `bytes_recv` —— 把用例锚定到它真正要测的那一刻（字节已抵达、
    reactor 是否读过仍未定），而不是把断言放松。
 7. **退出码没有过桥。** 本套件的每条结论都读自 `$?`。早期这套件是从 Windows 把内联字符串
    交给 Linux 执行的（`bash -lc '...'`），那时 `$?` **恒为 0**：`(exit 3)`、一个编译出来
@@ -175,8 +176,8 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 早期开发机的内核（4.4）**不把 `SO_LINGER{on,0}` 变成 RST**：用一对裸 socket
 验证过，设了零 linger 再 close，对端收到的是干净 FIN。这是机器的性质，不是服务端的。
 
-所以 C 用例会先自己问内核一次（`kernelHonoursZeroLinger()`），把结论打印出来：支持就断言 RST，
-不支持就打印 `[SKIP]` 并改为断言服务端侧的证据（`parseErrors` / `aborted`）。**跳过会写明理由，
+所以 C 用例会先自己问内核一次（`kernel_honours_zero_linger()`），把结论打印出来：支持就断言 RST，
+不支持就打印 `[SKIP]` 并改为断言服务端侧的证据（`parse_errors` / `aborted`）。**跳过会写明理由，
 不等于通过。** 换到真正的 Linux 内核上，那条断言自动恢复生效。
 
 ## 一个概率型缺陷怎么测：case F 与插桩工具
@@ -205,8 +206,8 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 前三个假设都是错的，trace 一行就给出答案。**但注意 tracing 会改变被测窗口的时序**，所以
 A/B 对照必须用两份都未插桩的构建——`loop_close_race.sh` 就是这么做的。
 
-可复用判据：判断"这条连接还欠字节吗"要看 `pendingBytes > 0`（已占额度、还没进 wbuf），
-而不是 `wbuf.empty()`。handler 的应答是 `submitSend` 排的任务，从不直写 wbuf。
+可复用判据：判断"这条连接还欠字节吗"要看 `pending_bytes > 0`（已占额度、还没进 wbuf），
+而不是 `wbuf.empty()`。handler 的应答是 `submit_send` 排的任务，从不直写 wbuf。
 
 ## 怎么给一个"不会发生的危险"做证据
 
@@ -215,9 +216,9 @@ A/B 对照必须用两份都未插桩的构建——`loop_close_race.sh` 就是�
 
 **（一）注入：把不变量打破，让危险变成真的。**
 
-`doTick` 的迭代安全原本依赖"若 `finSent` 则必 `closing`"这条跨 5 个函数、没有注释也没有断言的
-不变量。`verify/evidence/inject_fin_without_closing.py` 把 `finSent && !closing` 的状态直接摆到
-`doTick` 眼前——这正是任何一次只改了其中一处、漏了另一处的重构会造出来的样子。
+`do_tick` 的迭代安全原本依赖"若 `fin_sent` 则必 `closing`"这条跨 5 个函数、没有注释也没有断言的
+不变量。`verify/evidence/inject_fin_without_closing.py` 把 `fin_sent && !closing` 的状态直接摆到
+`do_tick` 眼前——这正是任何一次只改了其中一处、漏了另一处的重构会造出来的样子。
 
 ```
 bash verify/evidence/check_doTick_invariant.sh f27cfc1^
@@ -225,15 +226,15 @@ bash verify/evidence/check_doTick_invariant.sh f27cfc1^
    after   accepted=24 closed=24 stillOpen=0       rc=0
 ```
 
-两侧都注入，唯一变量是被测的 `doTick`。**必须显式给 before 参数**：默认 HEAD 的话，修复一落地
+两侧都注入，唯一变量是被测的 `do_tick`。**必须显式给 before 参数**：默认 HEAD 的话，修复一落地
 脚本就在拿修复跟修复自己比较，还打印一个自信满满的结论。
 
 **（二）计数：让"不可达"保持可测量，而不是停留在判断。**
 
-`ServerStats::epipeWrites` 数 drain 撞上 EPIPE 的次数。目前五种"让对端带着未读数据消失"的构造
+`server_stats::epipe_writes` 数 drain 撞上 EPIPE 的次数。目前五种"让对端带着未读数据消失"的构造
 （`verify/evidence/probe_epipe.cpp`：SO_LINGER 0、直接 close、带未读数据 close、先半关闭…）
 实测都是 0。这不等于不可达，只等于"没触发成功"——计数器的意义就是有朝一日它动起来时，能让那个
 差别被看见，而不是等到有人报告"连接不释放"。
 
 注意本机内核把 `SO_LINGER{on,0}` 变成 FIN 而不是 RST（`verify/evidence/so_linger_probe.cpp`），
-所以想在这里造真 RST 比看起来困难；`eofReads=1` 则说明五种场景里对端 FIN 都被正常识别，没有读自旋。
+所以想在这里造真 RST 比看起来困难；`eof_reads=1` 则说明五种场景里对端 FIN 都被正常识别，没有读自旋。
