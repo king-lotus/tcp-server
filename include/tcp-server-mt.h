@@ -621,8 +621,6 @@ class SubReactor {
     struct FinishPeerClosedTask { uint64_t id = 0; };
     struct DrainInputTask { uint64_t id = 0; };
     struct ParkCloseTask { uint64_t id = 0; };
-    // kTaskDispatch is indexed by the alternative index; keep this order in
-    // sync if a task type is added or reordered.
     using Task = std::variant<std::unique_ptr<NewConnTask>, SendTask,
                               CloseTask, FinishPeerClosedTask,
                               DrainInputTask, ParkCloseTask>;
@@ -634,14 +632,24 @@ class SubReactor {
     void handleTask(DrainInputTask& task) noexcept;
     void handleTask(ParkCloseTask& task) noexcept;
     using TaskDispatch = void (*)(SubReactor*, Task&) noexcept;
+    using TaskDispatchTable =
+        std::array<TaskDispatch, std::variant_size_v<Task>>;
     template <size_t I>
     static void dispatchTask(SubReactor* self, Task& task) noexcept {
         self->handleTask(std::get<I>(task));
     }
-    static constexpr std::array<TaskDispatch, 6> kTaskDispatch = {
-        &dispatchTask<0>, &dispatchTask<1>, &dispatchTask<2>,
-        &dispatchTask<3>, &dispatchTask<4>, &dispatchTask<5>,
-    };
+    // Built from Task's alternative list rather than written out by hand: a
+    // task type without a handleTask overload fails to compile, and a missing
+    // or reordered slot cannot happen.
+    template <size_t... I>
+    static constexpr std::array<TaskDispatch, sizeof...(I)>
+    makeTaskDispatch(std::index_sequence<I...>) noexcept {
+        return std::array<TaskDispatch, sizeof...(I)>{
+            {&dispatchTask<I>...}};
+    }
+    // Defined after the class: GCC will not instantiate this member-function
+    // template from an in-class initializer.
+    static const TaskDispatchTable kTaskDispatch;
     void cleanup() noexcept;
     // Publish the per-reactor traffic counters to the shared stats, then
     // reset them. Called once per loop iteration and once on loop exit, so
@@ -711,6 +719,13 @@ class SubReactor {
 
     std::vector<uint8_t> frameScratch_;
 };
+
+// Defined after the class: GCC will not instantiate a member-function
+// template from an in-class initializer. Inline so every translation unit
+// that includes the header shares one definition.
+inline constexpr SubReactor::TaskDispatchTable SubReactor::kTaskDispatch = (
+    SubReactor::makeTaskDispatch(std::make_index_sequence<
+        std::variant_size_v<SubReactor::Task>>{}));
 
 // ==================== MultiReactorServer ====================
 class MultiReactorServer {

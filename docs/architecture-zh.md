@@ -258,7 +258,8 @@ close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf �
 非 owner 队列路径的 submission 屏障和连接表按 `connId` 分成 16 个 shard：发送/
 关闭只锁自己的 shard，`stop()` 一次性取全部 shard 把在途调用排空。队列用 typed
 task（variant）：Send/Close/延迟任务内联，新连接任务用 `unique_ptr`（每连接
-一次），因此每帧不再分配 `std::function`；分派按 variant index 查
+一次），因此每帧不再分配 `std::function`；分派表由 variant 的 alternative 列表
+在编译期生成（`index_sequence`），运行时仍按 variant index 查
 function-pointer table。发送仍分配 frame vector，owner 快路径两者都不分配。
 
 `SendResult` 的语义：
@@ -682,8 +683,9 @@ python3 -m cpplint include/tcp-server-mt.h
 - typed task 与 `std::function` 的 10 次 A/B：1/1 与 2/2 基本持平或略好
   （2/2 130.8k vs 118.6k/s），4/4 在噪声内偏慢（102k vs 110k/s）；主要收益是
   去掉每帧 `std::function` 分配，不是延迟。
-- typed task 的分派用 function-pointer table；与 switch 的 10 次 A/B 基本持平或
-  略好（4/4 108.4k vs 104.5k/s，p99 77.6 vs 81.7us）。
+- typed task 的分派用 function-pointer table（由 variant 的 alternative 列表在
+  编译期生成）；与 switch 的 10 次 A/B 基本持平或略好（4/4 108.4k vs
+  104.5k/s，p99 77.6 vs 81.7us）。
 - 读路径已经不是瓶颈；剩余差异主要在 kernel 和测试客户端。
 
 ---

@@ -134,7 +134,7 @@ shrinking; that one is open.
 ## Layout
 
 ```
-include/tcp-server-mt.h   the only deliverable, 3414 lines
+include/tcp-server-mt.h   the only deliverable, 3429 lines
 verify/                   runtime suites, the peer harness, one-off probes
 docs/testing.md           how a suite is written, and how the harness is tested
 docs/review/              eight rounds of review, with an index
