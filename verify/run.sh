@@ -172,10 +172,10 @@ cat <<EOF
  Reading the output:
   - close_semantics prints [phase] lines that dump every counter. Read them as
     deltas: accepted/rejected says whether the accept loop handed the connection
-    over, queueDrops says whether a reactor refused the task, epollCtlErrors says
-    whether it refused the descriptor, and reactorFailures says whether the
+    over, queue_drops says whether a reactor refused the task, epoll_ctl_errors says
+    whether it refused the descriptor, and reactor_failures says whether the
     worker is alive at all. From the client side all four look identical.
-  - CS_REACTORS=1 matters because pickReactor() hands connections out
+  - CS_REACTORS=1 matters because pick_reactor() hands connections out
     round-robin: with several workers a fault that belongs to one of them gets
     averaged away.
   - idle_semantics asks what "idle" is measured in, and answers it with three
@@ -185,19 +185,19 @@ cat <<EOF
     measuring frames instead of bytes.
   - ping_pong covers the read path's most conditional branch, which no case had
     executed at all: PING on a healthy connection, and PING in flight with a
-    close. It asserts the PONG is counted (bytesSent == 8 per PONG, the header
+    close. It asserts the PONG is counted (bytes_sent == 8 per PONG, the header
     size) and that one past a close request is dropped rather than answered
     over the FIN.
-  - send_results asks what sendTo() can say back: one assertion per SendResult
+  - send_results asks what send_to() can say back: one assertion per send_result
     value, because four of the five had none anywhere in the suite and a correct
-    unguarded branch is free to change. Overloaded is reached by a frame larger
+    unguarded branch is free to change. overloaded is reached by a frame larger
     than a 32-byte ceiling rather than by racing the drain. It also counts
-    acceptErrors in a forked child whose descriptor ceiling is below the number
+    accept_errors in a forked child whose descriptor ceiling is below the number
     of peers knocking -- the one accept failure that is predictable at startup
     and leaves no other symptom.
   - reactor_spread asks the one thing no other suite asked: which reactor owns a
     connection. Eight connections over four reactors have to be handled by four
-    distinct threads -- that is pickReactor()'s round-robin, and an
+    distinct threads -- that is pick_reactor()'s round-robin, and an
     implementation that always returned the first reactor leaves every other
     suite green. It runs twice, at four reactors and at two, so the assertion is
     shown to follow the configuration rather than a constant in the test.

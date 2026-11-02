@@ -1,14 +1,14 @@
-// verify/config_budget.cpp -- what a default Config costs, and what it must
+// verify/config_budget.cpp -- what a default config costs, and what it must
 // still be able to do.
 //
 // The write buffer is allocated when a connection is accepted, so
-// `wbufCapacity` is what decides whether the default `maxConnections = 10000`
+// `wbuf_capacity` is what decides whether the default `max_connections = 10000`
 // fits in RAM: 256KB bought 324.7KB/conn, one maximum frame buys 128.8KB.
 // Nothing else in this directory notices either number, because every suite
 // that cares sets the value explicitly -- backpressure raises both to 8MB. So
 // this is the case that notices.
 //
-// The upper bound is a memory budget. The lower bound is not: sendTo() refuses
+// The upper bound is a memory budget. The lower bound is not: send_to() refuses
 // a frame that does not fit in wbuf, so a buffer smaller than MAX_FRAME_SIZE
 // makes the largest legal reply impossible to write at all -- and 64 * 1024, a
 // number that reads as "64KB", is 8 bytes too small. That is how this case came
@@ -29,11 +29,11 @@
 
 #include "harness.h"
 
-using industrial::MultiReactorServer;
+using industrial::multi_reactor_server;
 
 namespace {
 
-long rssKb() {
+long rss_kb() {
     FILE* f = std::fopen("/proc/self/status", "r");
     if (!f) return -1;
     char line[256];
@@ -48,49 +48,49 @@ long rssKb() {
 }  // namespace
 
 int main() {
-    MultiReactorServer::Config cfg;
+    multi_reactor_server::config cfg;
     char detail[192];
 
-    const size_t frameCeiling = industrial::MAX_FRAME_SIZE;
+    const size_t frame_ceiling = industrial::MAX_FRAME_SIZE;
 
-    std::printf("== what a default Config promises ==\n");
+    std::printf("== what a default config promises ==\n");
 
     std::snprintf(detail, sizeof detail, "%zu bytes, one maximum frame is %zu",
-                  cfg.wbufCapacity, frameCeiling);
-    harness::expect(cfg.wbufCapacity >= frameCeiling,
-          "wbufCapacity can hold the largest legal frame", detail);
+                  cfg.wbuf_capacity, frame_ceiling);
+    harness::expect(cfg.wbuf_capacity >= frame_ceiling,
+          "wbuf_capacity can hold the largest legal frame", detail);
 
-    // 128KB per connection is 1.28GB at the default maxConnections before any
+    // 128KB per connection is 1.28GB at the default max_connections before any
     // per-connection struct, so a default above this is a memory regression.
     std::snprintf(detail, sizeof detail, "%zu bytes (budget %zu)",
-                  cfg.wbufCapacity, static_cast<size_t>(128 * 1024));
-    harness::expect(cfg.wbufCapacity <= 128 * 1024,
-          "wbufCapacity is inside the per-connection budget", detail);
+                  cfg.wbuf_capacity, static_cast<size_t>(128 * 1024));
+    harness::expect(cfg.wbuf_capacity <= 128 * 1024,
+          "wbuf_capacity is inside the per-connection budget", detail);
 
-    std::snprintf(detail, sizeof detail, "maxPendingBytes=%zu wbufCapacity=%zu",
-                  cfg.maxPendingBytes, cfg.wbufCapacity);
-    harness::expect(cfg.maxPendingBytes <= cfg.wbufCapacity,
-                    "maxPendingBytes does not require a clamp at start()", detail);
+    std::snprintf(detail, sizeof detail, "max_pending_bytes=%zu wbuf_capacity=%zu",
+                  cfg.max_pending_bytes, cfg.wbuf_capacity);
+    harness::expect(cfg.max_pending_bytes <= cfg.wbuf_capacity,
+                    "max_pending_bytes does not require a clamp at start()", detail);
 
     std::snprintf(detail, sizeof detail, "%zu bytes, one maximum frame is %zu",
-                  cfg.rbufCapacity, frameCeiling);
-    harness::expect(cfg.rbufCapacity >= frameCeiling,
-                    "rbufCapacity can hold the largest legal frame", detail);
+                  cfg.rbuf_capacity, frame_ceiling);
+    harness::expect(cfg.rbuf_capacity >= frame_ceiling,
+                    "rbuf_capacity can hold the largest legal frame", detail);
 
-    std::snprintf(detail, sizeof detail, "maxConnections=%d", cfg.maxConnections);
-    harness::expect(cfg.maxConnections > 0, "maxConnections admits something", detail);
+    std::snprintf(detail, sizeof detail, "max_connections=%d", cfg.max_connections);
+    harness::expect(cfg.max_connections > 0, "max_connections admits something", detail);
 
     // The in-place write API has one caller today, but a commit that trusted
     // its argument instead of the span it offered would mark bytes it never
-    // wrote as readable -- stale data handed to parseFrames.
-    industrial::RingBuffer ring(8);
+    // wrote as readable -- stale data handed to parse_frames.
+    industrial::ring_buffer ring(8);
     const uint8_t six[6] = {0, 1, 2, 3, 4, 5};
     ring.write(six, sizeof six);
     ring.consume(4);   // head_ = 4, size_ = 2, so only [6, 8) is contiguous
-    std::snprintf(detail, sizeof detail, "writeSpan=%zu writable=%zu",
-                  ring.writeSpan(), ring.writable());
-    harness::expect(ring.writeSpan() == 2,
-                    "writeSpan offers only the contiguous tail", detail);
+    std::snprintf(detail, sizeof detail, "write_span=%zu writable=%zu",
+                  ring.write_span(), ring.writable());
+    harness::expect(ring.write_span() == 2,
+                    "write_span offers only the contiguous tail", detail);
     ring.commit(6);    // more than the ring offered
     std::snprintf(detail, sizeof detail, "readable=%zu", ring.readable());
     harness::expect(ring.readable() == 4,
@@ -98,25 +98,25 @@ int main() {
 
     std::printf("== measured cost (evidence, not a verdict) ==\n");
 
-    harness::Fixture server(cfg);
+    harness::fixture server(cfg);
     if (!server.started()) {
-        harness::expect(false, "a default Config starts");
+        harness::expect(false, "a default config starts");
         return harness::finish();
     }
 
-    const long before = rssKb();
-    std::vector<harness::Peer> peers;
+    const long before = rss_kb();
+    std::vector<harness::peer> peers;
     const size_t want = 200;
     for (size_t i = 0; i < want; ++i) {
-        harness::Peer p;
+        harness::peer p;
         if (!p.connect(server.port())) break;
         peers.push_back(std::move(p));
     }
-    for (int i = 0; i < 200 && server.server().connectionCount() < peers.size(); ++i) {
+    for (int i = 0; i < 200 && server.server().connection_count() < peers.size(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    const long after = rssKb();
+    const long after = rss_kb();
 
     if (!peers.empty() && before > 0 && after > 0) {
         std::printf("  [info] %.1f KB/connection over %zu connections\n",

@@ -27,10 +27,10 @@ changed, and they are not wired into the runner.
 
 | | |
 |---|---|
-| `harness::Fixture` | a started server: ephemeral port, handlers, stop on the way out |
-| `harness::Peer` | one connection: `send`, `sendRaw`, `expectFrame`, `expectClose`, `readToEnd` |
+| `harness::fixture` | a started server: ephemeral port, handlers, stop on the way out |
+| `harness::peer` | one connection: `send`, `send_raw`, `expect_frame`, `expect_close`, `read_to_end` |
 | `harness::expect` / `finish` | the one assertion printer, and the exit code |
-| `harness::freePort` | a port, for the cases that need the number before the server exists |
+| `harness::free_port` | a port, for the cases that need the number before the server exists |
 
 A suite that only speaks frames is about this long:
 
@@ -38,25 +38,25 @@ A suite that only speaks frames is about this long:
 #include "harness.h"
 
 int main() {
-    harness::Fixture server(harness::quietConfig(),
+    harness::fixture server(harness::quiet_config(),
                             [](uint64_t, const uint8_t*, size_t) {});
     harness::expect(server.started(), "start() ok");
 
-    harness::Peer peer;
+    harness::peer peer;
     harness::expect(static_cast<bool>(peer.connect(server.port())),
                     "client connected");
-    peer.send(industrial::FrameType::PING, nullptr, 0);
+    peer.send(industrial::frame_type::PING, nullptr, 0);
 
-    harness::Frame f;
-    const harness::Status st = peer.expectFrame(&f, 500);
+    harness::frame f;
+    const harness::status st = peer.expect_frame(&f, 500);
     harness::expect(static_cast<bool>(st), "a frame came back", st.why);
-    harness::expect(f.type == industrial::FrameType::PONG, "and it is a PONG");
+    harness::expect(f.type == industrial::frame_type::PONG, "and it is a PONG");
 
     return harness::finish();
 }
 ```
 
-`Fixture` takes up to three handlers -- message, close, conn-state -- because
+`fixture` takes up to three handlers -- message, close, conn-state -- because
 between them they are what the suites need to observe. `stop()` is idempotent and
 callable early, for the assertions that look at a stopped server.
 
@@ -67,7 +67,7 @@ which invariant to assert stays in the suite, where it can be read. A harness th
 decided what to assert would hide the claim at the exact moment someone needs to
 check it.
 
-**Raw sockets are allowed when the wire is the subject.** `sendRaw` exists for
+**Raw sockets are allowed when the wire is the subject.** `send_raw` exists for
 frames that must be wrong on purpose -- a bad magic number, a length past
 `MAX_FRAME_PAYLOAD`, half a header. Three places keep their own sockets entirely,
 and none of them is plumbing:
@@ -96,7 +96,7 @@ That caught one regression the compiler could not. `send_results` printed
 `peers.size()` after the peers had been cleared, so the count went from 40 to 0
 while every assertion still passed. The output diff is what noticed.
 
-The one line that legitimately moves is `acceptErrors` in the fork case: the
+The one line that legitimately moves is `accept_errors` in the fork case: the
 untouched binary varies between 1016, 1009 and 1010 across runs, so a match there
 would be luck rather than evidence.
 
@@ -105,11 +105,11 @@ would be luck rather than evidence.
 `harness_selftest.cpp` tests the harness against a bare socket, because a wrong
 harness makes every suite pass for the wrong reason. It found one immediately:
 after a reset has been reported once, `recv()` returns 0, which is
-indistinguishable from an orderly FIN, so a second `expectClose(Fin)` relabelled a
-reset connection as a clean one. `Peer` now remembers what it observed.
+indistinguishable from an orderly FIN, so a second `expect_close(fin)` relabelled a
+reset connection as a clean one. `peer` now remembers what it observed.
 
-Running the full 33 configurations -- not only the suites that were touched --
-caught the other: `portIsListening` closed its probe descriptor twice when the
+running the full 33 configurations -- not only the suites that were touched --
+caught the other: `port_is_listening` closed its probe descriptor twice when the
 connect succeeded, and the second close could land on a descriptor number the
 accept loop had just handed out. TSan reported it once, in a suite the change had
 not touched, and the binary was green on five standalone runs. It was real, and
@@ -117,8 +117,8 @@ rare, and only a full run made it likely enough to see.
 
 ## The self-test
 
-`harness_selftest.cpp` drives `Peer` against a listening socket it controls, and
+`harness_selftest.cpp` drives `peer` against a listening socket it controls, and
 asserts six things: framing on send, reassembly when a frame arrives split, FIN
 recognised, RST recognised and not relabelled, timeout reported as a timeout, and
-`sendRaw` writing the bytes it was given. It starts no server, so a failure there
+`send_raw` writing the bytes it was given. It starts no server, so a failure there
 is always the harness.
