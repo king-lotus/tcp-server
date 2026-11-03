@@ -75,6 +75,8 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 | A | reactor 异常退出 → `is_running()` 转假、`reactor_failures` 计数、`stop()` 仍能正常返回 |
 | B | accept 线程异常退出 → 同上，且它把持的监听套接字被真正释放 |
 | C | 12 轮「启动 → 注入故障 → stop → 再启动」→ 每次都留下一个还能重新起来的服务器 |
+| D | `close_linger_ms` / `backlog <= 0` 在 `start()` 被拒绝（否则 fd/准入泄漏或零长度 accept 队列） |
+| E | message handler 抛异常 → 被吞掉（与 R8-2 的 open state handler 同处理），连接继续分发 |
 
 `stop()` 一律包在带超时的 `within()` 里跑：恢复路径死锁时的表现只是"测试跑得久"，
 而退出码分不清那和一台慢机器有什么区别。

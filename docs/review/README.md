@@ -1,6 +1,6 @@
 # Review record
 
-Eight rounds of code review against one header, `include/tcp-server-mt.h`, in
+Nine rounds of code review against one header, `include/tcp-server-mt.h`, in
 the order they happened.
 
 The files were named one at a time as they were written on 2026-10-17 and
@@ -9,7 +9,7 @@ The files were named one at a time as they were written on 2026-10-17 and
 (`CODE-REVIEW-2026-10-18.md`), and the number only appears from the third round
 on. **The names were never unified** -- they cite each other, and each is a
 snapshot of what was true when it was written; see the three cautions below. An
-index table absorbs the mess more cheaply than rewriting eight historical
+index table absorbs the mess more cheaply than rewriting nine historical
 documents.
 
 ## Contents
@@ -24,10 +24,11 @@ documents.
 | 6 | [CODE-REVIEW-2026-10-18-round6.md](CODE-REVIEW-2026-10-18-round6.md) | 2026-10-18 | full re-review | R6-1 to R6-7. P1: dropping the last owner inside a close callback makes the process abort, always. Three more about what gets counted how |
 | 7 | [CODE-REVIEW-2026-10-18-round7.md](CODE-REVIEW-2026-10-18-round7.md) | 2026-10-18 | one item from outside | When `close` and the peer's FIN land in one `handleRead`, the reply just queued is swallowed by an early FIN |
 | 8 | [CODE-REVIEW-2026-10-18-round8.md](CODE-REVIEW-2026-10-18-round8.md) | 2026-10-18 | four items from outside | The close budget denominated in frames rather than bytes; one connection counted in both `accepted` and `rejected` when `stateHandler` throws; `handleWrite` beating `processPending`; `unregisterConn` clearing `closing` while `cleanup` never rolled back |
+| 9 | [CODE-REVIEW-round9-2026-11-02.md](CODE-REVIEW-round9-2026-11-02.md) | 2026-11-02 | full static review | R9-1 to R9-4: a `bad_alloc` use-after-free window left by the close-task reset; three different fates for handler exceptions; shutdown-dropped `send_task` accounting; close-request ordering. Static only: every entry began as `[需核实]` |
 
 Rounds 4, 7 and 8 are all "someone raised it, this side checked it" -- not full
 reviews, and much shorter accordingly. For what a full pass produces, read rounds
-1, 2, 3, 5 and 6.
+1, 2, 3, 5, 6 and 9.
 
 ## Three things to know before reading them
 
@@ -37,7 +38,7 @@ really was at the repository root. It is now `include/tcp-server-mt.h`.
 
 **Two, the line numbers have drifted.** A reference like `tcp-server-mt.h:880`
 holds only against the baseline it was written from. The header grew from 2032
-lines to its present 2937, and a reflow to 80 columns plus translating the
+lines to more than 3,400, and a reflow to 80 columns plus translating the
 comments into English moved most lines in between. The baseline named at the top
 of each report is the tree its line numbers refer to.
 
@@ -46,7 +47,7 @@ of each report is the tree its line numbers refer to.
 land on top of the LICENSE GitHub generated in the web UI, and all 97 commits
 were rewritten. The old hashes resolve today only because the objects are still
 held in this clone's `.git` by its reflog; one `git gc` and they are gone. Editing
-them out of eight documents was not worth it, so here is the table instead. Each
+them out of nine documents was not worth it, so here is the table instead. Each
 pair was checked tree against tree -- the only difference is the
 `.gitignore` / `LICENSE` / `README.md` that `Initial commit` brought:
 
@@ -64,3 +65,7 @@ probe written first to make it actually fail, then a fix, then the same probe ru
 again to watch it go green -- and the fix and the proof went in as two separate
 commits. That held from round 1 to round 8, and it is the part of these reports
 worth reading more than the conclusions themselves.
+
+Round 9 is the exception: it was a purely static pass on a Windows host that
+could not build the header, so every entry was marked `[需核实]`; the R9-1 probe
+and fix were produced afterwards.
