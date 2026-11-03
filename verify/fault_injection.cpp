@@ -21,6 +21,12 @@
 //      answers our FIN into a permanent fd + admission leak. Same for backlog <= 0:
 //      listen() takes the value as given, and a zero-length accept queue looks
 //      exactly like a server that randomly refuses connections under load.
+//   E. a message handler that throws is the application's bug, not a reactor
+//      failure. The throw happens inside parse_frames(), which is noexcept, so
+//      an uncaught one is std::terminate() -- every connection, not just the
+//      one whose message it was. The open state handler already absorbs the
+//      same violation (R8-2); this records that the message handler does too
+//      (R9-2), and that the connection keeps dispatching afterwards.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -42,6 +48,7 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -229,6 +236,47 @@ int main() {
         multi_reactor_server server_b_ok(cfg);
         harness::expect(server_b_ok.start(), "backlog=1 still accepted");
         if (server_b_ok.is_running()) server_b_ok.stop();
+    }
+
+    // ---- E: a message handler that throws --------------------------------
+    {
+        std::printf("E. a throwing message handler is the application's to keep\n");
+        multi_reactor_server::config cfg = base;
+        cfg.port = free_port();
+        cfg.num_reactors = 1;
+        std::atomic<int> handled{0};
+        std::atomic<int> threw{0};
+
+        harness::fixture f(
+            cfg,
+            [&](uint64_t, const uint8_t*, size_t) {
+                const int n = handled.fetch_add(
+                                  1, std::memory_order_relaxed) + 1;
+                if (n == 1) {
+                    threw.fetch_add(1, std::memory_order_relaxed);
+                    throw std::runtime_error("application message handler");
+                }
+            });
+        harness::expect(f.started(), "start() ok");
+        const uint64_t failures_before = f.stats().reactor_failures.load();
+
+        harness::peer p;
+        harness::expect(static_cast<bool>(p.connect(f.port())), "connect()");
+        harness::expect(static_cast<bool>(p.send(
+                            industrial::frame_type::DATA, "one", 3)),
+                        "first frame sent");
+        harness::expect(wait_for(3000, [&] { return threw.load() == 1; }),
+                        "the handler ran and threw");
+        harness::expect(f.server().is_running(),
+                        "the server still reports itself as running");
+        harness::expect(f.stats().reactor_failures.load() == failures_before,
+                        "reactor_failures did not move");
+
+        harness::expect(static_cast<bool>(p.send(
+                            industrial::frame_type::DATA, "two", 3)),
+                        "second frame sent on the same connection");
+        harness::expect(wait_for(3000, [&] { return handled.load() >= 2; }),
+                        "the connection kept dispatching after the throw");
     }
 
     return harness::finish();

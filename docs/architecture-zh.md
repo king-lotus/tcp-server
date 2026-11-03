@@ -231,7 +231,7 @@ server.set_message_handler(
   ├─ 当前线程是 owner reactor（handler 的常见情况）？
   │    └─ try_send_local:
   │         ├─ 在本 reactor 的 conns_ 查找（无全局锁）
-  │         ├─ 未关闭、未 closing、未排队 close_requested
+  │         ├─ 未关闭、未 closing、close_requests == 0
   │         ├─ 预占 pending_bytes
   │         ├─ 直接写 8 字节头 + 载荷到 wbuf
   │         └─ arm_write → ok
@@ -252,8 +252,10 @@ reactor 线程（队列路径）
 ```
 
 owner-thread 快路径是常见 echo 用的路径：它不分配 frame/task，不跨队列和
-eventfd。`close_requested` 保证“先 close_connection 再 send_to”仍按队列顺序落到
-close 之后（因此仍会被丢弃），不会因为快路径提前写 wbuf 而改变语义。
+eventfd。`close_requests` 在 `submit_close()` 之前递增、入队失败时回退；成功入队
+后保持非零，直到连接销毁（此时连接已经 closing 或 closed）。快路径看到非零就回退
+到队列路径，所以“先 close_connection 再 send_to”仍按队列顺序落到 close 之后（因此
+仍会被丢弃），并发调用 `close_connection()` 也不会互相清除请求。
 
 非 owner 队列路径的 submission 屏障和连接表按 `conn_id` 分成 16 个 shard：发送/
 关闭只锁自己的 shard，`stop()` 一次性取全部 shard 把在途调用排空。队列用 typed
@@ -436,6 +438,10 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `epipe_writes` | `sendmsg` 返回 EPIPE（预期为 0，用于验证不可达路径） |
 | `close_callbacks_dropped` | 关闭回调因分配失败被丢弃（预期为 0） |
 
+`bytes_dropped` 的“关闭时仍未发出”指 `discard_pending_output()` 释放的 wbuf 部分。
+`cleanup()` 关停时队列里剩余的 `send_task` 不计入 `bytes_dropped` / `queue_drops`：
+它们预占的 `pending_bytes` 随连接一起销毁，不会泄漏；此刻已没有连接可供计数归属。
+
 四个流量计数器（`frames_recv`、`frames_sent`、`bytes_recv`、`bytes_sent`）都是
 “每 reactor 本地累加 + 每轮循环发布一次”：空闲时精确，有流量时最多滞后一轮。
 `server_stats` 的热计数器按 64 字节隔离，避免不同 reactor 更新不同计数器时的
@@ -517,8 +523,11 @@ int main() {
 
 - **在 `start()` 之前安装**，运行期间不要替换（没有同步保护）。
 - 回调在多个 reactor 线程上并发执行，必须自己保证线程安全。
-- **不要抛异常**。异常逃出回调会被 reactor 顶层捕获，`reactor_failures++`，
-  `is_running()` 转假。
+- **不要抛异常**。message handler 与 conn-state handler 的 open 转换抛出的异常会被
+  捕获并丢弃（R8-2 / R9-2）：帧已经消费、连接仍然健康，没有可回滚的状态，也没有合适
+  的计数器。关闭侧回调（conn-state `false` 与 `close_handler`）运行在 `noexcept` 路径
+  上，抛出会直接 `std::terminate`。两条路径都不会到达 reactor 顶层，因此都不计入
+  `reactor_failures`。
 - **不要让回调阻塞**。回调在 owner reactor 线程上同步执行；一次慢调用（数据库、
   磁盘、锁、同步 RPC）会拖住该 reactor 上的所有连接，表现为其它连接的 PONG/应答
   延迟、空闲超时和尾延迟上升。需要阻塞工作时，用 `offload()`（需

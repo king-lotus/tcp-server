@@ -413,11 +413,21 @@ struct connection {
     // every frame (see submit_send) -- send_to answering ok to one would
     // promise something the owner has already decided not to do.
     std::atomic<bool> closing{false};
-    // A close request has been queued but the owner may not have parked it yet.
-    // The owner-thread send_to() fast path falls back to the queued path when
-    // this is set, so a send issued after close_connection() keeps the existing
-    // queue order (and its existing drop) instead of overtaking it.
-    std::atomic<bool> close_requested{false};
+    // Close requests this connection has accepted. Non-zero for the rest of
+    // its life once one is queued. The owner-thread send_to() fast path falls
+    // back to the queued path while this is non-zero, so a send issued after
+    // close_connection() keeps the existing queue order (and its existing
+    // drop) instead of overtaking it.
+    //
+    // Counted before the queue attempt, not after it: the old flag was set only
+    // once submit_close() returned, and a handler already running on the owner
+    // thread could pass the fast-path check in that window and write ahead of a
+    // close that was already queued (R9-4). A count rather than a flag because
+    // close_connection() is called from any thread: a failed attempt gives back
+    // exactly the count it added, so it cannot clear a request another caller
+    // has queued successfully. A successful attempt leaves its count in place;
+    // the connection is closing from then on, so there is nothing to clear.
+    std::atomic<uint32_t> close_requests{0};
     bool       fin_sent = false;
     // A graceful close whose final read dispatched requests still has their
     // replies queued, and the FIN waits for them. At most one queue round may
@@ -733,7 +743,11 @@ class multi_reactor_server {
  public:
     // Install handlers before start; never replace them while running. Handlers
     // run concurrently across workers and must not throw or destroy this
-    // server.
+    // server. A throw from a message handler or from the open transition of a
+    // conn-state handler is caught and dropped, because nothing is left to
+    // undo by then and the exception already belongs to the application. The
+    // close-side callbacks (conn-state false and close_handler) run on a
+    // noexcept path, where a throw reaches std::terminate.
     // Message payload/peer/reason references are borrowed for the call only.
     // send_to/close_connection are permitted. stop from a callback requests
     // shutdown only; the controlling thread must subsequently call stop to join
@@ -1144,6 +1158,14 @@ inline void sub_reactor::cleanup() noexcept {
         std::lock_guard<std::mutex> lk(pending_mutex_);
         server_->stats_ref().pending_tasks_depth.fetch_sub(
             pending_tasks_.size(), std::memory_order_relaxed);
+        // The send_tasks dropped here already counted their frames into
+        // pending_bytes when they were submitted, and that reservation is not
+        // given back. It is not a leak: pending_bytes is per connection and
+        // every connection is torn down below, so the count dies with its
+        // owner. It does mean bytes_dropped and queue_drops do not see these
+        // frames -- at shutdown there is no connection left for them to be
+        // about, which is the same reason discard_pending_output() owns only
+        // the wbuf half.
         pending_tasks_.clear();
     }
 
@@ -1187,6 +1209,9 @@ inline void sub_reactor::process_pending() noexcept {
             active_tasks_.size(), std::memory_order_relaxed);
     }
     for (auto& t : active_tasks_) {
+        // The tasks left after a break are dropped with their send_task
+        // frames; their pending_bytes reservations are not returned (cleanup()
+        // explains why that cannot leak and is not counted).
         if (!running_.load() || !server_->is_running()) break;
         // One indirect call through the table, indexed by the alternative.
         k_task_dispatch[t.index()](this, t);
@@ -1403,9 +1428,9 @@ inline bool sub_reactor::try_send_local(multi_reactor_server* expected,
         *out = send_result::closed;
         return true;
     }
-    // A close is already queued ahead of this send: take the queued path so the
-    // frame is ordered after it and dropped, exactly as before.
-    if (c->close_requested.load(std::memory_order_acquire)) return false;
+    // A close request is already ahead of this send: take the queued path so
+    // the frame is ordered after it and dropped, exactly as before.
+    if (c->close_requests.load(std::memory_order_acquire) != 0) return false;
 
     const size_t frame_size = FRAME_HEADER_SIZE + len;
     // No room now: take the queued path, which reserves the frame and lets the
@@ -1456,16 +1481,18 @@ inline void sub_reactor::handle_task(close_task& task) noexcept {
     const uint64_t id = task.id;
     auto it = conns_.find(id);
     if (it != conns_.end()) {
-        // Copy out and reset the map handle before closing: the deferred close
-        // callbacks must not run while this frame holds the conn.
+        // Hold the map's reference across the whole call. teardown_closed()
+        // hands its own reference to the deferred-close entry, so if queueing
+        // that entry throws, the entry's destructor would drop the last
+        // reference -- while drain_input_then_close() is still reading the
+        // connection. Holding it here costs nothing: the callbacks only run in
+        // flush_close_callbacks() below, after this scope is gone.
         std::shared_ptr<connection> c = it->second;
-        connection* raw = c.get();
-        c.reset();
         // Default (graceful): this is an application-level "we are done", so
         // the reply queued just before it must still reach the peer -- and so
         // must answers to requests the peer already sent but this reactor has
         // not read yet.
-        drain_input_then_close(raw);
+        drain_input_then_close(c.get());
     }
     flush_close_callbacks();
 }
@@ -1473,32 +1500,36 @@ inline void sub_reactor::handle_task(close_task& task) noexcept {
 inline void sub_reactor::handle_task(finish_peer_closed_task& task) noexcept {
     auto it = conns_.find(task.id);
     if (it == conns_.end()) return;
-    // Copy the pointer, then drop this frame's reference before the resumed
-    // check: it may tear the connection down.
+    // Same hold as close_task: finish_peer_closed() can reach
+    // teardown_closed(), whose notification allocation may fail and drop the
+    // last reference. Its teardown calls are tail actions today -- nothing
+    // reads the connection after them -- so this is not a live bug, but the
+    // hold keeps that from being an invariant the next edit has to preserve
+    // (R9-1).
     std::shared_ptr<connection> keep = it->second;
-    connection* raw = keep.get();
-    keep.reset();
-    finish_peer_closed(raw);
+    finish_peer_closed(keep.get());
 }
 
 inline void sub_reactor::handle_task(drain_input_task& task) noexcept {
     auto it = conns_.find(task.id);
     if (it == conns_.end()) return;
+    // Same reason as close_task above: the drain can reach teardown_closed(),
+    // whose notification allocation may fail, and this frame must still own
+    // the connection while drain_input_then_close() reads it (R9-1).
     std::shared_ptr<connection> keep = it->second;
-    connection* raw = keep.get();
-    keep.reset();
-    drain_input_then_close(raw);
+    drain_input_then_close(keep.get());
 }
 
 inline void sub_reactor::handle_task(park_close_task& task) noexcept {
     auto it = conns_.find(task.id);
     if (it == conns_.end()) return;
-    // Release the map's reference only after copying the pointer, so this frame
-    // holds nothing while park_close may close the connection.
+    // Same hold as close_task: park_close() can reach teardown_closed(), whose
+    // notification allocation may fail and drop the last reference. Its
+    // teardown calls are tail actions today, so this is not a live bug, but the
+    // hold keeps that from being an invariant the next edit has to preserve
+    // (R9-1).
     std::shared_ptr<connection> keep = it->second;
-    connection* raw = keep.get();
-    keep.reset();
-    park_close(raw, "requested");
+    park_close(keep.get(), "requested");
 }
 
 inline void sub_reactor::arm_write(connection* c) noexcept {
@@ -2021,7 +2052,18 @@ inline void sub_reactor::parse_frames(connection* c,
             }
             c->rbuf.consume(len);
             auto& mh = server_->msg_handler_ref();
-            if (mh) mh(c->id, frame_scratch_.data(), len);
+            if (mh) {
+                try {
+                    mh(c->id, frame_scratch_.data(), len);
+                } catch (...) {
+                    // The same contract violation the open state handler
+                    // absorbs (R8-2): the frame has been consumed, the
+                    // connection is healthy, and there is nothing to undo or
+                    // to count. Letting it cross parse_frames() -- noexcept --
+                    // would call std::terminate() and take every connection
+                    // with it, not just the one whose message it was.
+                }
+            }
         }
     }
 
@@ -3363,14 +3405,17 @@ inline bool multi_reactor_server::close_connection(uint64_t conn_id) noexcept {
         stats_.close_requests_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    // Count first, then queue. A send_to() running on the owner reactor must
+    // fall back to the queued path from the moment the close starts being
+    // queued, not from the moment the caller returns: otherwise a handler
+    // already in flight can pass the fast-path check while the close task is
+    // being appended, and write ahead of it (R9-4).
+    c->close_requests.fetch_add(1, std::memory_order_release);
     if (!c->owner->submit_close(conn_id)) {
+        c->close_requests.fetch_sub(1, std::memory_order_release);
         stats_.close_requests_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    // The close is queued. A send_to() from the same reactor must now use the
-    // queued path too, so it lands after the close task and keeps the existing
-    // ordering semantics.
-    c->close_requested.store(true, std::memory_order_release);
     return true;
 }
 
