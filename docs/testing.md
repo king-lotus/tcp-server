@@ -17,9 +17,9 @@ a suite that only passes under a sanitizer is a different claim from one that
 passes without. A hang is bounded by `timeout 180`; a failure is a non-zero exit,
 which is the only thing the runner reads.
 
-The suites live in `verify/`. The twenty programs under `verify/evidence/` are
-not part of this: each settles one claim against a history that has since
-changed, and they are not wired into the runner.
+The suites live in `verify/`. The twenty programs under
+`verify/evidence/` are not part of this: each settles one claim against a
+history that has since changed, and they are not wired into the runner.
 
 ## Writing a suite
 

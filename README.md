@@ -134,10 +134,10 @@ shrinking; that one is open.
 ## Layout
 
 ```
-include/tcp-server-mt.h   the only deliverable, 3400 lines
+include/tcp-server-mt.h   the only deliverable
 verify/                   runtime suites, the peer harness, one-off probes
 docs/testing.md           how a suite is written, and how the harness is tested
-docs/review/              eight rounds of review, with an index
+docs/review/              nine rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
 ```
 
