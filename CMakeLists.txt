@@ -65,7 +65,7 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same ten runs run.sh performs: seven suites, plus the two that run a
+    # The same eleven runs run.sh performs: nine suites, plus the two that run a
     # second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)

@@ -22,7 +22,7 @@ run it -- `verify/` is that machine.
   skips both.
 - **Closing is staged, not `close(fd)`.** A connection is marked `closing`
   first, drains the replies already queued, and only then FINs. That semantic is
-  where eight rounds of review landed most often and where the probes are
+  where nine rounds of review landed most often and where the probes are
   densest. `stop()` is the immediate exception: it aborts whatever is still
   open. `stop_gracefully(ms)` stops accepting, closes every connection
   gracefully, and waits up to `ms` before that same stop.
@@ -74,7 +74,7 @@ because the three configurations, cpplint and the ordering live there.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # the same ten runs
+ctest --test-dir build --output-on-failure     # the same eleven runs
 ```
 
 `-DTCP_SANITIZE=address,undefined` (or `thread`) rebuilds the suites under one
@@ -136,12 +136,13 @@ shrinking; that one is open.
 ```
 include/tcp-server-mt.h   the only deliverable
 verify/                   runtime suites, the peer harness, one-off probes
+docs/api-reference.md     the public surface: config, lifecycle, send/close, stats
 docs/testing.md           how a suite is written, and how the harness is tested
 docs/review/              nine rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
 ```
 
-Those twenty probes under `verify/evidence/` are not a standing test suite. Each
+Those fifteen probes under `verify/evidence/` are not a standing test suite. Each
 one was written to settle a single claim, against a history that has since been
 fixed. Two of them read the header out of git at a given revision, so they accept
 either layout -- before or after the directory move on 2026-10-18.

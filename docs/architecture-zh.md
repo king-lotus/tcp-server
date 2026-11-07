@@ -307,8 +307,9 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
    内核；写不完就打开 `EPOLLOUT`，由 `handle_write` 继续。
 3. **发 FIN**：wbuf 空了以后 `shutdown(SHUT_WR)`。关闭**之前**已经排队的应答
    仍会被写出；`closing` 拒绝的是关闭之后的新提交。
-4. **等对端 FIN**：继续读，直到 `recv` 返回 0（对端 FIN）或
-   `close_linger_ms` 到期。到期仍未收到 FIN 就强制中止。
+4. **等对端 FIN**：继续读，直到 `recv` 返回 0（对端 FIN）。整个关闭从
+   `park_close()` 起算共用 `close_linger_ms` 预算（含排空与发 FIN），到期即
+   强制中止——无论 FIN 是否已经发出。
 5. **销毁连接**：`teardown_closed()` → `close(fd)`，然后在安全栈帧上执行延迟的
    `conn_state_handler(false)` 和 `close_handler`。
 
@@ -343,9 +344,10 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 - `stop_gracefully(timeout_ms)` 是整机排空版本：先停止 accept（join 后监听套接字
   已关闭），再反复对当前连接调用 `close_connection()`，直到
   `connection_count()==0` 且没有 pending 的新连接，或 `timeout_ms` 到期；最后执行
-  正常的 `stop()`。返回 `true` 表示全部排空，`false` 表示超时后剩余连接被
-  `stop()` 中止。必须从控制线程调用；从回调里调用只会 `request_stop()` 并返回
-  `false`。
+  正常的 `stop()`。返回 `true` 只表示连接表与 admission 归零：linger 期满被强制
+  中止的连接同样满足该条件，因此 `true` 不保证没有发生 RST（看
+  `stats().aborted`）。`false` 表示超时仍有残留，或从回调里调用（此时只
+  `request_stop()` 并返回）。必须从控制线程调用。
 
 ---
 
@@ -356,7 +358,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `tick_ms` | 500 | reactor 检查空闲/linger/帧装配期限的周期 |
 | `idle_timeout_ms` | 120000 | 超过这么久没收到任何字节，优雅关闭连接 |
 | `frame_assembly_timeout_ms` | `0`（= 5 × `idle_timeout_ms`） | 一个帧从第一个字节到装配完成的上限；超时中止连接 |
-| `close_linger_ms` | 5000 | 优雅关闭发出 FIN 后，等对端 FIN 的上限；超时中止 |
+| `close_linger_ms` | 5000 | 一次优雅关闭的总预算，从关闭被 park 起算：排空 wbuf、发 FIN、等对端 FIN；超时中止 |
 
 - 这些超时都只在 tick 边界检查，实际触发可能比配置值晚最多一个 `tick_ms`。
   `start()` 在 `tick_ms` 大于任一超时时打印警告，但不会拒绝启动。
@@ -387,7 +389,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `wbuf_capacity` | `MAX_FRAME_SIZE` (65544) | 写缓冲；必须 >= 8 |
 | `max_pending_bytes` | `MAX_FRAME_SIZE` (65544) | 单连接待发软上限；启动时会被压到 `<= wbuf_capacity` |
 | `write_budget_bytes` | `262144` | 单次 drain 最多写多少字节，必须非 0 |
-| `close_linger_ms` | `5000` | 优雅关闭等对端 FIN 的上限，必须 > 0 |
+| `close_linger_ms` | `5000` | 一次优雅关闭的总预算（park 起算，含排空与等对端 FIN），必须 > 0 |
 | `handler_threads` | `0` | 可选的 offload 池线程数；0 = 不启用；上限 64 |
 | `handler_queue_limit` | `8192` | 所有连接共享的 offload 排队上限；启用池时必须 > 0 |
 
@@ -421,10 +423,10 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `frames_recv` | 解析出一个完整帧；每 reactor 本地累加，每轮发布，空闲精确、繁忙最多滞后一轮 |
 | `frames_sent` | 帧的最后一个字节到达内核（不是入队时）；同样本地累加、每轮发布 |
 | `bytes_recv` / `bytes_sent` | 实际 recv/send 到内核的字节数；同样本地累加、每轮发布 |
-| `queue_drops` | 整帧被拒绝：单连接 `max_pending_bytes` 到顶，或 reactor 队列满 |
-| `bytes_dropped` | 连接关闭时仍未发出的字节 |
+| `queue_drops` | 提交被拒：整帧因 `max_pending_bytes` 到顶或 reactor 队列满被拒；控制类任务（新连接、close、续排）被同一队列拒绝也计入 |
+| `bytes_dropped` | 已接受但未发出的字节：整帧被丢弃（容量不足或连接已在关闭），或销毁时 wbuf 中仍未发出的部分 |
 | `aborted` | 强制断开（RST），不是优雅关闭 |
-| `frames_dropped_on_close` | 关闭过程中被丢弃的帧（如 FIN 之后的 PONG） |
+| `frames_dropped_on_close` | 关闭已开始后被丢弃的帧（如关闭过程中的 PONG）：对端收到的是有序 FIN，不是这些回复 |
 | `parse_errors` | magic 错或长度超限 |
 | `idle_timeouts` | 空闲超时触发 |
 | `frame_assembly_timeouts` | 不完整帧超过 `frame_assembly_timeout_ms`（字节仍在到达） |
@@ -438,7 +440,8 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `epipe_writes` | `sendmsg` 返回 EPIPE（预期为 0，用于验证不可达路径） |
 | `close_callbacks_dropped` | 关闭回调因分配失败被丢弃（预期为 0） |
 
-`bytes_dropped` 的“关闭时仍未发出”指 `discard_pending_output()` 释放的 wbuf 部分。
+`bytes_dropped` 中“销毁时仍未发出”的部分指 `discard_pending_output()` 释放的 wbuf；
+整帧被拒（容量不足、连接已在关闭）同样计入该计数器。
 `cleanup()` 关停时队列里剩余的 `send_task` 不计入 `bytes_dropped` / `queue_drops`：
 它们预占的 `pending_bytes` 随连接一起销毁，不会泄漏；此刻已没有连接可供计数归属。
 
@@ -550,7 +553,8 @@ industrial::send_result r = server.send_to(id, reply.data(), reply.size());
 bool queued = server.close_connection(id);
 
 // 整机优雅关闭：停止 accept、逐连接 close，最多等 timeout_ms。
-// true = 全部排空；false = 超时后剩余连接被 stop() 中止。
+// true = 连接表与 admission 归零（linger 期满被中止也满足，故不保证未被 RST）；
+// false = 超时仍有残留，或在回调中调用（此时仅请求停止并返回）。
 bool drained = server.stop_gracefully(3000);
 
 // 可选的慢 handler 卸载；需要 cfg.handler_threads > 0。
