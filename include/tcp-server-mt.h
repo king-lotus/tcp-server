@@ -373,6 +373,198 @@ struct admission_ticket {
     ~admission_ticket() { count.fetch_sub(1, std::memory_order_relaxed); }
 };
 
+// How far a drain got. These used to be 0 / 1 / -1 with two different outcomes
+// sharing the 0: the while-loop ending because wbuf was empty, and EPIPE. The
+// first means every queued byte reached the kernel and the caller should go on
+// to whatever comes next; the second means not one more byte will ever leave,
+// and treating them alike is what put the connection's fate in the hands of
+// `wbuf.empty()` at each call site -- a fact none of them said out loud.
+enum class drain_outcome {
+    drained,   // wbuf is empty: everything owed has reached the kernel
+    stalled,   // fair-share budget spent, or EAGAIN: EPOLLOUT will resume it
+    dead,      // EPIPE: this socket's write direction is finished, permanently
+    error,     // any other failure: fatal
+};
+
+// What the close FSM tells the reactor to do next. The FSM decides, the reactor
+// performs the effect and feeds the result back as the next event.
+enum class close_action {
+    none,
+    drain_input,        // serve buffered input (run handle_read)
+    drain_wbuf,         // move wbuf into the kernel
+    send_fin,           // shutdown(SHUT_WR)
+    defer_drain_input,  // queue one more input-serving round
+    defer_park,         // queue one park round (replies land first)
+    defer_peer_closed,  // queue one peer-closed round
+    close_graceful,     // teardown, orderly
+    close_abort,        // teardown, RST
+};
+
+// ==================== Graceful-close state ====================
+// A connection's graceful-close state (see docs/close-fsm.md). This slice only
+// moves the fields out of connection; the decision logic follows in a later
+// slice. Every non-atomic field stays reactor-thread-only, as before.
+struct close_fsm {
+    // One queue round may be spent waiting for replies to land; the kind says
+    // which side owns the round (see drain_input_then_close / finish_peer_closed).
+    enum class deferred_kind : uint8_t { none = 0, close, peer_closed };
+
+    // closing: a graceful close has been requested and is being honoured (output
+    // drained, FIN sent or imminent). Submissions are refused from here on, but
+    // the peer keeps reading what we owe it.
+    // fin_sent: FIN has actually left. Closing before that would drop queued
+    // bytes and turn the polite close into the RST this whole mechanism avoids.
+    // The two are separate on purpose: "closed" must not mean "socket is gone",
+    // or an application that sends a reply and then closes would never get the
+    // reply out. Reads keep running throughout.
+    // Atomic, though every write is reactor-thread-only: send_to() reads it, and
+    // send_to runs on whichever thread the application called it from. The two
+    // have to agree, because once this is set the reactor refuses every frame
+    // (see submit_send) -- send_to answering ok to one would promise something
+    // the owner has already decided not to do.
+    std::atomic<bool>     closing{false};
+    // Close requests this connection has accepted. Non-zero for the rest of its
+    // life once one is queued. The owner-thread send_to() fast path falls back to
+    // the queued path while this is non-zero, so a send issued after
+    // close_connection() keeps the existing queue order (and its existing drop)
+    // instead of overtaking it.
+    //
+    // Counted before the queue attempt, not after it: the old flag was set only
+    // once submit_close() returned, and a handler already running on the owner
+    // thread could pass the fast-path check in that window and write ahead of a
+    // close that was already queued (R9-4). A count rather than a flag because
+    // close_connection() is called from any thread: a failed attempt gives back
+    // exactly the count it added, so it cannot clear a request another caller
+    // has queued successfully. A successful attempt leaves its count in place;
+    // the connection is closing from then on, so there is nothing to clear.
+    std::atomic<uint32_t> close_requests{0};
+    bool                  fin_sent = false;
+    // A graceful close whose final read dispatched requests still has their
+    // replies queued, and the FIN waits for them. At most one queue round may be
+    // spent waiting -- a peer that keeps sending cannot hold the close open with
+    // more input -- and the round has an owner, because only the side that
+    // deferred knows what the wait was for:
+    //
+    //   close       -- drain_input_then_close() deferred; the round ends in a park.
+    //   peer_closed -- finish_peer_closed() deferred; the round ends in whatever
+    //                  finish_peer_closed() decides once the replies have landed
+    //                  in wbuf -- a FIN, or "nothing left, close now".
+    //
+    // One bool cannot say which, and conflating them cost the peer its last
+    // answer: taken as "the round has been spent, park now" rather than "the
+    // round is still owed", it parked the close one round early, with wbuf still
+    // empty and the FIN therefore immediate -- over replies whose own deferral
+    // had not run yet.
+    deferred_kind         deferred_round = deferred_kind::none;
+    // Input this graceful close still owes the peer: the bytes that were buffered
+    // and unserved when the close was first requested. drain_input_then_close()
+    // may spend queue rounds on them, because handle_read stops at a fixed
+    // per-call budget and one pass cannot be assumed to have served a whole
+    // backlog -- but on nothing beyond them, so a peer that keeps sending cannot
+    // hold the close open with fresh input. Negative means "not measured yet".
+    // Reactor-thread-only.
+    int64_t               close_input_bytes = -1;
+    int64_t               close_started_at_ms = 0;  // when the graceful close was parked
+    int64_t               fin_sent_at_ms = 0;       // when shutdown(SHUT_WR) returned
+    // Shared across threads: teardown_closed() sets it, send_to() and the close
+    // paths read it.
+    std::atomic<bool>     is_closed{false};
+
+    // Read-only view into the connection's buffers, set once by attach().
+    ring_buffer*          wbuf_ = nullptr;
+    ring_buffer*          rbuf_ = nullptr;
+    std::atomic<size_t>*  pending_bytes_ = nullptr;
+
+    void attach(ring_buffer* wbuf, ring_buffer* rbuf,
+                std::atomic<size_t>* pending_bytes) noexcept {
+        wbuf_ = wbuf;
+        rbuf_ = rbuf;
+        pending_bytes_ = pending_bytes;
+    }
+
+    // -------- decisions (pure: read state + view, return the next action) -----
+
+    bool wbuf_empty() const noexcept { return wbuf_ && wbuf_->empty(); }
+    bool rbuf_empty() const noexcept { return rbuf_ ? rbuf_->empty() : true; }
+    size_t pending() const noexcept {
+        return pending_bytes_ ? pending_bytes_->load(std::memory_order_relaxed) : 0;
+    }
+    bool done() const noexcept {
+        return is_closed.load(std::memory_order_acquire) || fin_sent;
+    }
+
+    // A graceful close that parks now (close_conn graceful, idle timeout).
+    // Idempotent: once closed or FINed there is nothing left to park.
+    close_action on_graceful() noexcept {
+        if (done()) return close_action::none;
+        if (!closing.load(std::memory_order_acquire)) {
+            closing.store(true, std::memory_order_release);
+            close_started_at_ms = now_ms();
+        }
+        return close_action::drain_wbuf;
+    }
+
+    // What to do after a wbuf drain. dead/error end the connection; stalled
+    // leaves the rest to a later EPOLLOUT; drained means the FIN can go out.
+    close_action on_drain_result(drain_outcome r) noexcept {
+        if (r == drain_outcome::error || r == drain_outcome::dead)
+            return close_action::close_abort;
+        if (r == drain_outcome::drained) return close_action::send_fin;
+        return close_action::none;  // stalled
+    }
+
+    // A public close (close_connection / stop_gracefully): serve buffered input
+    // first, so answers to already-arrived requests still reach the peer.
+    close_action on_request() noexcept {
+        if (done()) return close_action::none;
+        if (close_input_bytes < 0)
+            close_input_bytes = static_cast<int64_t>(rbuf_ ? rbuf_->readable() : 0);
+        return close_action::drain_input;
+    }
+
+    // A serving round finished. served is the frame count, dealt the bytes this
+    // round took off the close_input_bytes budget.
+    close_action on_input_drained(int served, int64_t dealt) noexcept {
+        if (done()) return close_action::none;
+        if (served > 0 && dealt > 0) close_input_bytes -= dealt;
+        if (served > 0 && !rbuf_empty() && close_input_bytes > 0)
+            return close_action::defer_drain_input;
+        if (served == 0 && deferred_round == deferred_kind::none && pending() > 0) {
+            deferred_round = deferred_kind::close;
+            return close_action::defer_park;
+        }
+        if (deferred_round == deferred_kind::peer_closed) return close_action::none;
+        if (served == 0 || deferred_round == deferred_kind::close)
+            return close_action::drain_wbuf;
+        deferred_round = deferred_kind::close;
+        return close_action::defer_park;
+    }
+
+    // Re-decide after the input-defer hand-off failed: drain_input is off the
+    // table and served was > 0, so what remains is the park decision.
+    close_action on_input_defer_failed() noexcept {
+        if (deferred_round == deferred_kind::peer_closed) return close_action::none;
+        if (deferred_round == deferred_kind::close) return close_action::drain_wbuf;
+        deferred_round = deferred_kind::close;
+        return close_action::defer_park;
+    }
+
+    // The peer FINed and wbuf is empty. defer_peer_closed spends the one allowed
+    // queue round waiting for replies to land; otherwise FIN (if we are closing)
+    // or tear down.
+    close_action on_peer_fin() noexcept {
+        if (is_closed.load(std::memory_order_acquire)) return close_action::none;
+        if (!closing.load(std::memory_order_acquire) &&
+            deferred_round == deferred_kind::none && pending() > 0) {
+            deferred_round = deferred_kind::peer_closed;
+            return close_action::defer_peer_closed;
+        }
+        if (closing.load(std::memory_order_acquire) && !fin_sent)
+            return close_action::send_fin;
+        return close_action::close_graceful;
+    }
+};
+
 // ==================== Connection ====================
 struct connection {
     uint64_t    id    = 0;
@@ -421,65 +613,10 @@ struct connection {
     // it is queued. Reactor-thread-only, like wbuf itself.
     size_t      send_frame_remain = 0;
     // -------- close protocol --------
-    // closing: a graceful close has been requested and is being honoured
-    //          (output drained, FIN sent or imminent). Submissions are refused
-    //          from here on, but the peer keeps reading what we owe it.
-    // fin_sent: FIN has actually left. Closing before that would drop queued
-    //          bytes and turn the polite close into the RST this whole
-    //          mechanism avoids.
-    // The two are separate on purpose: "closed" must not mean "socket is gone",
-    // or an application that sends a reply and then closes would never get the
-    // reply out. Reads keep running throughout.
-    // Atomic, though every write is reactor-thread-only: send_to() reads it,
-    // and send_to runs on whichever thread the application called it from.
-    // The two have to agree, because once this is set the reactor refuses
-    // every frame (see submit_send) -- send_to answering ok to one would
-    // promise something the owner has already decided not to do.
-    std::atomic<bool> closing{false};
-    // Close requests this connection has accepted. Non-zero for the rest of
-    // its life once one is queued. The owner-thread send_to() fast path falls
-    // back to the queued path while this is non-zero, so a send issued after
-    // close_connection() keeps the existing queue order (and its existing
-    // drop) instead of overtaking it.
-    //
-    // Counted before the queue attempt, not after it: the old flag was set only
-    // once submit_close() returned, and a handler already running on the owner
-    // thread could pass the fast-path check in that window and write ahead of a
-    // close that was already queued (R9-4). A count rather than a flag because
-    // close_connection() is called from any thread: a failed attempt gives back
-    // exactly the count it added, so it cannot clear a request another caller
-    // has queued successfully. A successful attempt leaves its count in place;
-    // the connection is closing from then on, so there is nothing to clear.
-    std::atomic<uint32_t> close_requests{0};
-    bool       fin_sent = false;
-    // A graceful close whose final read dispatched requests still has their
-    // replies queued, and the FIN waits for them. At most one queue round may
-    // be spent waiting -- a peer that keeps sending cannot hold the close open
-    // with more input -- and the round has an owner, because only the side that
-    // deferred knows what the wait was for:
-    //
-    //   close       -- drain_input_then_close() deferred; the round ends in a
-    //                  park.
-    //   peer_closed -- finish_peer_closed() deferred; the round ends in
-    //                  whatever finish_peer_closed() decides once the replies
-    //                  have landed in wbuf -- a FIN, or "nothing left, close
-    //                  now".
-    //
-    // One bool cannot say which, and conflating them cost the peer its last
-    // answer: taken as "the round has been spent, park now" rather than "the
-    // round is still owed", it parked the close one round early, with wbuf
-    // still empty and the FIN therefore immediate -- over replies whose own
-    // deferral had not run yet.
-    enum class deferred_round_kind : uint8_t { none = 0, close, peer_closed };
-    deferred_round_kind deferred_round = deferred_round_kind::none;
-    // Input this graceful close still owes the peer: the bytes that were
-    // buffered and unserved when the close was first requested.
-    // drain_input_then_close() may spend queue rounds on them, because
-    // handle_read stops at a fixed per-call budget and one pass cannot be
-    // assumed to have served a whole backlog -- but on nothing beyond them, so
-    // a peer that keeps sending cannot hold the close open with fresh input.
-    // Negative means "not measured yet". Reactor-thread-only.
-    int64_t    close_input_bytes = -1;
+    // The close state now lives in `fsm` (docs/close-fsm.md): closing,
+    // close_requests, fin_sent, deferred_round, close_input_bytes,
+    // close_started_at_ms, fin_sent_at_ms and is_closed moved there. The two
+    // fields kept here are read-path, not close state:
     // Bytes this connection's handle_read() has taken off the socket since
     // drain_input_then_close() zeroed it, which is always either nobody or the
     // graceful close: it is how a round can be charged for input that arrived
@@ -489,11 +626,12 @@ struct connection {
     // handle_write consults it to finish a parked close deterministically the
     // moment the drain completes, instead of waiting for a spurious EPOLLIN.
     bool       peer_closed = false;
-    int64_t    close_started_at_ms = 0;   // when the graceful close was parked
-    int64_t    fin_sent_at_ms = 0;        // when shutdown(SHUT_WR) returned
+    // Graceful-close state machine (closing, close_requests, fin_sent,
+    // deferred_round, close_input_bytes, close_started_at_ms, fin_sent_at_ms,
+    // is_closed).
+    close_fsm  fsm;
 
     // Shared across threads from here down:
-    std::atomic<bool>   is_closed{false};
     // admission credit for output: bytes reserved and not yet handed to the
     // kernel, whether they are still sitting in a queued send task or already
     // sitting in wbuf. It is one number covering both because neither one alone
@@ -533,19 +671,6 @@ struct connection {
             ::close(fd); fd = -1;
         }
     }
-};
-
-// How far a drain got. These used to be 0 / 1 / -1 with two different outcomes
-// sharing the 0: the while-loop ending because wbuf was empty, and EPIPE. The
-// first means every queued byte reached the kernel and the caller should go on
-// to whatever comes next; the second means not one more byte will ever leave,
-// and treating them alike is what put the connection's fate in the hands of
-// `wbuf.empty()` at each call site -- a fact none of them said out loud.
-enum class drain_outcome {
-    drained,   // wbuf is empty: everything owed has reached the kernel
-    stalled,   // fair-share budget spent, or EAGAIN: EPOLLOUT will resume it
-    dead,      // EPIPE: this socket's write direction is finished, permanently
-    error,     // any other failure: fatal
 };
 
 // One closed connection, held until its close callback has run. The conn is
@@ -1008,9 +1133,9 @@ class multi_reactor_server {
     size_t connection_count() const noexcept;
     // Snapshot of every live connection id. The only public call that can
     // throw: it allocates once per shard, so bad_alloc reaches the caller.
-    // stop_gracefully() calls it from a noexcept function on a 10ms loop, which
-    // is the one place where that difference decides between a returned false
-    // and a terminated process.
+    // stop_gracefully() calls it from a noexcept function on a 10ms loop, and
+    // catches the exception there so a bad_alloc falls through to stop() and a
+    // returned false rather than terminating the process.
     std::vector<uint64_t> connection_ids() const;
 
     // Where the listening socket actually is. Equals config::port unless that
@@ -1274,8 +1399,6 @@ inline void sub_reactor::cleanup() noexcept {
         // last bytes. Abort explicitly, and account the undelivered bytes as
         // drops rather than pretending they went out.
         std::shared_ptr<connection> c = conns_.begin()->second;
-        // connection* raw = c.get();
-        // c.reset();
         close_conn(c.get(), "server shutdown", false);
     }
     flush_close_callbacks();
@@ -1370,6 +1493,7 @@ inline void sub_reactor::handle_task(
         c->last_recv_ms = now_ms();
         c->rbuf.init(server_->rbuf_capacity());
         c->wbuf.init(server_->wbuf_capacity());
+        c->fsm.attach(&c->wbuf, &c->rbuf, &c->pending_bytes);
 
         struct epoll_event ev{};
         ev.events = EPOLLIN; ev.data.fd = t.fd.fd;
@@ -1452,8 +1576,8 @@ inline void sub_reactor::handle_task(send_task& task) noexcept {
     // only marks the connection when it runs, and it runs after this one in the
     // same batch. Anything arriving after that point is refused here
     // -- the FIN is already reserved for what we owe the peer.
-    if (c->is_closed.load(std::memory_order_acquire) ||
-        c->closing.load(std::memory_order_acquire)) {
+    if (c->fsm.is_closed.load(std::memory_order_acquire) ||
+        c->fsm.closing.load(std::memory_order_acquire)) {
         c->pending_bytes.fetch_sub(f.size(), std::memory_order_relaxed);
         // One refusal, two questions, two counters: how many replies never went
         // out (queue_drops) and how much data the peer never received
@@ -1521,14 +1645,14 @@ inline bool sub_reactor::try_send_local(multi_reactor_server* expected,
     if (it == conns_.end()) return false;   // another reactor owns it
 
     connection* c = it->second.get();
-    if (c->is_closed.load(std::memory_order_acquire) ||
-        c->closing.load(std::memory_order_acquire)) {
+    if (c->fsm.is_closed.load(std::memory_order_acquire) ||
+        c->fsm.closing.load(std::memory_order_acquire)) {
         *out = send_result::closed;
         return true;
     }
     // A close request is already ahead of this send: take the queued path so
     // the frame is ordered after it and dropped, exactly as before.
-    if (c->close_requests.load(std::memory_order_acquire) != 0) return false;
+    if (c->fsm.close_requests.load(std::memory_order_acquire) != 0) return false;
 
     const size_t frame_size = FRAME_HEADER_SIZE + len;
     // No room now: take the queued path, which reserves the frame and lets the
@@ -1767,7 +1891,7 @@ inline int sub_reactor::handle_read(connection* c) noexcept {
         if (!server_->is_running()) return dispatched();
         // Parse whatever is already a complete frame
         parse_frames(c, frames_left);
-        if (c->is_closed.load(std::memory_order_acquire)) return dispatched();
+        if (c->fsm.is_closed.load(std::memory_order_acquire)) return dispatched();
         if (frames_left <= 0 || bytes_left <= 0) {
             schedule_read(c);
             return dispatched();
@@ -1846,27 +1970,27 @@ inline int sub_reactor::handle_read(connection* c) noexcept {
 inline void sub_reactor::handle_write(connection* c) noexcept {
     // Past our FIN there is nothing left to write, and the EPOLLOUT bit is kept
     // clear, so an event arriving here is stale: just make sure it is off.
-    if (c->fin_sent) {
+    if (c->fsm.fin_sent) {
         disarm_write(c); return;
     }
     const drain_outcome r = drain_wbuf_to_socket(c);
-    if (r == drain_outcome::error) {
-        close_conn(c, "send error", false); return;
-    }
-    // Nothing more will ever leave this socket, so there is nothing for the
-    // rest of this function to wait for: no FIN can be negotiated (it requires
-    // an empty wbuf first) and no later EPOLLOUT can deliver what is queued.
-    // Ending it here rather than waiting is also what keeps this from becoming
-    // the write-side echo of the busy-poll the read side was cured of -- a
-    // socket with send-buffer space and a broken peer reports EPOLLOUT on every
-    // single epoll_wait, and leaving the interest armed would have this reactor
-    // re-run a failing sendmsg until some outside deadline noticed.
-    if (r == drain_outcome::dead) {
-        close_conn(c, "write side dead", false);
+    const close_action a = c->fsm.on_drain_result(r);
+    if (a == close_action::close_abort) {
+        // Nothing more will ever leave this socket, so there is nothing for the
+        // rest of this function to wait for: no FIN can be negotiated (it
+        // requires an empty wbuf first) and no later EPOLLOUT can deliver what
+        // is queued. Ending it here rather than waiting is also what keeps this
+        // from becoming the write-side echo of the busy-poll the read side was
+        // cured of -- a socket with send-buffer space and a broken peer reports
+        // EPOLLOUT on every single epoll_wait, and leaving the interest armed
+        // would have this reactor re-run a failing sendmsg until some outside
+        // deadline noticed.
+        close_conn(c, r == drain_outcome::dead ? "write side dead" : "send error",
+                   false);
         return;
     }
     // fair-share budget or EAGAIN: EPOLLOUT refires
-    if (!c->wbuf.empty()) return;
+    if (a == close_action::none) return;
 
     // A parked peer-close finishes here, deterministically, instead of waiting
     // for the next spurious EPOLLIN to notice the drain completed.
@@ -1914,7 +2038,7 @@ inline void sub_reactor::handle_write(connection* c) noexcept {
     // Adding a guard here would move that accounting nowhere and would make
     // every EPOLLOUT on a parked socket wait another iteration to ask again.
     disarm_write(c);
-    if (c->closing.load(std::memory_order_acquire) &&
+    if (c->fsm.closing.load(std::memory_order_acquire) &&
         !try_begin_write_shutdown(c)) {
         // shutdown() failed on a socket that was writable a moment ago: the
         // only way left to end this connection is a reset, which is at least
@@ -1926,13 +2050,13 @@ inline void sub_reactor::handle_write(connection* c) noexcept {
 // Sends FIN and records it. Reads stay armed: the connection is now waiting for
 // the peer's own FIN (or close_linger_ms, enforced by do_tick).
 inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
-    if (c->fin_sent || c->fd < 0) return c->fin_sent;
+    if (c->fsm.fin_sent || c->fd < 0) return c->fsm.fin_sent;
     // Never FIN over bytes still in wbuf: they would be lost, and the peer
     // would see a clean end to a truncated stream.
     if (!c->wbuf.empty()) return false;
     if (::shutdown(c->fd, SHUT_WR) < 0) return false;
-    c->fin_sent = true;
-    c->fin_sent_at_ms = now_ms();
+    c->fsm.fin_sent = true;
+    c->fsm.fin_sent_at_ms = now_ms();
     return true;
 }
 
@@ -1968,7 +2092,7 @@ inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
 // because a deadline is all it can be sure of. Every half-close initiated by
 // the peer paid for that with an RST it never earned (P0-5).
 inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
-    if (c->is_closed.load(std::memory_order_acquire)) return;
+    if (c->fsm.is_closed.load(std::memory_order_acquire)) return;
     if (!c->wbuf.empty()) {
         // Parked with the write side still productive. Read interest is dropped
         // for the rest of the drain (see the header comment): the only thing a
@@ -2016,22 +2140,26 @@ inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
         // -1.
         return;                    // parked close finishes in handle_write
     }
-    if (!c->closing.load(std::memory_order_acquire) &&
-        c->deferred_round == connection::deferred_round_kind::none &&
-        c->pending_bytes.load(std::memory_order_relaxed) > 0) {
-        c->deferred_round = connection::deferred_round_kind::peer_closed;
+    switch (c->fsm.on_peer_fin()) {
+      case close_action::defer_peer_closed: {
         const uint64_t id = c->id;
         if (enqueue(queue_task{finish_peer_closed_task{id}})) return;
         // The hand-off failed (queue full, or the reactor is going down): a
         // late FIN beats an answer nobody can wait for any longer.
-    }
-    if (c->closing.load(std::memory_order_acquire) && !c->fin_sent) {
+        break;
+      }
+      case close_action::send_fin:
         // Still closing on our side and the peer declared itself done too: the
         // only thing left is the FIN. Anything a handler queued was drained
         // above or is still passing through the socket buffer, ahead of it.
         if (!try_begin_write_shutdown(c)) {
             teardown_closed(c, "peer closed", false); return;
         }
+        break;
+      case close_action::close_graceful:
+        break;
+      default:
+        return;   // none: is_closed was already checked at the top
     }
     teardown_closed(c, "peer closed", true);
 }
@@ -2108,7 +2236,7 @@ inline void sub_reactor::parse_frames(connection* c,
                     pong.size(), std::memory_order_relaxed);
                 close_conn(c, "wbuf full on pong", false); return;
             }
-            if (c->closing.load(std::memory_order_acquire)) {
+            if (c->fsm.closing.load(std::memory_order_acquire)) {
                 // Mid-close: the FIN is already (or about to be) behind
                 // everything we owe the peer. Queueing a PONG after it would
                 // either be sent past the FIN -- which the kernel refuses --
@@ -2129,7 +2257,7 @@ inline void sub_reactor::parse_frames(connection* c,
             // close_conn only marks and unlists now and runs no callback on
             // this stack -- though a failed arm just above may already have
             // closed it.
-            if (c->is_closed.load(std::memory_order_acquire)) return;
+            if (c->fsm.is_closed.load(std::memory_order_acquire)) return;
             c->rbuf.consume(len);
         } else if (type == frame_type::PONG) {
             c->rbuf.consume(len);
@@ -2209,7 +2337,7 @@ inline void sub_reactor::unregister_conn(connection* c,
     // done so: what it buys is that a reader added later cannot find `closing`
     // stale-true on a descriptor that is gone, which is a small mercy next to
     // the alternative.
-    c->closing.store(false, std::memory_order_release);
+    c->fsm.closing.store(false, std::memory_order_release);
 }
 
 // A connection that was accepted and then refused by its own registration --
@@ -2230,7 +2358,7 @@ inline void sub_reactor::discard_rejected_conn(connection* c) noexcept {
     unregister_conn(c);
     conns_.erase(c->id);
     server_->on_connection_closed(c->id);
-    c->is_closed.store(true, std::memory_order_release);
+    c->fsm.is_closed.store(true, std::memory_order_release);
     // The task holds the last reference and would release the ticket on return
     // either way; releasing it here instead frees the admission slot now rather
     // than whenever the ghost was going to be reaped.
@@ -2285,7 +2413,7 @@ inline void sub_reactor::close_conn(connection* c, const char* reason,
                                   bool graceful) noexcept {
     // A graceful close of a live connection is parked; one that has already
     // sent its FIN (or is aborted) is torn down right here.
-    if (graceful && !c->fin_sent) {
+    if (graceful && !c->fsm.fin_sent) {
         park_close(c, reason); return;
     }
     teardown_closed(c, reason, graceful);
@@ -2311,26 +2439,22 @@ inline void sub_reactor::close_conn(connection* c, const char* reason,
 // first FIN is still in flight) must not restart the drain or skip it.
 inline void sub_reactor::park_close(connection* c,
                                     const char* reason) noexcept {
-    if (c->is_closed.load(std::memory_order_acquire) || c->fin_sent) return;
-    if (!c->closing.load(std::memory_order_acquire)) {
-        c->closing.store(true, std::memory_order_release);
-        c->close_started_at_ms = now_ms();
-    }
+    const close_action a = c->fsm.on_graceful();
+    if (a == close_action::none) return;
     // Hand over what is already queued; whatever does not fit in the socket
     // buffer stays in wbuf and is finished by handle_write (EPOLLOUT armed).
     const drain_outcome r = drain_wbuf_to_socket(c);
-    if (r == drain_outcome::error) {
+    switch (c->fsm.on_drain_result(r)) {
+      case close_action::close_abort:
+        // Once the socket refuses writes for good there is no graceful close
+        // left to honour -- nothing owed can leave, so no FIN can honestly
+        // follow it. Waiting would change nothing except which deadline does
+        // this same abort later.
         teardown_closed(c, reason, false); return;
-    }
-    // Once the socket refuses writes for good there is no graceful close left
-    // to honour -- nothing owed can leave, so no FIN can honestly follow it.
-    // Waiting would change nothing except which deadline does this same abort
-    // later.
-    if (r == drain_outcome::dead) {
-        teardown_closed(c, reason, false); return;
-    }
-    if (!c->wbuf.empty()) {
-        arm_write(c); return;
+      case close_action::none:
+        arm_write(c); return;   // stalled: wbuf non-empty, EPOLLOUT resumes
+      default:
+        break;   // drained: wbuf empty, FIN goes out below
     }
     // wbuf empty: either every byte is in the socket buffer, or sendmsg stopped
     // exactly on the budget boundary. In both cases nothing more can be queued
@@ -2373,11 +2497,7 @@ inline void sub_reactor::park_close(connection* c,
 // what was already buffered when the close was asked for: fresh arrivals do not
 // extend it, so a peer that keeps sending cannot hold the close open.
 inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
-    if (c->is_closed.load(std::memory_order_acquire) || c->fin_sent) return;
-
-    // Measured before the read: what had arrived and had not been served yet.
-    if (c->close_input_bytes < 0)
-        c->close_input_bytes = static_cast<int64_t>(c->rbuf.readable());
+    if (c->fsm.on_request() == close_action::none) return;
 
     c->drain_read_bytes = 0;
     const size_t queued_before = c->rbuf.readable();
@@ -2385,7 +2505,7 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
     // handle_read has its own exits: the peer's FIN may have arrived in the
     // same read, or the socket may have errored. Either way the connection is
     // already accounted for and there is nothing left for this request to do.
-    if (c->is_closed.load(std::memory_order_acquire) || c->fin_sent) return;
+    if (c->fsm.is_closed.load(std::memory_order_acquire) || c->fsm.fin_sent) return;
 
     // Charged in bytes, and for every byte the call handed out -- including the
     // ones that arrived during it. Charging `served * FRAME_HEADER_SIZE` made
@@ -2406,59 +2526,40 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
     // of it. What survives past that is at most one read budget of the newest
     // input, bounded by k_read_budget and independent of how much the peer
     // sends.
+    int64_t dealt = 0;
     if (served > 0) {
-        const int64_t dealt = static_cast<int64_t>(queued_before)
-                            + static_cast<int64_t>(c->drain_read_bytes)
-                            - static_cast<int64_t>(c->rbuf.readable());
-        if (dealt > 0) c->close_input_bytes -= dealt;
+        dealt = static_cast<int64_t>(queued_before)
+              + static_cast<int64_t>(c->drain_read_bytes)
+              - static_cast<int64_t>(c->rbuf.readable());
         c->drain_read_bytes = 0;
     }
 
-    // More of the owed input is still buffered and the budget allows another
-    // round: come back for it. Parking here would refuse the replies of frames
-    // this close promised to serve. Progress is required (served > 0) so a peer
-    // that stops mid-frame cannot keep the close pending on a half a frame.
-    if (served > 0 && !c->rbuf.empty() && c->close_input_bytes > 0) {
-        const uint64_t id = c->id;
-        if (enqueue(queue_task{drain_input_task{id}})) return;
-        // The hand-off failed: park below rather than keeping it pending.
+    // The decisions below live in close_fsm::on_input_drained. The defer_drain_input
+    // and defer_park cases are the two "answers are queued behind this batch"
+    // branches; none is the peer_closed round already being owned. Progress is
+    // required (served > 0) so a peer that stops mid-frame cannot hold the close
+    // open on a half a frame. Case F's "11 of 22 bytes" is the defer_park case:
+    // parking early would set `closing`, submit_send refuses the reply, and the
+    // peer gets an orderly FIN over a request we took in, handled, and answered
+    // into nothing.
+    close_action a = c->fsm.on_input_drained(served, dealt);
+    for (;;) {
+        if (a == close_action::defer_drain_input) {
+            const uint64_t id = c->id;
+            if (enqueue(queue_task{drain_input_task{id}})) return;
+            // The hand-off failed: park below rather than keeping it pending.
+            a = c->fsm.on_input_defer_failed();
+            continue;
+        }
+        if (a == close_action::defer_park) {
+            const uint64_t id = c->id;
+            if (enqueue(queue_task{park_close_task{id}})) return;
+            // The hand-off failed: park here rather than keeping it forever.
+            break;
+        }
+        if (a == close_action::drain_wbuf) break;   // park now
+        return;   // none: peer_closed round owns it, or already done
     }
-
-    // Nothing further to read, yet bytes are still reserved: replies whose
-    // handler already ran -- possibly two batches apart, with this task landing
-    // between them. Parking now side-effects every one of them into `closing`,
-    // which submit_send refuses, and the peer gets an orderly FIN over a
-    // request we took in, handled, and answered into nothing (case F: 11 of 22
-    // bytes).
-    // Their reservations still standing is what makes them visible here.
-    if (served == 0 &&
-        c->deferred_round == connection::deferred_round_kind::none &&
-        c->pending_bytes.load(std::memory_order_relaxed) > 0) {
-        c->deferred_round = connection::deferred_round_kind::close;
-        const uint64_t id = c->id;
-        if (enqueue(queue_task{park_close_task{id}})) return;
-        // The hand-off failed: park here rather than keeping it forever.
-    }
-    // The peer's FIN arrived in the same read that dispatched these frames, and
-    // finish_peer_closed() already claimed the round: it is queued to come back
-    // once the replies have landed in wbuf. Parking here would set `closing`
-    // and -- wbuf still being empty -- send the FIN at once, over the very
-    // replies that deferral exists to protect. The close ends in the task that
-    // owns the round, which is also the only one that can see whether anything
-    // is still owed.
-    if (c->deferred_round ==
-        connection::deferred_round_kind::peer_closed) return;
-
-    if (served == 0 ||
-        c->deferred_round == connection::deferred_round_kind::close) {
-        park_close(c, "requested");
-        return;
-    }
-
-    c->deferred_round = connection::deferred_round_kind::close;
-    const uint64_t id = c->id;
-    if (enqueue(queue_task{park_close_task{id}})) return;
-
     // Nothing came of the hand-off -- queue full, or the reactor is going down.
     // A late close beats an answer nobody would wait for, so honour it here.
     park_close(c, "requested");
@@ -2472,7 +2573,7 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
 inline void sub_reactor::teardown_closed(connection* c, const char* reason,
                                        bool graceful) noexcept {
     bool expected = false;
-    if (!c->is_closed.compare_exchange_strong(expected, true,
+    if (!c->fsm.is_closed.compare_exchange_strong(expected, true,
                                              std::memory_order_acq_rel))
         return;
     // reason is not stored on the connection: it is forwarded straight into the
@@ -2605,14 +2706,14 @@ inline void sub_reactor::do_tick() noexcept {
     std::vector<connection_ptr> stalled;   // frame never completed
     for (auto& kv : conns_) {
         connection* c = kv.second.get();
-        if (c->closing.load(std::memory_order_acquire)) {
+        if (c->fsm.closing.load(std::memory_order_acquire)) {
             // A closing connection has a deadline regardless of which stage it
             // reached, and it is the same value for both: how long the close
             // may take. last_recv_ms is useless here (the peer has nothing left
             // to send), so measure from the close itself; park_close stamps
             // close_started_at_ms before any of the stages that can stall.
-            if (linger > 0 && c->fd >= 0 && c->close_started_at_ms != 0 &&
-                now - c->close_started_at_ms >= linger)
+            if (linger > 0 && c->fd >= 0 && c->fsm.close_started_at_ms != 0 &&
+                now - c->fsm.close_started_at_ms >= linger)
                 expired.push_back(kv.second);
             continue;
         }
@@ -2729,7 +2830,7 @@ inline void sub_reactor::loop() noexcept {
                 }
                 if (ev & EPOLLIN) {
                     handle_read(c);
-                    if (c->is_closed.load(std::memory_order_acquire)) continue;
+                    if (c->fsm.is_closed.load(std::memory_order_acquire)) continue;
                 }
                 if (ev & EPOLLOUT) {
                     handle_write(c);
@@ -3080,7 +3181,12 @@ inline bool multi_reactor_server::stop_gracefully(int timeout_ms) noexcept {
 
     const int64_t deadline = now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
     while (now_ms() < deadline) {
-        const std::vector<uint64_t> ids = connection_ids();
+        std::vector<uint64_t> ids;
+        try {
+            ids = connection_ids();
+        } catch (...) {
+            break;  // Could not snapshot; fall through to stop() below.
+        }
         if (ids.empty() && admitted_.load(std::memory_order_acquire) == 0) {
             break;
         }
@@ -3451,8 +3557,8 @@ inline send_result multi_reactor_server::send_to(uint64_t conn_id,
     // would describe a frame that is going into bytes_dropped on arrival. This
     // is not a shutdown or a disconnection that ok is allowed to be vague about
     // -- it is the close this caller asked for moments ago.
-    if (c->is_closed.load(std::memory_order_acquire) ||
-        c->closing.load(std::memory_order_acquire)) return send_result::closed;
+    if (c->fsm.is_closed.load(std::memory_order_acquire) ||
+        c->fsm.closing.load(std::memory_order_acquire)) return send_result::closed;
 
     std::vector<uint8_t> frame;
     try {
@@ -3514,9 +3620,9 @@ inline bool multi_reactor_server::close_connection(uint64_t conn_id) noexcept {
     // queued, not from the moment the caller returns: otherwise a handler
     // already in flight can pass the fast-path check while the close task is
     // being appended, and write ahead of it (R9-4).
-    c->close_requests.fetch_add(1, std::memory_order_release);
+    c->fsm.close_requests.fetch_add(1, std::memory_order_release);
     if (!c->owner->submit_close(conn_id)) {
-        c->close_requests.fetch_sub(1, std::memory_order_release);
+        c->fsm.close_requests.fetch_sub(1, std::memory_order_release);
         stats_.close_requests_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
