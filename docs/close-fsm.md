@@ -21,7 +21,8 @@ This spec defines `close_fsm`, a **pure state machine** that owns the close stat
 **Goals**
 
 - Concentrate the close invariants (the `fin_sent`-vs-`closing` split, the one-round
-  deferral, the `close_input_bytes` budget, the linger deadline) behind one small seam.
+  deferral, the `close_input_bytes` budget, the close timestamp the linger deadline
+  measures from) behind one small seam.
 - Make the close protocol unit-testable without a live socket.
 - Make the reactor's nine close methods thin callers of one state machine.
 
@@ -60,7 +61,6 @@ close fields and the decision logic in the nine methods.
 | `deferred_round` | `enum { none, close, peer_closed }` | `connection::deferred_round` |
 | `close_input_bytes` | `int64_t` | `connection::close_input_bytes` |
 | `close_started_at_ms` | `int64_t` | `connection::close_started_at_ms` |
-| `fin_sent_at_ms` | `int64_t` | `connection::fin_sent_at_ms` |
 | `is_closed` | `std::atomic<bool>` | `connection::is_closed` |
 
 The cross-thread atomics `close_requests` and `is_closed` move into the FSM but keep
@@ -137,10 +137,11 @@ stateDiagram-v2
 
 | state | event | action | next state |
 |---|---|---|---|
-| OPEN | `on_request()` | `drain_input` (or `drain_wbuf` if rbuf empty) | DRAINING_INPUT (or PARKED) |
+| OPEN | `on_request()` | `drain_input` (even if rbuf is empty: the read still runs once) | DRAINING_INPUT |
 | OPEN | `on_graceful()` | `drain_wbuf` | PARKED |
 | DRAINING_INPUT | `on_input_drained(served>0, more buffered, budget left)` | `defer_drain_input` | DRAINING_INPUT |
-| DRAINING_INPUT | `on_input_drained(served==0, pending_bytes>0)` | `defer_park` | PARKED |
+| DRAINING_INPUT | `on_input_drained(served==0, pending_bytes>0, first time)` | `defer_park` | PARKED |
+| DRAINING_INPUT | `on_input_drained(served>0, nothing buffered, first time)` | `defer_park` (the queued park round drains) | PARKED |
 | DRAINING_INPUT | `on_input_drained(otherwise)` | `drain_wbuf` | PARKED |
 | PARKED | `on_drain_result(stalled)` | `none` (EPOLLOUT resumes) | PARKED |
 | PARKED | `on_drain_result(drained)` | `drain_complete` (reactor then `shutdown`; on failure the linger deadline ends it) | FIN_SENT or PARKED |
@@ -190,9 +191,10 @@ as a plain struct holding the fields; behaviour moves into it one method at a ti
 1. **Introduce `close_fsm`** as a nested struct holding the ten fields (rename nothing
    yet; `connection` delegates to `fsm.closing`, etc.). Pure mechanical move.
 2. **Move the pure decisions** — `try_begin_write_shutdown`'s emptiness check, the
-   `deferred_round` bookkeeping, the `close_input_bytes` budget, the linger deadline
-   — into `on_*` methods that return the action enum. The nine methods become thin
-   callers that perform the returned action.
+   `deferred_round` bookkeeping, the `close_input_bytes` budget, and the
+   `close_started_at_ms` stamp the linger deadline measures from — into `on_*`
+   methods that return the action enum. The nine methods become thin callers that
+   perform the returned action. `do_tick` still computes the deadline itself.
 3. **Remove the scattered flags** once no reactor code reads them directly.
 4. **Add the unit tests** (below) alongside, and run `verify/run.sh` (plain + ASan +
    TSan) after each slice.
@@ -205,17 +207,19 @@ No step changes wire behaviour; `close_semantics`, `idle_semantics`, `ping_pong`
 **Surviving (integration, unchanged):** `close_semantics` (FIN-vs-RST, mid-close
 reads, counter closure), `idle_semantics`, `ping_pong`, `backpressure`, `fault_injection`.
 
-**New (unit, no socket):** drive `close_fsm` directly with a fake `wbuf`/`rbuf`/
-`pending_bytes` view and assert the returned action:
+**New (unit, no socket):** `run_close_fsm_unit_cases()` in `verify/close_semantics.cpp`
+drives `close_fsm` directly with a fake `wbuf`/`rbuf`/`pending_bytes` view and
+asserts the returned action:
 
-- `on_request` → `drain_input` (empty rbuf is handled by the following `on_input_drained`).
+- `on_request` → `drain_input`, and it measures `close_input_bytes` from rbuf.
 - `on_input_drained(served>0, more buffered, budget left)` → `defer_drain_input`.
-- `on_input_drained(served>0, no more buffered)` → `drain_wbuf`.
+- `on_input_drained(served>0, nothing buffered)` → `defer_park` (the queued park round drains).
 - `on_input_drained(served==0, pending_bytes>0)` → `defer_park` (one round only).
 - `on_input_drained` twice → the one-round rule: no second defer for the same round.
-- `on_input_defer_failed` after a `defer_drain_input` enqueue failure → `defer_park` (or `drain_wbuf`/`none` per `deferred_round`).
-- `on_drain_result(drained)` → `drain_complete`.
+- `on_input_defer_failed` after a `defer_drain_input` enqueue failure → `defer_park`; with a `peer_closed` round already owned → `none`.
+- `on_drain_result(drained)` → `drain_complete`; `(stalled)` → `none`.
 - `on_drain_result(dead)` / `(error)` → `close_abort`.
+- `on_peer_fin` with wbuf non-empty → `none`.
 - `on_peer_fin` with wbuf empty + pending_bytes>0 → `defer_peer_closed` (first time only).
 - `on_peer_fin` with closing and nothing owed → `send_fin`.
 - `on_peer_fin` otherwise → `close_graceful`.

@@ -471,7 +471,6 @@ struct close_fsm {
     // input. Negative means "not measured yet". Reactor-thread-only.
     int64_t               close_input_bytes = -1;
     int64_t               close_started_at_ms = 0;  // when the close was parked
-    int64_t               fin_sent_at_ms = 0;       // when SHUT_WR returned
     // Shared across threads: teardown_closed() sets it, send_to() and the
     // close paths read it.
     std::atomic<bool>     is_closed{false};
@@ -490,7 +489,7 @@ struct close_fsm {
 
     // ----- decisions (pure: read state + view, return the next action) -----
 
-    bool wbuf_empty() const noexcept { return wbuf_ && wbuf_->empty(); }
+    bool wbuf_empty() const noexcept { return !wbuf_ || wbuf_->empty(); }
     bool rbuf_empty() const noexcept { return rbuf_ ? rbuf_->empty() : true; }
     size_t pending() const noexcept {
         return pending_bytes_
@@ -565,12 +564,14 @@ struct close_fsm {
         return park_decision(1);   // 1: served was > 0 in that path
     }
 
-    // The peer FINed and wbuf is empty. defer_peer_closed spends the one
-    // allowed queue round waiting for replies to land; otherwise FIN (if we
-    // are closing) or tear down.
+    // The peer FINed. A productive wbuf means it is not our turn yet: the
+    // caller parks, handle_write resumes this once the bytes are out.
+    // defer_peer_closed spends the one allowed queue round waiting for replies
+    // to land; otherwise FIN (if we are closing) or tear down.
     close_action on_peer_fin() noexcept {
         if (is_closed.load(std::memory_order_acquire))
             return close_action::none;
+        if (!wbuf_empty()) return close_action::none;
         if (!closing.load(std::memory_order_acquire) &&
             deferred_round == deferred_kind::none && pending() > 0) {
             deferred_round = deferred_kind::peer_closed;
@@ -632,7 +633,7 @@ struct connection {
     // -------- close protocol --------
     // The close state now lives in `fsm` (docs/close-fsm.md): closing,
     // close_requests, fin_sent, deferred_round, close_input_bytes,
-    // close_started_at_ms, fin_sent_at_ms and is_closed moved there. The two
+    // close_started_at_ms and is_closed moved there. The two
     // fields kept here are read-path, not close state:
     // Bytes this connection's handle_read() has taken off the socket since
     // drain_input_then_close() zeroed it, which is always either nobody or the
@@ -644,8 +645,7 @@ struct connection {
     // moment the drain completes, instead of waiting for a spurious EPOLLIN.
     bool       peer_closed = false;
     // Graceful-close state machine (closing, close_requests, fin_sent,
-    // deferred_round, close_input_bytes, close_started_at_ms, fin_sent_at_ms,
-    // is_closed).
+    // deferred_round, close_input_bytes, close_started_at_ms, is_closed).
     close_fsm  fsm;
 
     // Shared across threads from here down:
@@ -2073,10 +2073,9 @@ inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
     if (c->fsm.fin_sent || c->fd < 0) return c->fsm.fin_sent;
     // Never FIN over bytes still in wbuf: they would be lost, and the peer
     // would see a clean end to a truncated stream.
-    if (!c->wbuf.empty()) return false;
+    if (!c->fsm.wbuf_empty()) return false;
     if (::shutdown(c->fd, SHUT_WR) < 0) return false;
     c->fsm.fin_sent = true;
-    c->fsm.fin_sent_at_ms = now_ms();
     return true;
 }
 
@@ -2113,7 +2112,7 @@ inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
 // the peer paid for that with an RST it never earned (P0-5).
 inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
     if (c->fsm.is_closed.load(std::memory_order_acquire)) return;
-    if (!c->wbuf.empty()) {
+    if (!c->fsm.wbuf_empty()) {
         // Parked with the write side still productive. Read interest is dropped
         // for the rest of the drain (see the header comment): the only thing a
         // read could deliver is the FIN we have already seen.
@@ -2567,21 +2566,17 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
     // submit_send refuses the reply, and the peer gets an orderly FIN over a
     // request we took in, handled, and answered into nothing.
     close_action a = c->fsm.on_input_drained(served, dealt);
-    for (;;) {
-        if (a == close_action::defer_drain_input) {
-            const uint64_t id = c->id;
-            if (enqueue(queue_task{drain_input_task{id}})) return;
-            // The hand-off failed: park below rather than keeping it pending.
-            a = c->fsm.on_input_defer_failed();
-            continue;
-        }
-        if (a == close_action::defer_park) {
-            const uint64_t id = c->id;
-            if (enqueue(queue_task{park_close_task{id}})) return;
-            // The hand-off failed: park here rather than keeping it forever.
-            break;
-        }
-        if (a == close_action::drain_wbuf) break;   // park now
+    if (a == close_action::defer_drain_input) {
+        const uint64_t id = c->id;
+        if (enqueue(queue_task{drain_input_task{id}})) return;
+        // The hand-off failed: park below rather than keeping it pending.
+        a = c->fsm.on_input_defer_failed();
+    }
+    if (a == close_action::defer_park) {
+        const uint64_t id = c->id;
+        if (enqueue(queue_task{park_close_task{id}})) return;
+        // The hand-off failed: park here rather than keeping it forever.
+    } else if (a != close_action::drain_wbuf) {
         return;   // none: peer_closed round owns it, or already done
     }
     // Nothing came of the hand-off -- queue full, or the reactor is going down.
