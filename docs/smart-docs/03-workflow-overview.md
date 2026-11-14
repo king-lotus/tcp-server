@@ -37,14 +37,14 @@ sequenceDiagram
     K->>A: EPOLLIN on listen socket
     A->>K: accept4
     K-->>A: new fd
-    A->>A: admitted_ >= max_connections?
-    Note over A: if over the ceiling, close fd and count rejected
+    A->>A: count, byte budget, per-IP cap?
+    Note over A: if over any ceiling, close fd and count rejected
     A->>K: TCP_NODELAY, SO_KEEPALIVE, keepalive timers
-    A->>A: getnameinfo into peer string
+    A->>A: getnameinfo into peer string and per-IP key
     A->>A: pick_reactor, round-robin
     A->>R: new_conn_task with ownership of the fd
     R->>R: build connection, both ring buffers
-    R->>R: insert into conn map and fd_index
+    R->>R: insert into the id-keyed conn map
     R->>App: conn_state_handler(id, peer, true)
 ```
 
@@ -209,6 +209,9 @@ flowchart LR
 | `write_budget_bytes` | Bytes written to one socket per drain | Control returns to the reactor |
 | `handler_queue_limit` | Queued offload tasks server-wide | `offload` returns `false` |
 | `max_connections` | Admitted plus admitted-but-not-yet-open | New connection closed immediately, `rejected` |
+| `max_total_buffer_bytes` | Buffer bytes reserved by admitted connections | New connection closed immediately, `buffer_budget_rejections` |
+| `max_connections_per_ip` | Live connections from one numeric peer address | New connection closed immediately, `ip_rejections` |
+| `read_high_watermark_bytes` | Pending output for one connection | Reading pauses (EPOLLIN dropped) until the low mark; `read_pauses` |
 
 ## Error handling
 
@@ -216,7 +219,11 @@ flowchart LR
 |---|---|---|
 | Bad magic, over-length frame | Abort with RST | `parse_errors` |
 | Ring buffer full with a partial frame | Abort | `parse_errors` |
-| `EPOLLHUP` / `EPOLLERR` | Abort immediately, do not drain | `aborted` |
+| `EPOLLERR` | Abort immediately, do not drain | `aborted` |
+| `EPOLLHUP` with `EPOLLIN` | Serve the peer's FIN (`recv() == 0`), then close per the FSM | `aborted` only if the socket was broken |
+| `EPOLLHUP` with no readable EOF | Abort | `aborted` |
+| Pending output above the high watermark | Stop reading at a frame boundary, drop `EPOLLIN` | `read_pauses` |
+| Close callback throws | Contained; the connection was already gone | `callback_exceptions` |
 | `recv`/`sendmsg` error | Abort | `aborted` |
 | `epoll_ctl` registration failure | Abort the connection | `epoll_ctl_errors` |
 | `accept4` failure | Continue accepting | `accept_errors` |

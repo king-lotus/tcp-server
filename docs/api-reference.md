@@ -104,22 +104,31 @@ validated by `start()`; nothing is checked at construction.
 | `bind_addr` | `"0.0.0.0"` | Listen address. Defaults to every interface. |
 | `port` | `0` | Listen port. `0` asks the kernel to choose; read `server.port()` afterwards. |
 | `backlog` | `1024` | `listen()` backlog. Must be > 0. |
+| `reuse_port` | `false` | Set `SO_REUSEPORT` on the listener. Off by default so a duplicate instance fails to bind; on, the kernel may split connections between processes on the same port. |
 | `num_reactors` | `0` | Reactor threads. `0` means `hardware_concurrency()`; capped at 64. |
 | `max_connections` | `10000` | Admission ceiling. A connection over it is accepted and immediately closed, counted in `rejected`. |
+| `max_total_buffer_bytes` | `0` | Ceiling on buffer bytes reserved by admitted connections. `0` means `max_connections × (rbuf_capacity + wbuf_capacity)`. Must admit at least one connection. |
+| `max_connections_per_ip` | `0` | Most live connections from one numeric peer address. `0` is unlimited. Over the cap the socket is accepted and immediately closed, counted in `rejected` and `ip_rejections`. |
 | `idle_timeout_ms` | `120000` | Close a connection after this long with **no bytes received**. Must be > 0. |
 | `tick_ms` | `500` | Granularity of every deadline. Must be > 0; a tick coarser than a deadline makes that deadline late by up to one tick, and `start()` warns. |
 | `frame_assembly_timeout_ms` | `0` | Deadline for one frame, measured from its first byte. `0` means 5 × `idle_timeout_ms`. Must be ≥ 0. |
 | `rbuf_capacity` | `65544` | Per-connection read buffer. Must be ≥ 65544: a smaller one cannot hold a legal maximum frame. |
 | `wbuf_capacity` | `65544` | Per-connection write buffer. Must be ≥ 8. |
 | `max_pending_bytes` | `65544` | Ceiling on bytes accepted for one connection but not yet written. Clamped down to `wbuf_capacity` by `start()`. |
+| `socket_send_buffer_bytes` | `0` | `SO_SNDBUF` for accepted sockets. `0` keeps the OS default; a smaller value bounds the kernel send-buffer memory one connection can pin and makes read backpressure engage sooner. |
+| `read_high_watermark_bytes` | `0` | Above this much pending output the reactor stops reading and drops `EPOLLIN`. `0` means 3/4 of the effective `max_pending_bytes`. |
+| `read_low_watermark_bytes` | `0` | Pending output at or below this resumes reading. `0` means half the high mark. Explicit values must satisfy `0 < low < high ≤ max_pending_bytes`. |
 | `write_budget_bytes` | `262144` | Most bytes written to one socket in a single drain before control returns to the reactor, so one fast sender cannot monopolise it. Must be > 0. |
 | `close_linger_ms` | `5000` | Total budget for a graceful close, counted from the moment it is parked: drain the write buffer, send the FIN, then wait for the peer's FIN. Must be > 0. |
 | `handler_threads` | `0` | Size of the optional offload pool. `0` disables `offload()` entirely; capped at 64. |
 | `handler_queue_limit` | `8192` | Queued offload tasks across the whole server. Must be > 0 when `handler_threads > 0`. |
 
-Two helpers resolve the "0 means decide for me" fields for callers that need the
-same number the server used: `resolved_reactor_count()` and
-`resolved_frame_assembly_timeout_ms()`.
+Helpers resolve the "0 means decide for me" fields for callers that need the
+same number the server used: `resolved_reactor_count()`,
+`resolved_frame_assembly_timeout_ms()`,
+`resolved_read_high_watermark_bytes()`,
+`resolved_read_low_watermark_bytes()`,
+`per_connection_buffer_bytes()` and `resolved_max_total_buffer_bytes()`.
 
 ## `multi_reactor_server`
 
@@ -164,8 +173,10 @@ using close_handler      = std::function<void(uint64_t conn_id,
 
 Both close-side callbacks (the `false` transition and `close_handler`) are
 **deferred**: they run on the owning worker after the connection's stack frame
-has unwound, which is what makes `stop()` from a callback safe. They run on a
-`noexcept` path — an exception escaping either one terminates the process.
+has unwound, which is what makes `stop()` from a callback safe. A throwing
+close-side callback is contained: the exception is counted in
+`callback_exceptions`, the other notification callback still runs, and the
+server keeps serving.
 
 The application is told about a close exactly once. If the notification cannot
 be allocated, the connection still goes away and `close_callbacks_dropped`
@@ -188,14 +199,17 @@ started, when called from a callback, or when the configuration is rejected:
 `max_connections <= 0`, `tick_ms <= 0`, `idle_timeout_ms <= 0`,
 `write_budget_bytes == 0`, `close_linger_ms <= 0`, `backlog <= 0`,
 `frame_assembly_timeout_ms < 0`, `handler_threads < 0`,
-`handler_threads > 64`, or `handler_threads > 0` with
-`handler_queue_limit == 0`.
+`handler_threads > 64`, `handler_threads > 0` with
+`handler_queue_limit == 0`, `max_connections_per_ip < 0`,
+`max_total_buffer_bytes` below one connection's buffers, or read watermarks that
+are not `0 < low < high ≤ max_pending_bytes`.
 
 `start()` also inspects `RLIMIT_NOFILE`: it tries to raise the soft limit to the
-hard limit, and warns when the limit is below `max_connections + 64`. That
-budget does not account for the two descriptors each reactor needs, so with many
-reactors and a tight limit, connections may still be refused before
-`max_connections` is reached; each refusal is counted in `accept_errors`.
+hard limit, and warns when the limit is below
+`max_connections + 2 × (1 + reactors) + 16` — the accept epoll/eventfd pair,
+one epoll/eventfd pair per reactor, and a small margin. When the limit is tight,
+connections are still refused before `max_connections` is reached; each refusal
+is counted in `accept_errors`.
 
 **`stop()`** is immediate and abortive: stop accepting, close every connection,
 join everything. Connections still holding queued output are torn down rather
@@ -203,8 +217,9 @@ than drained. Calling it twice is harmless. Called from a callback it only
 requests shutdown and returns — the controlling thread must still call it.
 
 **`stop_gracefully(timeout_ms)`** stops accepting, then asks every connection to
-close gracefully, repeating for up to `timeout_ms` (polling every 10 ms) before
-falling through to `stop()`. It returns `true` when no connections and no
+close gracefully and waits for up to `timeout_ms` (polling every 10 ms) before
+falling through to `stop()`. Each connection is asked once; only a request the
+reactor queue refused is retried. It returns `true` when no connections and no
 admission reservations remain, `false` otherwise — including when it was called
 from a callback, in which case it only requests shutdown. With `timeout_ms <= 0`
 the drain window is empty and it falls straight through to `stop()`.
@@ -257,11 +272,12 @@ bool close_connection(uint64_t conn_id) noexcept;
 
 Starts a graceful close: pending output is drained, then FIN, then the peer's
 FIN is awaited — all within the single `close_linger_ms` budget, counted from
-the moment the close is parked. Returns `true` if the request
-reached the owning reactor's queue, `false` if it did not — the server is not
-running, the connection is unknown, it has no owner, or the queue refused it. A
-`false` does not close anything: the connection stays open until something else
-ends it. Every `false` is counted in `close_requests_dropped`.
+the moment the close is parked. Returns `true` if the request reached the owning
+reactor's queue immediately, `false` if it did not — the server is not running,
+the connection is unknown, it has no owner, or the queue refused it. A refused
+request is **not lost**: it is recorded on the connection and `do_tick()`'s
+sweep performs the same drain-then-close within one tick, so `false` means
+"delayed", not "ignored". Each refusal is counted in `close_requests_dropped`.
 
 ```cpp
 bool offload(uint64_t conn_id, std::function<void()> fn) noexcept;
@@ -332,9 +348,13 @@ iteration: exact when idle, up to one iteration behind under load.
 | `accept_errors` | `accept4` failed — typically descriptor exhaustion. |
 | `pending_tasks_total` / `pending_tasks_depth` | Tasks submitted through the cross-thread queue, and the current queue depth. The owner-thread fast path touches neither. |
 | `eof_reads` | `recv` returned 0. A parked half-close makes this repeat under level-triggered epoll, so a fast-moving value means the reactor is spinning on one FIN. |
-| `close_requests_dropped` | `close_connection` was refused; the connection was not asked to close. |
+| `close_requests_dropped` | The queue refused `close_connection`'s immediate hand-off. The close is still performed by the tick sweep; the counter is a queue-pressure signal. |
+| `read_pauses` | Read backpressure engaged: pending output crossed the high watermark and `EPOLLIN` was dropped. |
+| `buffer_bytes` / `buffer_budget_rejections` | Buffer bytes reserved by admitted connections, and admissions refused because `max_total_buffer_bytes` had no room. |
+| `ip_rejections` | Admissions refused because the peer address already had `max_connections_per_ip` live connections. |
 | `epipe_writes` | `sendmsg` returned `EPIPE`. Expected to stay 0 — every path that could reach it is guarded first. |
 | `close_callbacks_dropped` | The close notification could not be allocated; the connection was torn down unannounced. |
+| `callback_exceptions` | A close-side callback threw. The exception was contained; the connection was already gone. |
 
 ## Close reasons
 
@@ -343,7 +363,7 @@ The `reason` passed to `close_handler`, and why each one appears.
 | Reason | Cause |
 |---|---|
 | `peer closed` | The peer sent FIN. Graceful if all output was already delivered. |
-| `hup/err` | `EPOLLHUP`/`EPOLLERR`: the peer reset the connection. |
+| `hup/err` | `EPOLLERR`: the peer reset the connection. Also `EPOLLHUP` when no readable EOF accompanied it. A plain `EPOLLHUP` after our own FIN is the peer's FIN and is reported as `peer closed`. |
 | `idle timeout` | No bytes for `idle_timeout_ms`. |
 | `frame assembly timeout` | A partial frame did not complete in time. |
 | `close linger expired` | The graceful close did not finish within `close_linger_ms`: either the FIN went unanswered, or the output ahead of it never drained. |
@@ -364,14 +384,17 @@ The `reason` passed to `close_handler`, and why each one appears.
 
 ## What the library does not do
 
-- **No TLS, no authentication, no per-IP limits.** `bind_addr` defaults to every
-  interface; putting this on an untrusted network means putting a TLS terminator
-  or a firewall in front of it.
+- **No TLS and no authentication.** `bind_addr` defaults to every interface;
+  putting this on an untrusted network means putting a TLS terminator or a
+  firewall in front of it. Per-IP admission is available but opt-in
+  (`max_connections_per_ip`).
 - **No signal handling.** See [threading model](#threading-model).
 - **No application-level framing beyond the header.** Payloads are opaque and
   are delivered exactly as framed.
-- **No flow control beyond backpressure.** A peer that stops reading eventually
-  hits `max_pending_bytes` and its frames are refused.
+- **No application-level pacing beyond backpressure.** A peer that stops reading
+  crosses the read high watermark, at which point the reactor stops reading so
+  TCP pushes back on the sender; `send_to` still refuses frames past
+  `max_pending_bytes`.
 - **Keepalive is on**, with a 30 s idle interval, 10 s probe interval and 3
   probes, so a vanished peer is detected by the kernel even when
   `idle_timeout_ms` is long.

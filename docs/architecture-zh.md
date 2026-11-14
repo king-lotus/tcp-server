@@ -42,7 +42,7 @@ industrial::multi_reactor_server server(cfg);
       │ 自己的线程        │          │ 自己的线程        │
       │ epoll fd         │          │ epoll fd         │
       │ eventfd 唤醒      │          │ eventfd 唤醒      │
-      │ conns_/fd_index_ │          │ conns_/fd_index_ │
+      │ conns_（按 id）   │          │ conns_（按 id）   │
       │ 任务队列          │          │ 任务队列          │
       └────────┬─────────┘          └────────┬─────────┘
                │                             │
@@ -78,13 +78,18 @@ industrial::multi_reactor_server server(cfg);
 3. 设置 `TCP_NODELAY`、`SO_KEEPALIVE`（`TCP_KEEPIDLE=30s`、
    `TCP_KEEPINTVL=10s`、`TCP_KEEPCNT=3`）。
 4. 取对端地址字符串，分配递增的连接 id。
-5. 准入：`max_connections` 用 `admission_ticket` 的 RAII 计数控制；超限直接 `rejected++`
-   并关闭新 fd。
+5. 准入：`admission_ticket` 用 RAII 同时计入连接数与缓冲字节
+   （`rbuf_capacity + wbuf_capacity`）。超过 `max_connections`、超过
+   `max_total_buffer_bytes`，或同一数字 IP 已有 `max_connections_per_ip`
+   条连接时，直接 `rejected++`（后两者另计
+   `buffer_budget_rejections` / `ip_rejections`）并关闭新 fd。
 6. 轮转选 reactor，把 fd 所有权交给它；注册成功后才 `accepted++`，失败则
    `rejected++`。
 
 `accepted` 统计的是“已经注册进 reactor 的连接”，不是“accept 返回的 fd”；
-`max_connections` 的准入计数则覆盖从 accept 到连接销毁的整个生命周期。
+准入计数与字节预占覆盖从 accept 到连接销毁的整个生命周期。缓冲本身用
+`new uint8_t[cap]` 惰性分配：页在真正写入前不落盘，但预占按完整容量记账，
+所以 `max_total_buffer_bytes` 仍是上限。
 
 ### 2.3 reactor 主循环
 
@@ -95,9 +100,9 @@ while (running && server->is_running()) {
     处理本 reactor 的待读连接（最多 64 条，每条 handle_read 有预算）
     发布 frames_recv_local_ → stats.frames_recv
     epoll_wait(..., read_head_ ? 0 : tick_ms)
-    处理 EPOLLIN / EPOLLOUT / EPOLLHUP|EPOLLERR
+    处理 EPOLLIN / EPOLLOUT / EPOLLERR   // HUP 与 IN 同到走读路径
     flush_close_callbacks()     // 延迟的关闭回调
-    process_pending()          // 任务队列
+    process_pending()          // 任务队列，整批事件处理完后统一跑
     flush_close_callbacks()
     到 tick 点则 do_tick()     // 空闲与 linger 扫描
 }
@@ -137,8 +142,8 @@ while (running && server->is_running()) {
 
 注意：`message_handler` 只收到载荷，**收不到 type**。非 PING/PONG 的未定义类型
 也会被当作 DATA 交给回调；如果应用需要区分消息类型，应把类型编码进载荷，或修改
-实现。`PING` 的回 `PONG` 也受 `max_pending_bytes` 约束：发不出去时会中止连接并
-记录原因。
+实现。`PING` 的回 `PONG` 也受 `max_pending_bytes` 约束：预占失败时先暂停读
+（见 6.4 的读侧背压），把同一帧留给恢复后重试，而不是直接中止连接。
 
 ---
 
@@ -281,6 +286,11 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
    里的字节”。这是软上限，超过时 `overloaded` 且 `queue_drops++`。
 2. **每 reactor 任务队列上限**：`max(8192, (max_connections / reactors) * 4)`。
    满时提交被拒绝，同样计入 `queue_drops`。
+3. **读侧水位线**：`pending_bytes` 超过 `read_high_watermark_bytes` 时，reactor
+   停在帧边界、取消 `EPOLLIN`，让 TCP 对发送方施加压力；降到
+   `read_low_watermark_bytes` 及以下再恢复。暂停期间跳过帧装配超时扫描，
+   空闲超时仍按“最近收到字节或最近写出字节”计算。关闭请求会越过暂停，
+   由 `close_input_bytes` 与 `close_linger_ms` 继续封顶。
 
 `wbuf_capacity` 默认也是 65544，正好能放下一个最大帧。`start()` 只要求
 `wbuf_capacity >= 8`；如果显式调小，最大帧的回复会以 `overloaded`/`too_large`
@@ -313,9 +323,11 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 5. **销毁连接**：`teardown_closed()` → `close(fd)`，然后在安全栈帧上执行延迟的
    `conn_state_handler(false)` 和 `close_handler`。
 
-`close_connection()` 返回 `true` 只表示“请求到达了 reactor 队列”，不表示连接已经
-关闭。返回 `false` 表示请求没送到（没有 owner 或队列满），连接仍然活着；
-这种情况计入 `close_requests_dropped`。
+`close_connection()` 返回 `true` 只表示“请求立即到达了 reactor 队列”，不表示连接
+已经关闭。返回 `false` 表示请求没送到（没有 owner 或队列满）；但请求不会丢：
+连接上的 `close_wanted` 会记录它，`do_tick()` 的扫描在一个 tick 内执行同样的
+“先排输入、再关闭”。每次队列拒绝计入 `close_requests_dropped`，它是队列压力的
+信号，不再表示关闭被放弃。
 
 ### 6.2 中止（内部路径）
 
@@ -380,14 +392,20 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `bind_addr` | `"0.0.0.0"` | 监听地址 |
 | `port` | `0` | 0 表示内核选临时端口；启动后用 `server.port()` 读回 |
 | `backlog` | `1024` | `listen()` backlog，必须 > 0 |
+| `reuse_port` | `false` | 是否设置 `SO_REUSEPORT`；默认关闭，重复实例会 bind 失败 |
 | `num_reactors` | `0` | 0 = `hardware_concurrency()`；上限 64 |
 | `max_connections` | `10000` | 准入上限，必须 > 0 |
+| `max_total_buffer_bytes` | `0` | 准入缓冲字节上限；0 = `max_connections × (rbuf+wbuf)`；至少要能容纳一条连接 |
+| `max_connections_per_ip` | `0` | 单个数字 IP 的最大在线连接数；0 = 不限，必须 >= 0 |
 | `idle_timeout_ms` | `120000` | 空闲关闭阈值，必须 > 0 |
 | `frame_assembly_timeout_ms` | `0` | 0 = `5 × idle_timeout_ms`；正数为绝对毫秒；必须 >= 0 |
 | `tick_ms` | `500` | 定时器粒度，必须 > 0 |
 | `rbuf_capacity` | `MAX_FRAME_SIZE` (65544) | 读缓冲；必须 >= 65544 |
 | `wbuf_capacity` | `MAX_FRAME_SIZE` (65544) | 写缓冲；必须 >= 8 |
 | `max_pending_bytes` | `MAX_FRAME_SIZE` (65544) | 单连接待发软上限；启动时会被压到 `<= wbuf_capacity` |
+| `socket_send_buffer_bytes` | `0` | accepted socket 的 `SO_SNDBUF`；0 = 保留系统默认 |
+| `read_high_watermark_bytes` | `0` | 读暂停高水位；0 = 有效 `max_pending_bytes` 的 3/4 |
+| `read_low_watermark_bytes` | `0` | 读恢复低水位；0 = 高水位的一半；显式值需满足 `0 < low < high <= max_pending_bytes` |
 | `write_budget_bytes` | `262144` | 单次 drain 最多写多少字节，必须非 0 |
 | `close_linger_ms` | `5000` | 一次优雅关闭的总预算（park 起算，含排空与等对端 FIN），必须 > 0 |
 | `handler_threads` | `0` | 可选的 offload 池线程数；0 = 不启用；上限 64 |
@@ -404,6 +422,9 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 - `frame_assembly_timeout_ms < 0`（0 合法，表示 `5 × idle_timeout_ms`）；
 - `write_budget_bytes == 0`；
 - `handler_threads < 0`、`> 64`，或 `handler_threads > 0 && handler_queue_limit == 0`；
+- `max_connections_per_ip < 0`；
+- `max_total_buffer_bytes` 小于单条连接的 `rbuf_capacity + wbuf_capacity`；
+- 读水位线不满足 `0 < low < high <= max_pending_bytes`（0 表示自动推导）；
 - 监听 socket、epoll/eventfd、reactor 线程、accept 线程或 handler 池创建失败。
 
 `start()` 成功只表示 accept 线程已经就绪且此刻没有组件失败；`port()` 只有在
@@ -418,7 +439,10 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | 计数器 | 何时增加 |
 |---|---|
 | `accepted` | 连接在 reactor 中完成注册（不是 accept 返回时） |
-| `rejected` | 超过 `max_connections`，或注册失败 |
+| `rejected` | 超过 `max_connections` / `max_total_buffer_bytes` / `max_connections_per_ip`，或注册失败 |
+| `buffer_budget_rejections` | 因 `max_total_buffer_bytes` 无空余被拒 |
+| `ip_rejections` | 因同一 IP 达到 `max_connections_per_ip` 被拒 |
+| `buffer_bytes` | 当前被准入连接预占的缓冲字节（gauge） |
 | `closed` | 连接完成销毁 |
 | `frames_recv` | 解析出一个完整帧；每 reactor 本地累加，每轮发布，空闲精确、繁忙最多滞后一轮 |
 | `frames_sent` | 帧的最后一个字节到达内核（不是入队时）；同样本地累加、每轮发布 |
@@ -436,9 +460,11 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `pending_tasks_total` | 累计入队任务数 |
 | `pending_tasks_depth` | 当前队列深度（gauge） |
 | `eof_reads` | `recv` 返回 0 的次数（对端 FIN） |
-| `close_requests_dropped` | `close_connection` 请求没送到 owner |
+| `close_requests_dropped` | `close_connection` 的队列投递被拒（`do_tick` 仍会完成关闭，计数表示队列压力） |
+| `read_pauses` | 读侧背压触发次数（`pending_bytes` 越过高位、取消 `EPOLLIN`） |
 | `epipe_writes` | `sendmsg` 返回 EPIPE（预期为 0，用于验证不可达路径） |
 | `close_callbacks_dropped` | 关闭回调因分配失败被丢弃（预期为 0） |
+| `callback_exceptions` | 关闭侧回调抛异常（已捕获并计数，进程继续运行） |
 
 `bytes_dropped` 中“销毁时仍未发出”的部分指 `discard_pending_output()` 释放的 wbuf；
 整帧被拒（容量不足、连接已在关闭）同样计入该计数器。
@@ -673,7 +699,9 @@ python3 -m cpplint include/tcp-server-mt.h
 | `backpressure` | 广播时的队列上限与 `queue_drops` |
 | `fault_injection` | reactor/accept 线程异常后的恢复（需要 `INDUSTRIAL_TCP_TESTING`） |
 | `reactor_spread` | 轮转分配确实把连接分到不同 reactor |
-| `config_budget` | 默认缓冲区预算、`ring_buffer` 就地写 API |
+| `config_budget` | 默认缓冲区预算、`ring_buffer` 就地写 API、新配置的校验 |
+| `watermark` | 读侧背压：暂停/恢复、关闭覆盖暂停、帧装配超时豁免 |
+| `hardening` | id 不复用、回调异常隔离、字节预算、每 IP 上限、`SO_REUSEPORT` 开关 |
 | `harness_selftest` | 测试 harness 自身 |
 
 `verify/evidence/` 下的一次性探针不属于常驻套件，不接入 runner。
@@ -682,8 +710,11 @@ python3 -m cpplint include/tcp-server-mt.h
 
 ## 12. 容量与性能（当前机器上的参考值）
 
-- 默认每连接内存约 **129 KB**（VM 实测 129.2 KB/连接，200 连接）。
-  默认 `max_connections = 10000` 时约 **1.3 GB** 缓冲。
+- 每连接按容量预占约 **129 KB**（`rbuf` 65544 + `wbuf` 65544）。缓冲改为
+  `new uint8_t[]` 惰性分配：页在真正读写前不落盘，200 条空闲连接实测约
+  **9 KB/连接**（此前 `vector::resize` 零填约 129 KB/连接）。默认
+  `max_connections = 10000` 的预占上限约 **1.3 GB**，可用
+  `max_total_buffer_bytes` 收紧。
 - 最大帧 **64 KiB + 8 字节头**。
 - 在开发 VM 上，4 KB 批量 ingest 约 **2.8 GB/s**，占用 8 核中的约 0.83 核；
   这些数字依赖机器、内核和编译选项，不是承诺。
@@ -718,7 +749,10 @@ python3 -m cpplint include/tcp-server-mt.h
   无限延长关闭，最终由 `close_linger_ms` 兜底。
 - **空闲超时看字节，但帧有独立的装配期限**：一个持续发送但永远不发完一帧的
   对端不会因空闲被回收；`frame_assembly_timeout_ms`（默认 5 × `idle_timeout_ms`）
-  会中止它并计入 `frame_assembly_timeouts`。`rbuf_capacity` 和 TCP keepalive 仍是
+  会中止它并计入 `frame_assembly_timeouts`。读侧背压暂停期间该期限不扫描
+  （不读是本地输出积压，不是对端 dribble）；恢复读时重新计时。
+  暂停期间对端 FIN 不会产生事件，要等恢复读或空闲回收；
+  对端 RST 仍以 `EPOLLERR` 立即中止。`rbuf_capacity` 和 TCP keepalive 仍是
   内存/死连接的第二道约束。如果合法客户端需要更久来装配一个最大帧，应显式调大
   该值。
 - **handler 不能抛异常**，也不能在回调里销毁 server。

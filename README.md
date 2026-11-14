@@ -48,8 +48,8 @@ This project has no "just run it and see" position. Everything is settled by
 building and running it on Linux:
 
 ```bash
-# Nine suites, eleven runs per configuration -- two of them run twice, at
-# different reactor counts -- over {plain, asan+ubsan, tsan}: 33 configurations,
+# Eleven suites, thirteen runs per configuration -- two of them run twice, at
+# different reactor counts -- over {plain, asan+ubsan, tsan}: 39 configurations,
 # cpplint included.
 ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh
 ```
@@ -74,7 +74,7 @@ because the three configurations, cpplint and the ordering live there.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # the same eleven runs
+ctest --test-dir build --output-on-failure     # the same thirteen runs
 ```
 
 `-DTCP_SANITIZE=address,undefined` (or `thread`) rebuilds the suites under one
@@ -142,7 +142,7 @@ docs/review/              nine rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
 ```
 
-Those fifteen probes under `verify/evidence/` are not a standing test suite. Each
+Those probes under `verify/evidence/` are not a standing test suite. Each
 one was written to settle a single claim, against a history that has since been
 fixed. Two of them read the header out of git at a given revision, so they accept
 either layout -- before or after the directory move on 2026-10-18.

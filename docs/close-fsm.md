@@ -57,6 +57,7 @@ close fields and the decision logic in the nine methods.
 |---|---|---|
 | `closing` | `std::atomic<bool>` | `connection::closing` |
 | `close_requests` | `std::atomic<uint32_t>` | `connection::close_requests` |
+| `close_wanted` | `std::atomic<bool>` | queue-refused close, retried by `do_tick` |
 | `fin_sent` | `bool` | `connection::fin_sent` |
 | `deferred_round` | `enum { none, close, peer_closed }` | `connection::deferred_round` |
 | `close_input_bytes` | `int64_t` | `connection::close_input_bytes` |
@@ -175,6 +176,14 @@ Each action maps to one reactor effect. The FSM decides **which**; the reactor d
 | `defer_peer_closed` | enqueue `finish_peer_closed_task{id}`; on queue-full, teardown |
 | `close_graceful` | `teardown_closed(..., graceful=true)` |
 | `close_abort` | `teardown_closed(..., graceful=false)` (RST via `SO_LINGER{1,0}`) |
+
+**Request delivery.** `close_connection` counts the request first, then tries
+the reactor queue. If the queue refuses it, `close_wanted` records the request
+on the FSM and `do_tick` performs the same drain-then-close one tick later; the
+close is delayed, not lost. A connection that is already `closing` needs no
+retry. Read-side backpressure is overridden by a close: `drain_input_then_close`
+and `park_close` resume reading, and the existing `close_input_bytes` budget and
+`close_linger_ms` bound how much input the close may consume.
 
 **Where the side effects stay** (all in the reactor, none in the FSM):
 

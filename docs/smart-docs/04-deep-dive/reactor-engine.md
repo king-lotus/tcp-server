@@ -4,8 +4,10 @@
 
 `sub_reactor` is where the library actually runs. One instance per reactor
 thread, each owning an `epoll` set, an `eventfd` for cross-thread wakeups, a map
-from `conn_id` to `shared_ptr<connection>`, a map from file descriptor to
-`connection*`, a 64 KiB scratch buffer, and a task queue guarded by one mutex.
+from `conn_id` to `shared_ptr<connection>`, a 64 KiB scratch buffer, and a task
+queue guarded by one mutex. Events carry the connection id in
+`epoll_event.data.u64` (0 is the wake fd), so a stale event for a retired
+connection fails the map lookup instead of acting on a recycled descriptor.
 
 Everything else in the header exists to feed it, configure it, or report on it.
 
@@ -34,10 +36,10 @@ flowchart TB
         TICK["do_tick if a tick elapsed"]
     end
     CONT --> PUB --> WAIT --> DISP --> FLUSH --> TICK --> CONT
-    DISP -->|"wake fd"| PEND["process_pending"]
-    DISP -->|"EPOLLIN"| READ["handle_read"]
+    DISP -->|"wake fd"| DRAIN["drain_wakeup"]
+    DISP -->|"EPOLLIN or HUP+IN"| READ["handle_read"]
     DISP -->|"EPOLLOUT"| WRITE["handle_write"]
-    DISP -->|"HUP or ERR"| ABORT["close_conn, abortive"]
+    DISP -->|"ERR, or HUP alone"| ABORT["close_conn, abortive"]
 ```
 
 ## Key files
@@ -101,6 +103,22 @@ The queue is per reactor, and its capacity scales with the connections that
 reactor can be asked to serve, because a broadcast to every connection lands
 entirely on one queue at a time.
 
+### Read backpressure
+
+`pending_bytes` is the output credit. When it reaches
+`read_high_watermark_bytes`, `parse_frames` stops at a frame boundary and
+`pause_read` re-applies the interest without `EPOLLIN`, so TCP — not the
+reactor — slows the sender. The drain resumes reading at the low mark, either
+inline (after a write) or from `do_tick` when the last decrement happened on a
+caller thread. `schedule_read` refuses while paused, so a paused connection
+cannot keep the loop on a zero-timeout `epoll_wait`.
+
+Two exemptions keep the pause honest: `frame_assembly_timeout_ms` does not fire
+while paused (the incomplete frame is waiting on us, not dribbling), and the
+idle sweep uses `max(last_recv, last_drain_progress)` so a slow-but-reading peer
+is not reclaimed. A close request lifts the pause; `close_input_bytes` and
+`close_linger_ms` bound what the close may then consume.
+
 ### Close machinery
 
 The three closing entry points differ in one thing: who owes what to whom.
@@ -125,7 +143,8 @@ A throw from anywhere in the iteration is caught at loop scope: the reactor
 counts `reactor_failures`, raises the server's failed flag, stops accepting
 submissions, runs `cleanup()`, and exits. The lifecycle state is deliberately
 left alone, so a concurrent `start()` verdict is never rewritten by a worker
-crash.
+crash. Close-side callbacks are narrower: each invocation is caught separately,
+counted in `callback_exceptions`, and does not suppress the other notification.
 
 ## Dependencies
 
@@ -162,10 +181,10 @@ fixes them.
    only checks that the connection table and the admission count are empty,
    which a linger-expired abort satisfies as well. `stats().aborted` is the only
    signal that distinguishes the two.
-4. **The `RLIMIT_NOFILE` budget under-counts descriptors.** It assumes
-   `max_connections + 64`, but each reactor needs two descriptors of its own, so
-   at high reactor counts the warning can stay silent while the process cannot
-   serve the configured connections.
+4. ~~**The `RLIMIT_NOFILE` budget under-counts descriptors.** It assumed
+   `max_connections + 64`, but each reactor needs two descriptors of its own.~~
+   **Closed by the hardening pass:** the budget is now
+   `max_connections + 2 × (1 + reactors) + 16`.
 
 ## Potential improvements
 

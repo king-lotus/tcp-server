@@ -29,6 +29,13 @@ cd "$proj"
 
 echo "== project: $proj =="
 
+# Build artifacts live under the home cache by default rather than /tmp, which
+# some sandboxes mount in a way that makes every compile ask for permission.
+# VERIFY_OUT_DIR overrides it.
+out="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
+mkdir -p "$out"
+echo "== build dir: $out =="
+
 # ---- toolchain ------------------------------------------------------------
 if ! command -v g++ >/dev/null 2>&1; then
     echo "== installing build-essential (needs network + your sudo password) =="
@@ -48,16 +55,18 @@ base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
 build() {
     local label="$1"; shift
     echo "== building [$label] =="
-    g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o /tmp/close_semantics
-    g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o /tmp/idle_semantics
-    g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o /tmp/ping_pong
-    g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o /tmp/send_results
-    g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o /tmp/backpressure
+    g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o "$out/close_semantics"
+    g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o "$out/idle_semantics"
+    g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o "$out/ping_pong"
+    g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o "$out/send_results"
+    g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o "$out/backpressure"
     g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
-        -o /tmp/fault_injection
-    g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o /tmp/reactor_spread
-    g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o /tmp/config_budget
-    g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o /tmp/harness_selftest
+        -o "$out/fault_injection"
+    g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o "$out/reactor_spread"
+    g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o "$out/config_budget"
+    g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o "$out/harness_selftest"
+    g++ "${base_flags[@]}" "$@" verify/watermark.cpp -o "$out/watermark"
+    g++ "${base_flags[@]}" "$@" verify/hardening.cpp -o "$out/hardening"
 }
 
 run_all() {
@@ -75,17 +84,19 @@ run_all() {
     fi
     echo "---- running [$label] ----"
 
-    for attempt in "close_semantics, default reactors:/tmp/close_semantics" \
-                   "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 /tmp/close_semantics" \
-                   "idle_semantics:/tmp/idle_semantics" \
-                   "ping_pong:/tmp/ping_pong" \
-                   "send_results:/tmp/send_results" \
-                   "backpressure:/tmp/backpressure" \
-                   "fault_injection:/tmp/fault_injection" \
-                   "reactor_spread, default reactors:/tmp/reactor_spread" \
-                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread" \
-                   "config_budget:/tmp/config_budget" \
-                   "harness_selftest:/tmp/harness_selftest"; do
+    for attempt in "close_semantics, default reactors:$out/close_semantics" \
+                   "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 $out/close_semantics" \
+                   "idle_semantics:$out/idle_semantics" \
+                   "ping_pong:$out/ping_pong" \
+                   "send_results:$out/send_results" \
+                   "backpressure:$out/backpressure" \
+                   "fault_injection:$out/fault_injection" \
+                   "reactor_spread, default reactors:$out/reactor_spread" \
+                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 $out/reactor_spread" \
+                   "config_budget:$out/config_budget" \
+                   "harness_selftest:$out/harness_selftest" \
+                   "watermark:$out/watermark" \
+                   "hardening:$out/hardening"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
