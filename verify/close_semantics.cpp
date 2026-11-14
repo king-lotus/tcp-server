@@ -59,8 +59,12 @@
 #include "harness.h"
 #include "tcp-server-mt.h"
 
+using industrial::close_action;
+using industrial::close_fsm;
+using industrial::drain_outcome;
 using industrial::frame_type;
 using industrial::multi_reactor_server;
+using industrial::ring_buffer;
 using industrial::send_result;
 
 namespace {
@@ -226,6 +230,124 @@ void dump_stats(multi_reactor_server& server, const char* phase) {
                 (unsigned long long)st.eof_reads.load());
 }
 
+// ---- close_fsm unit transitions (no socket) --------------------------------
+// The FSM is the decision layer, so its branches can be driven directly with
+// fake buffers. The deferral rules are the point: they need a queue round to
+// land between two calls, which a live socket cannot schedule on demand.
+
+struct fsm_fixture {
+    ring_buffer          wbuf{4096};
+    ring_buffer          rbuf{4096};
+    std::atomic<size_t>  pending{0};
+    close_fsm            fsm;
+
+    fsm_fixture() { fsm.attach(&wbuf, &rbuf, &pending); }
+
+    void buffered(size_t n) {
+        uint8_t junk[256] = {};
+        while (n > 0) {
+            const size_t chunk = n < sizeof junk ? n : sizeof junk;
+            rbuf.write(junk, chunk);
+            n -= chunk;
+        }
+    }
+};
+
+void run_close_fsm_unit_cases() {
+    std::printf("== close_fsm unit transitions ==\n");
+    {
+        fsm_fixture x;
+        x.buffered(100);
+        expect(x.fsm.on_request() == close_action::drain_input,
+               "on_request -> drain_input");
+        expect(x.fsm.close_input_bytes == 100,
+               "on_request measures the close input budget");
+    }
+    {
+        fsm_fixture x;
+        x.buffered(100);
+        x.fsm.on_request();
+        expect(x.fsm.on_input_drained(1, 10) ==
+                   close_action::defer_drain_input,
+               "on_input_drained(served, more buffered) -> defer_drain_input");
+    }
+    {
+        fsm_fixture x;
+        x.fsm.on_request();
+        expect(x.fsm.on_input_drained(1, 0) == close_action::defer_park,
+               "on_input_drained(served, nothing buffered) -> defer_park");
+    }
+    {
+        fsm_fixture x;
+        x.pending = 1;
+        x.fsm.on_request();
+        expect(x.fsm.on_input_drained(0, 0) == close_action::defer_park,
+               "on_input_drained(nothing served, replies queued)"
+               " -> defer_park");
+        expect(x.fsm.on_input_drained(0, 0) == close_action::drain_wbuf,
+               "the close deferral is one round only");
+    }
+    {
+        fsm_fixture x;
+        x.buffered(100);
+        x.fsm.on_request();
+        expect(x.fsm.on_input_drained(1, 10) ==
+                   close_action::defer_drain_input,
+               "input defer hands off");
+        expect(x.fsm.on_input_defer_failed() == close_action::defer_park,
+               "on_input_defer_failed -> defer_park");
+    }
+    {
+        fsm_fixture x;
+        x.pending = 1;
+        x.fsm.on_peer_fin();
+        expect(x.fsm.on_input_defer_failed() == close_action::none,
+               "on_input_defer_failed under peer_closed -> none");
+    }
+    {
+        fsm_fixture x;
+        expect(x.fsm.on_drain_result(drain_outcome::drained) ==
+                   close_action::drain_complete,
+               "on_drain_result(drained) -> drain_complete");
+        expect(x.fsm.on_drain_result(drain_outcome::stalled) ==
+                   close_action::none,
+               "on_drain_result(stalled) -> none");
+        expect(x.fsm.on_drain_result(drain_outcome::dead) ==
+                   close_action::close_abort,
+               "on_drain_result(dead) -> close_abort");
+        expect(x.fsm.on_drain_result(drain_outcome::error) ==
+                   close_action::close_abort,
+               "on_drain_result(error) -> close_abort");
+    }
+    {
+        fsm_fixture x;
+        uint8_t one = 0;
+        x.wbuf.write(&one, 1);
+        expect(x.fsm.on_peer_fin() == close_action::none,
+               "on_peer_fin with wbuf non-empty -> none");
+    }
+    {
+        fsm_fixture x;
+        x.pending = 1;
+        expect(x.fsm.on_peer_fin() == close_action::defer_peer_closed,
+               "on_peer_fin with replies queued -> defer_peer_closed");
+        expect(x.fsm.on_peer_fin() == close_action::close_graceful,
+               "the peer_closed deferral is one round only");
+    }
+    {
+        fsm_fixture x;
+        expect(x.fsm.on_graceful() == close_action::drain_wbuf,
+               "on_graceful -> drain_wbuf");
+        expect(x.fsm.on_peer_fin() == close_action::send_fin,
+               "on_peer_fin while closing, nothing owed -> send_fin");
+    }
+    {
+        fsm_fixture x;
+        expect(x.fsm.on_peer_fin() == close_action::close_graceful,
+               "on_peer_fin otherwise -> close_graceful");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -233,6 +355,8 @@ int main() {
     // unbuffered. Without this the two streams interleave when piped, and an
     // interleaved failure log is worse than none.
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    run_close_fsm_unit_cases();
 
     g_zero_linger = kernel_honours_zero_linger();
     std::printf("== kernel turns SO_LINGER{on,0} into an observable RST: %s ==\n",
@@ -320,6 +444,12 @@ int main() {
         const int fd = peer.fd();
         reply_queued.store(false);
         close_after_reply.store(true);
+        // This case ends with the ordinary server-initiated graceful close: our
+        // FIN goes out, and the peer answers with its own. On Linux that leaves
+        // the socket with EPOLLHUP set. loop() used to look at HUP before
+        // EPOLLIN, so it classified this final step as a broken connection --
+        // counted it in `aborted` and dropped whatever the peer had sent.
+        const uint64_t aborted_before = server.stats().aborted.load();
         const std::string payload = "ANSWER-42";
         peer.send(frame_type::DATA, payload.data(), payload.size());
         expect(wait_for(2000, [&] { return reply_queued.load(); }), "handler ran");
@@ -338,6 +468,8 @@ int main() {
         }
         expect(wait_for(2000, [&] { return server.connection_count() == size_t(0); }),
                "connection torn down after the FIN exchange");
+        expect(server.stats().aborted.load() == aborted_before,
+               "the peer's FIN after our own is an orderly close, not an abort");
         dump_stats(server, "A.end");
     }
 
@@ -652,6 +784,65 @@ int main() {
                 expect(drained, "stop_gracefully drained every connection");
                 expect(hfix.server().connection_count() == 0,
                        "no connections left after the drain");
+            }
+        }
+    }
+
+    // ---- I: stop_gracefully asks each connection to close once ---------------
+    //
+    // The retry loop runs every 10ms for the whole timeout. close_connection()
+    // queues a close task on every successful call, so asking every still-open
+    // id on every pass made one parked connection accumulate a request per
+    // tick -- on a server with many connections, enough to fill the reactor
+    // queues and compete with the drain/park continuations the close itself
+    // needs. A connection parked after its FIN (the peer has not answered it)
+    // exposes the difference: there is nothing left to do but wait for
+    // close_linger, and the old loop still queued ~30 requests in 300ms.
+    {
+        std::printf("I. stop_gracefully requests each close once\n");
+        multi_reactor_server::config icfg;
+        icfg.bind_addr     = "127.0.0.1";
+        icfg.port          = 0;
+        icfg.num_reactors  = 1;
+        icfg.tick_ms       = 20;
+        icfg.idle_timeout_ms = 60000;
+        icfg.close_linger_ms = 5000;   // keep the close parked for the test
+
+        harness::fixture ifix(icfg);
+        if (!ifix.started()) {
+            expect(false, "flood-test server starts");
+        } else {
+            harness::peer peer;
+            if (!peer.connect(ifix.port())) {
+                expect(false, "flood-test client connects");
+            } else {
+                // A partial frame is enough to register the connection and
+                // gives the close nothing to serve, so the only task the close
+                // itself queues is the request under test. The peer then never
+                // answers the server's FIN, keeping the close parked.
+                (void)peer.send(frame_type::DATA, "x", 1);
+                expect(wait_for(2000, [&] {
+                           return !ifix.server().connection_ids().empty();
+                       }), "flood-test connection registered");
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                const uint64_t tasks_before =
+                    ifix.server().stats().pending_tasks_total.load();
+                const bool drained = ifix.server().stop_gracefully(300);
+                const uint64_t tasks_after =
+                    ifix.server().stats().pending_tasks_total.load();
+                const uint64_t queued = tasks_after - tasks_before;
+                std::printf("      close tasks queued during a 300ms stop: %llu\n",
+                            (unsigned long long)queued);
+                // One close request, plus at most a couple of continuation
+                // hand-offs. One per 10ms pass would be ~30.
+                expect(queued <= 10,
+                       "stop_gracefully queues one close request, not one per pass");
+                expect(ifix.server().stats().close_requests_dropped.load() == 0,
+                       "no close request was refused");
+                expect(!drained,
+                       "the peer never answered the FIN, so the stop was not drained");
+                peer.close();
             }
         }
     }

@@ -27,6 +27,10 @@
 //      one whose message it was. The open state handler already absorbs the
 //      same violation (R8-2); this records that the message handler does too
 //      (R9-2), and that the connection keeps dispatching afterwards.
+//   F. fail_close_enqueue_for_test -- a close request the queue refused must
+//      still close the connection. close_wanted records it and do_tick's sweep
+//      performs the drain-then-close within one tick, so a full queue delays
+//      the close instead of losing it.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -277,6 +281,66 @@ int main() {
                         "second frame sent on the same connection");
         harness::expect(wait_for(3000, [&] { return handled.load() >= 2; }),
                         "the connection kept dispatching after the throw");
+    }
+
+    // ---- F: a refused close request is still honoured -----------------------
+    //
+    // close_connection() hands the request to the reactor queue. When the
+    // queue refuses it, the old behaviour was a rollback and a counter -- the
+    // connection stayed open until idle timeout. close_wanted now records the
+    // request on the connection, and do_tick's sweep performs it within one
+    // tick. The switch below makes submit_close() refuse once, which is the
+    // only way to reach the path on an otherwise empty queue.
+    {
+        std::printf("F. a queue-refused close still reaches the connection\n");
+        multi_reactor_server::config cfg = base;
+        cfg.port = free_port();
+        cfg.num_reactors = 1;
+        cfg.tick_ms = 20;
+        cfg.idle_timeout_ms = 60000;
+        cfg.close_linger_ms = 1000;
+
+        std::atomic<uint64_t> id{0};
+        std::atomic<int> closed{0};
+        harness::fixture f(
+            cfg,
+            [&](uint64_t cid, const uint8_t*, size_t) { id.store(cid); },
+            [&](uint64_t, const std::string&, const char*) {
+                closed.fetch_add(1, std::memory_order_relaxed);
+            });
+        harness::expect(f.started(), "start() ok");
+        if (!f.started()) return harness::finish();
+
+        harness::peer p;
+        harness::expect(static_cast<bool>(p.connect(f.port())), "client connected");
+        harness::expect(static_cast<bool>(p.send(
+                            industrial::frame_type::DATA, "x", 1)),
+                        "request sent");
+        harness::expect(wait_for(2000, [&] { return id.load() != 0; }),
+                        "connection id observed");
+        if (id.load() == 0) return harness::finish();
+
+        const uint64_t dropped_before =
+            f.stats().close_requests_dropped.load();
+        f.server().fail_close_enqueue_for_test.store(true);
+        const bool queued = f.server().close_connection(id.load());
+        harness::expect(!queued, "the queue refused the close task");
+        harness::expect(f.stats().close_requests_dropped.load() >
+                            dropped_before,
+                        "the refusal is counted");
+        harness::expect(f.server().connection_ids().size() == 1,
+                        "the refused request did not close inline");
+
+        harness::expect(static_cast<bool>(
+                            p.expect_close(harness::close_kind::fin, 2000)),
+                        "the swept close still sent a FIN");
+        p.close();
+        harness::expect(wait_for(2000, [&] { return closed.load() >= 1; }),
+                        "the close reached the callback");
+        harness::expect(wait_for(2000, [&] {
+                            return f.server().connection_count() == 0;
+                        }),
+                        "the connection is gone");
     }
 
     return harness::finish();

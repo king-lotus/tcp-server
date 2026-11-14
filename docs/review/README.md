@@ -69,3 +69,11 @@ worth reading more than the conclusions themselves.
 Round 9 is the exception: it was a purely static pass on a Windows host that
 could not build the header, so every entry was marked `[需核实]`; the R9-1 probe
 and fix were produced afterwards.
+
+## Not a review round
+
+[DOC-AUDIT-2026-11-07.md](DOC-AUDIT-2026-11-07.md) sits beside these by date,
+not by kind: it audits what the documentation *claims* against what the header
+*does*, rather than the implementation against its own contracts. Its line
+numbers were checked against the working tree of that day, 3463 lines, and
+carry the same warning as everything else here once that tree moves.

@@ -1,4 +1,4 @@
-// industrial_tcp_server_mt.hpp
+// tcp-server-mt.h
 // Multi-threaded reactor, whole-frame buffering, RAII, explicit close protocol
 // C++17 / Linux (epoll + eventfd)
 #pragma once
@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <cerrno>
 #include <cassert>
+#include <climits>
 
 #include <atomic>
 #include <algorithm>
@@ -56,6 +57,12 @@ constexpr uint32_t MAX_FRAME_PAYLOAD = 64 * 1024;
 // payload. Buffers that must hold any legal frame are sized from this rather
 // than from a rounded number that happens to be close.
 constexpr size_t   MAX_FRAME_SIZE = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+
+// epoll_event.data.u64 tag reserved for a reactor's wake eventfd. Connection
+// ids start at 1 (next_conn_id_), so 0 can never name a connection. Events
+// carry the id rather than the fd, which is what makes a stale event unable to
+// alias a connection that recycled the descriptor number.
+constexpr uint64_t REACTOR_WAKE_TAG = 0;
 
 enum class frame_type : uint16_t {
     DATA = 0x0001,
@@ -96,10 +103,10 @@ inline const std::array<uint8_t, FRAME_HEADER_SIZE>& pong_frame() noexcept {
 
 inline void encode_frame_into(uint8_t* out, frame_type type,
                             const void* payload, size_t len) noexcept {
-    // A const char* source is assumed. len <= MAX_FRAME_PAYLOAD is enforced by
-    // send_to, but this is an inline public entry point and nothing here would
-    // complain about a caller who did not check: it would just write a length
-    // the far side cannot honour.
+    // A non-null payload is assumed when len > 0. len <= MAX_FRAME_PAYLOAD is
+    // enforced by send_to, but this is an inline public entry point and nothing
+    // here would complain about a caller who did not check: it would just write
+    // a length the far side cannot honour.
     assert(len <= MAX_FRAME_PAYLOAD);
     write_frame_header(out, type, len);
     if (len > 0 && payload) std::memcpy(out + FRAME_HEADER_SIZE, payload, len);
@@ -147,7 +154,14 @@ class ring_buffer {
         // resizing over live data would drop it silently
         assert(empty());
         assert(cap > 0);
-        buf_.resize(cap);
+        // Allocate into a temporary first, so a bad_alloc leaves the object
+        // exactly as it was. The storage is deliberately uninitialised
+        // (no parentheses): a vector::resize zero-filled it, committing every
+        // page at accept for a connection that may stay idle. Only bytes below
+        // size_ are ever read, and commit()/write() are the only ways size_
+        // grows.
+        std::unique_ptr<uint8_t[]> fresh(new uint8_t[cap]);
+        buf_.swap(fresh);
         cap_  = cap;
         head_ = 0;
         size_ = 0;
@@ -167,8 +181,8 @@ class ring_buffer {
         if (w == 0) return 0;
         size_t tail  = write_tail();
         size_t first = std::min(w, cap_ - tail);
-        std::memcpy(buf_.data() + tail, p, first);
-        if (w > first) std::memcpy(buf_.data(), p + first, w - first);
+        std::memcpy(buf_.get() + tail, p, first);
+        if (w > first) std::memcpy(buf_.get(), p + first, w - first);
         size_ += w;
         return w;
     }
@@ -177,8 +191,8 @@ class ring_buffer {
         size_t r = std::min(n, size_);
         if (r == 0) return 0;
         size_t first = std::min(r, cap_ - head_);
-        std::memcpy(p, buf_.data() + head_, first);
-        if (r > first) std::memcpy(p + first, buf_.data(), r - first);
+        std::memcpy(p, buf_.get() + head_, first);
+        if (r > first) std::memcpy(p + first, buf_.get(), r - first);
         return r;
     }
 
@@ -189,8 +203,8 @@ class ring_buffer {
         size_t r = std::min(n, size_ - skip);
         size_t at = (head_ + skip) % cap_;
         size_t first = std::min(r, cap_ - at);
-        std::memcpy(p, buf_.data() + at, first);
-        if (r > first) std::memcpy(p + first, buf_.data(), r - first);
+        std::memcpy(p, buf_.get() + at, first);
+        if (r > first) std::memcpy(p + first, buf_.get(), r - first);
         return r;
     }
 
@@ -199,7 +213,7 @@ class ring_buffer {
     // is offered; a ring that has wrapped has a second piece at buf_[0].
     uint8_t* write_ptr() noexcept {
         if (cap_ == 0) return nullptr;
-        return buf_.data() + write_tail();
+        return buf_.get() + write_tail();
     }
     size_t write_span() const noexcept {
         if (cap_ == 0) return 0;
@@ -227,10 +241,10 @@ class ring_buffer {
         spans_view s;
         if (size_ == 0) return s;
         size_t first = std::min(size_, cap_ - head_);
-        s.p1 = buf_.data() + head_;
+        s.p1 = buf_.get() + head_;
         s.n1 = first;
         if (size_ > first) {
-            s.p2 = buf_.data(); s.n2 = size_ - first; s.count = 2;
+            s.p2 = buf_.get(); s.n2 = size_ - first; s.count = 2;
         }
         else s.count = 1;
         return s;
@@ -245,7 +259,7 @@ class ring_buffer {
         return cap_ == 0 ? 0 : (head_ + size_) % cap_;
     }
 
-    std::vector<uint8_t> buf_;
+    std::unique_ptr<uint8_t[]> buf_;
     size_t cap_  = 0;
     size_t head_ = 0;
     size_t size_ = 0;
@@ -253,8 +267,26 @@ class ring_buffer {
 
 // ==================== Statistics ====================
 struct server_stats {
+    // Connections fully registered with a reactor: in both maps, counted by
+    // connection_count(), sendable. Counted only after registration succeeds,
+    // so accepted minus closed is the live set.
     std::atomic<uint64_t> accepted{0};
+    // Sockets turned away. Wider than "the admission ceiling was reached": an
+    // epoll_ctl or map-insert failure, an on_connection_opened() that declines
+    // the connection, and an allocation failure in the new-connection task land
+    // here too, each beside its own counter. Read it as "a client did not get
+    // in", not as a capacity gauge.
     std::atomic<uint64_t> rejected{0};
+    // Rejections with a narrower cause than `rejected`, counted beside it:
+    // the global buffer budget had no room, or the peer's address already had
+    // max_connections_per_ip live connections.
+    std::atomic<uint64_t> buffer_budget_rejections{0};
+    std::atomic<uint64_t> ip_rejections{0};
+    // Buffer bytes reserved by admitted connections (queued and live). Gauge,
+    // like pending_tasks_depth; admission is bounded by it when
+    // max_total_buffer_bytes is set.
+    std::atomic<size_t> buffer_bytes{0};
+    // Every connection that left, drained and FINed or aborted alike.
     std::atomic<uint64_t> closed{0};
     // Counted when a frame is parsed. Reactors batch the count in a local
     // line-aligned tally and publish it once per loop iteration (and once on
@@ -274,12 +306,19 @@ struct server_stats {
     // per loop iteration.
     alignas(64) std::atomic<uint64_t> bytes_recv{0};
     alignas(64) std::atomic<uint64_t> bytes_sent{0};
-    alignas(64) std::atomic<uint64_t> queue_drops{0};  // whole frames refused
-    // bytes still unsent when the connection closed
+    // Refused submissions. Mostly frames refused for exceeding
+    // max_pending_bytes or because a reactor queue is full, but enqueue()
+    // cannot tell task types apart, so control tasks (new connection, close,
+    // continuation) refused by the same queues land here too.
+    alignas(64) std::atomic<uint64_t> queue_drops{0};
+    // bytes accepted but never sent: a frame dropped whole (capacity reject,
+    // or arriving after the close began), or output still buffered when the
+    // connection was torn down.
     std::atomic<uint64_t> bytes_dropped{0};
     // forced disconnects (RST), not a graceful close
     std::atomic<uint64_t> aborted{0};
-    // frames dropped mid-close; the FIN is out
+    // frames dropped because a close was already in progress: the peer gets the
+    // orderly FIN, not an answer to these.
     std::atomic<uint64_t> frames_dropped_on_close{0};
     std::atomic<uint64_t> parse_errors{0};
     std::atomic<uint64_t> idle_timeouts{0};
@@ -303,18 +342,23 @@ struct server_stats {
     // this doubles as a probe for whether the reactor is spinning on one FIN:
     // across a parked drain it should barely move.
     std::atomic<uint64_t> eof_reads{0};
-    // close_connection() sent, then refused by the queue. Each of those closes
-    // never reached a connection and nothing counts it; what waits for them is
-    // the idle timeout.
+    // close_connection() sent, then refused by the queue. The request is not
+    // lost: close_wanted hands it to do_tick's sweep, which closes the
+    // connection within one tick. The counter remains because a refused
+    // hand-off is still a queue-pressure signal, and it is observable where a
+    // delayed close is not.
     std::atomic<uint64_t> close_requests_dropped{0};
-    // sendmsg returned EPIPE: some socket's write side has been judged dead.
-    // Every path that could reach it is intercepted by a guard first (after our
-    // own shutdown, both handle_write and park_close's fin_sent check return
-    // before it; a peer RST takes the EPOLLERR/EPOLLHUP branch in loop()
-    // first), so it is expected to sit at 0 -- and that is what this counter is
-    // for: it keeps "unreachable" something you can read rather than a claim.
-    // If it ever moves, the reasoning above is void and this path needs another
-    // look.
+    // Read-side backpressure engaged: pending output crossed the high
+    // watermark and EPOLLIN was dropped. Counts transitions, not bytes.
+    std::atomic<uint64_t> read_pauses{0};
+    // sendmsg returned EPIPE: the peer sent RST, so this socket will never take
+    // another byte. Reaching it takes a narrow window. A RST that is already
+    // pending turns the next event into EPOLLHUP/EPOLLERR, which loop() handles
+    // before it looks at EPOLLOUT; and once our own FIN is out, the fin_sent
+    // guards in handle_write and park_close return before the drain is tried.
+    // So this is expected to stay at 0. The counter exists to keep that
+    // expectation checkable: one increment means one of those guards has a hole
+    // and the write path needs another look.
     std::atomic<uint64_t> epipe_writes{0};
     // Close callbacks dropped: the connection was torn down completely, but the
     // allocation that was to notify the application failed. Expected to stay 0
@@ -323,20 +367,57 @@ struct server_stats {
     // watching the connection vanish with its callback never invoked and no
     // counter moving at all.
     std::atomic<uint64_t> close_callbacks_dropped{0};
+    // A close-side callback (conn_state_handler(false) or close_handler)
+    // threw. It used to reach std::terminate because the flush is noexcept;
+    // now the exception is contained and counted, so one application bug
+    // cannot take every connection down with it.
+    std::atomic<uint64_t> callback_exceptions{0};
 };
 
 // ==================== Send results ====================
 enum class send_result : int {
-    ok = 0,
-    not_connected,   // no such connection
-    closed,         // connection closed, or server stopped
-    too_large,       // payload exceeds MAX_FRAME_PAYLOAD
-    overloaded,     // logical limit reached, or queue full
-    invalid_argument,
+    ok = 0,            // accepted: queued, or already in wbuf
+    not_connected,     // no such connection
+    closed,            // server stopped, or this connection closing/closed
+    too_large,         // len > MAX_FRAME_PAYLOAD
+    overloaded,        // max_pending_bytes, queue full, or copy failed
+    invalid_argument,  // len > 0 with a null data
 };
 
 class multi_reactor_server;
 class sub_reactor;
+
+// Live connection count per numeric peer address. The accept thread is the
+// only acquirer, but release runs wherever teardown does, so the count is
+// mutex-protected. Entries are erased at zero: a table that only ever grew
+// would itself be the denial of service it exists to prevent.
+struct ip_admission {
+    std::mutex mutex;
+    std::unordered_map<std::string, size_t> counts;
+
+    bool try_acquire(const std::string& key, int cap) noexcept {
+        try {
+            std::lock_guard<std::mutex> lk(mutex);
+            size_t& n = counts[key];
+            if (n >= static_cast<size_t>(cap)) return false;
+            ++n;
+            return true;
+        } catch (...) {
+            // Could not allocate the entry: refuse rather than terminate. The
+            // rejection is counted by the accept loop.
+            return false;
+        }
+    }
+    void release(const std::string& key) noexcept {
+        try {
+            std::lock_guard<std::mutex> lk(mutex);
+            auto it = counts.find(key);
+            if (it == counts.end()) return;
+            if (--it->second == 0) counts.erase(it);
+        } catch (...) {
+        }
+    }
+};
 
 // One reservation follows a socket from the accept queue through connection
 // lifetime. Every failure/discard path releases it through the same destructor.
@@ -346,15 +427,258 @@ class sub_reactor;
 // definition). The ++/-- operator forms would quietly mean seq_cst.
 struct admission_ticket {
     std::atomic<size_t>& count;
-    explicit admission_ticket(std::atomic<size_t>& value) noexcept
-        : count(value) {
+    std::atomic<size_t>& bytes;
+    size_t               reserved;
+    std::shared_ptr<ip_admission> ip_table;
+    std::string          ip_key;
+    bool                 ip_held = false;
+
+    // May allocate (the key copy); the caller is the accept loop's try block.
+    admission_ticket(std::atomic<size_t>& value,
+                     std::atomic<size_t>& byte_gauge,
+                     size_t byte_reservation,
+                     std::shared_ptr<ip_admission> table = {},
+                     std::string key = {})
+        : count(value), bytes(byte_gauge), reserved(byte_reservation),
+          ip_table(std::move(table)), ip_key(std::move(key)) {
         count.fetch_add(1, std::memory_order_relaxed);
+        bytes.fetch_add(reserved, std::memory_order_relaxed);
+    }
+    // Takes the per-IP slot, if one is configured. Called after construction;
+    // false means the cap is reached and no slot was taken.
+    bool acquire_ip(int cap) noexcept {
+        if (ip_held) return true;
+        if (!ip_table || cap <= 0) return true;
+        ip_held = ip_table->try_acquire(ip_key, cap);
+        return ip_held;
     }
     admission_ticket(const admission_ticket&) = delete;
     admission_ticket& operator=(const admission_ticket&) = delete;
     admission_ticket(admission_ticket&&) = delete;
     admission_ticket& operator=(admission_ticket&&) = delete;
-    ~admission_ticket() { count.fetch_sub(1, std::memory_order_relaxed); }
+    ~admission_ticket() {
+        count.fetch_sub(1, std::memory_order_relaxed);
+        bytes.fetch_sub(reserved, std::memory_order_relaxed);
+        if (ip_table && ip_held) ip_table->release(ip_key);
+    }
+};
+
+// How far a drain got. These used to be 0 / 1 / -1 with two different outcomes
+// sharing the 0: the while-loop ending because wbuf was empty, and EPIPE. The
+// first means every queued byte reached the kernel and the caller should go on
+// to whatever comes next; the second means not one more byte will ever leave,
+// and treating them alike is what put the connection's fate in the hands of
+// `wbuf.empty()` at each call site -- a fact none of them said out loud.
+enum class drain_outcome {
+    drained,   // wbuf is empty: everything owed has reached the kernel
+    stalled,   // fair-share budget spent, or EAGAIN: EPOLLOUT will resume it
+    dead,      // EPIPE: this socket's write direction is finished, permanently
+    error,     // any other failure: fatal
+};
+
+// What the close FSM tells the reactor to do next. The FSM decides, the reactor
+// performs the effect and feeds the result back as the next event.
+enum class close_action {
+    none,
+    drain_input,        // serve buffered input (run handle_read)
+    drain_wbuf,         // move wbuf into the kernel
+    drain_complete,     // wbuf drained empty: the close decision is next
+    send_fin,           // shutdown(SHUT_WR)
+    defer_drain_input,  // queue one more input-serving round
+    defer_park,         // queue one park round (replies land first)
+    defer_peer_closed,  // queue one peer-closed round
+    close_graceful,     // teardown, orderly
+    close_abort,        // teardown, RST
+};
+
+// ==================== Graceful-close state ====================
+// A connection's graceful-close state (see docs/close-fsm.md): it owns the
+// close fields and decides the next close_action; the reactor performs it.
+// Every non-atomic field stays reactor-thread-only, as before.
+struct close_fsm {
+    // One queue round may be spent waiting for replies to land; the kind says
+    // which side owns the round (see drain_input_then_close /
+    // finish_peer_closed).
+    enum class deferred_kind : uint8_t { none = 0, close, peer_closed };
+
+    // closing: a graceful close has been requested and is being honoured
+    // (output drained, FIN sent or imminent). Submissions are refused from
+    // here on, but the peer keeps reading what we owe it.
+    // fin_sent: FIN has actually left. Closing before that would drop queued
+    // bytes and turn the polite close into the RST this whole mechanism
+    // avoids.
+    // The two are separate on purpose: "closed" must not mean "socket is
+    // gone", or an application that sends a reply and then closes would never
+    // get the reply out. Reads keep running throughout.
+    // Atomic, though every write is reactor-thread-only: send_to() reads it,
+    // and send_to runs on whichever thread the application called it from.
+    // The two have to agree, because once this is set the reactor refuses
+    // every frame (see submit_send) -- send_to answering ok to one would
+    // promise something the owner has already decided not to do.
+    std::atomic<bool>     closing{false};
+    // Close requests this connection has accepted. Non-zero for the rest of
+    // its life once one is queued. The owner-thread send_to() fast path falls
+    // back to the queued path while this is non-zero, so a send issued after
+    // close_connection() keeps the existing queue order (and its existing
+    // drop) instead of overtaking it.
+    //
+    // Counted before the queue attempt, not after it: the old flag was set
+    // only once submit_close() returned, and a handler already running on the
+    // owner thread could pass the fast-path check in that window and write
+    // ahead of a close that was already queued (R9-4). A count rather than a
+    // flag because close_connection() is called from any thread.
+    //
+    // A failed attempt keeps its count too. The request is not lost any more
+    // (close_wanted below hands it to the tick sweep), so rolling the count
+    // back would reopen the same ordering window: a send landing between the
+    // rollback and the sweep could take the fast path ahead of a close that is
+    // now guaranteed.
+    std::atomic<uint32_t> close_requests{0};
+    // Set when close_connection() could not hand the request to the reactor
+    // queue. The request is still real: the reactor's tick sweep picks the
+    // flag up and performs the close, so a full queue delays a close by up to
+    // one tick instead of losing it. Atomic because the caller may be any
+    // thread; only the owner reactor clears it.
+    std::atomic<bool>     close_wanted{false};
+    bool                  fin_sent = false;
+    // A graceful close whose final read dispatched requests still has their
+    // replies queued, and the FIN waits for them. At most one queue round may
+    // be spent waiting -- a peer that keeps sending cannot hold the close open
+    // with more input -- and the round has an owner, because only the side
+    // that deferred knows what the wait was for:
+    //
+    //   close       -- drain_input_then_close() deferred; the round ends in a
+    //                  park.
+    //   peer_closed -- finish_peer_closed() deferred; the round ends in
+    //                  whatever finish_peer_closed() decides once the replies
+    //                  have landed in wbuf -- a FIN, or "nothing left, close
+    //                  now".
+    //
+    // One bool cannot say which, and conflating them cost the peer its last
+    // answer: taken as "the round has been spent, park now" rather than "the
+    // round is still owed", it parked the close one round early, with wbuf
+    // still empty and the FIN therefore immediate -- over replies whose own
+    // deferral had not run yet.
+    deferred_kind         deferred_round = deferred_kind::none;
+    // Input this graceful close still owes the peer: the bytes that were
+    // buffered and unserved when the close was first requested.
+    // drain_input_then_close() may spend queue rounds on them, because
+    // handle_read stops at a fixed per-call budget and one pass cannot be
+    // assumed to have served a whole backlog -- but on nothing beyond them,
+    // so a peer that keeps sending cannot hold the close open with fresh
+    // input. Negative means "not measured yet". Reactor-thread-only.
+    int64_t               close_input_bytes = -1;
+    int64_t               close_started_at_ms = 0;  // when the close was parked
+    // Shared across threads: teardown_closed() sets it, send_to() and the
+    // close paths read it.
+    std::atomic<bool>     is_closed{false};
+
+    // Read-only view into the connection's buffers, set once by attach().
+    ring_buffer*          wbuf_ = nullptr;
+    ring_buffer*          rbuf_ = nullptr;
+    std::atomic<size_t>*  pending_bytes_ = nullptr;
+
+    void attach(ring_buffer* wbuf, ring_buffer* rbuf,
+                std::atomic<size_t>* pending_bytes) noexcept {
+        wbuf_ = wbuf;
+        rbuf_ = rbuf;
+        pending_bytes_ = pending_bytes;
+    }
+
+    // ----- decisions (pure: read state + view, return the next action) -----
+
+    bool wbuf_empty() const noexcept { return !wbuf_ || wbuf_->empty(); }
+    bool rbuf_empty() const noexcept { return rbuf_ ? rbuf_->empty() : true; }
+    size_t pending() const noexcept {
+        return pending_bytes_
+                   ? pending_bytes_->load(std::memory_order_relaxed) : 0;
+    }
+    bool done() const noexcept {
+        return is_closed.load(std::memory_order_acquire) || fin_sent;
+    }
+
+    // A graceful close that parks now (close_conn graceful, idle timeout).
+    // Idempotent: once closed or FINed there is nothing left to park.
+    close_action on_graceful() noexcept {
+        if (done()) return close_action::none;
+        if (!closing.load(std::memory_order_acquire)) {
+            closing.store(true, std::memory_order_release);
+            close_started_at_ms = now_ms();
+        }
+        return close_action::drain_wbuf;
+    }
+
+    // What to do after a wbuf drain. dead/error end the connection; stalled
+    // leaves the rest to a later EPOLLOUT; drained means wbuf is empty and
+    // the close decision (FIN or otherwise) is made by the caller.
+    close_action on_drain_result(drain_outcome r) noexcept {
+        if (r == drain_outcome::error || r == drain_outcome::dead)
+            return close_action::close_abort;
+        if (r == drain_outcome::drained) return close_action::drain_complete;
+        return close_action::none;  // stalled
+    }
+
+    // A public close (close_connection / stop_gracefully): serve buffered
+    // input first, so answers to already-arrived requests still reach the
+    // peer.
+    close_action on_request() noexcept {
+        if (done()) return close_action::none;
+        if (close_input_bytes < 0)
+            close_input_bytes =
+                static_cast<int64_t>(rbuf_ ? rbuf_->readable() : 0);
+        return close_action::drain_input;
+    }
+
+    // A serving round finished. served is the frame count, dealt the bytes
+    // this round took off the close_input_bytes budget.
+    close_action on_input_drained(int served, int64_t dealt) noexcept {
+        if (done()) return close_action::none;
+        if (served > 0 && dealt > 0) close_input_bytes -= dealt;
+        if (served > 0 && !rbuf_empty() && close_input_bytes > 0)
+            return close_action::defer_drain_input;
+        if (served == 0 && deferred_round == deferred_kind::none &&
+            pending() > 0) {
+            deferred_round = deferred_kind::close;
+            return close_action::defer_park;
+        }
+        return park_decision(served);
+    }
+
+    // The park decision shared by on_input_drained and on_input_defer_failed:
+    // peer_closed owns the round; an already-close deferred_round (or a round
+    // that served nothing) parks now; otherwise defer one park round.
+    close_action park_decision(int served) noexcept {
+        if (deferred_round == deferred_kind::peer_closed)
+            return close_action::none;
+        if (served == 0 || deferred_round == deferred_kind::close)
+            return close_action::drain_wbuf;
+        deferred_round = deferred_kind::close;
+        return close_action::defer_park;
+    }
+
+    // Re-decide after the input-defer hand-off failed: drain_input is off the
+    // table and served was > 0, so what remains is the park decision.
+    close_action on_input_defer_failed() noexcept {
+        return park_decision(1);   // 1: served was > 0 in that path
+    }
+
+    // The peer FINed. A productive wbuf means it is not our turn yet: the
+    // caller parks, handle_write resumes this once the bytes are out.
+    // defer_peer_closed spends the one allowed queue round waiting for replies
+    // to land; otherwise FIN (if we are closing) or tear down.
+    close_action on_peer_fin() noexcept {
+        if (is_closed.load(std::memory_order_acquire))
+            return close_action::none;
+        if (!wbuf_empty()) return close_action::none;
+        if (!closing.load(std::memory_order_acquire) &&
+            deferred_round == deferred_kind::none && pending() > 0) {
+            deferred_round = deferred_kind::peer_closed;
+            return close_action::defer_peer_closed;
+        }
+        if (closing.load(std::memory_order_acquire) && !fin_sent)
+            return close_action::send_fin;
+        return close_action::close_graceful;
+    }
 };
 
 // ==================== Connection ====================
@@ -372,22 +696,40 @@ struct connection {
     // dribbling one large frame over a slow link is not silent. Stamped only
     // where bytes arrive (handle_read); parsing does not touch it, so a frame
     // that completes late cannot extend the deadline.
-    // Consequence: a peer that sends bytes which never complete a frame is now
-    // never idle-reclaimed. It is bounded by rbuf (a frame larger than
-    // rbuf_capacity is closed as incomplete) and by TCP keepalive, not by the
-    // idle tick.
+    // Consequence: a peer that sends bytes which never complete a frame is not
+    // idle-reclaimed. It is bounded by frame_assembly_timeout_ms instead (see
+    // do_tick), by rbuf (a frame larger than rbuf_capacity is closed as
+    // incomplete), and by TCP keepalive.
     int64_t    last_recv_ms = 0;
-    // When the first byte of the frame currently being assembled arrived; 0
-    // means no partial frame. Later bytes do not refresh it: this deadline is
-    // about progress, not silence. Reactor-thread-only.
+    // Timestamp of the first byte of the frame being assembled; 0 means no
+    // frame is in progress. Set for both halves: a header that has not fully
+    // arrived, and a payload that has not finished arriving. Later bytes do not
+    // refresh it, so the deadline derived from it (this field plus
+    // frame_assembly_timeout_ms, see do_tick) measures how long the frame has
+    // been incomplete, not how long the peer has been quiet.
     int64_t    frame_started_at_ms = 0;
+    // Inbound bytes that have arrived but not been parsed: a partial frame plus
+    // whatever complete frames came in the same read. Reactor-thread-only.
     ring_buffer rbuf;
+    // Outbound bytes, whole frames only. Nothing is appended until a frame is
+    // complete, which is what lets send_frame_remain below name a single frame.
     ring_buffer wbuf;
-    // Target state of this socket's EPOLLOUT bit, owned by the worker thread.
-    // arm_write/disarm_write are idempotent transitions toward it, never blind
-    // epoll_ctl calls, so a stale EPOLLOUT event cannot tear down a live write
-    // interest (and a queued frame cannot be stranded without a wakeup).
+    // Whether EPOLLOUT is currently registered for this fd, as far as this
+    // reactor knows. A state flag, not a toggle: arm_write and disarm_write are
+    // skipped when the flag already says what the caller wants, so bytes
+    // arriving on an armed connection do not re-issue EPOLL_CTL_MOD on every
+    // read. Nor is it the kernel's view: after our own shutdown the write
+    // interest is gone while this stays true, which is why disarm_write must
+    // still issue its MOD rather than skip it.
     bool       write_armed = false;
+    // Read-side backpressure: EPOLLIN is dropped (and parsing stops at a frame
+    // boundary) while pending output is above the high watermark. Reactor-
+    // thread-only, like the rest of the interest state.
+    bool       read_paused = false;
+    // Last time the drain moved bytes out of wbuf. The idle sweep uses it
+    // together with last_recv_ms: while paused there may be no inbound bytes,
+    // but a peer that is still reading is not idle.
+    int64_t    last_drain_progress_ms = 0;
     // Bytes of the frame at the head of wbuf that have not reached the kernel.
     // wbuf only ever receives whole frames, so the head is either inside
     // exactly one frame or exactly at a frame boundary; this field says which,
@@ -395,68 +737,10 @@ struct connection {
     // it is queued. Reactor-thread-only, like wbuf itself.
     size_t      send_frame_remain = 0;
     // -------- close protocol --------
-    // closing: a graceful close has been requested and is being honoured
-    // (output
-    //          drained, FIN sent or imminent). Submissions are refused from
-    //          here
-    //          on, but the peer keeps reading what we owe it.
-    // fin_sent: FIN has actually left. Closing before that would drop queued
-    // bytes
-    //          and turn the polite close into the RST this whole mechanism
-    //          avoids.
-    // The two are separate on purpose: "closed" must not mean "socket is gone",
-    // or an application that sends a reply and then closes would never get the
-    // reply out. Reads keep running throughout.
-    // Atomic, though every write is reactor-thread-only: send_to() reads it,
-    // and send_to runs on whichever thread the application called it from.
-    // The two have to agree, because once this is set the reactor refuses
-    // every frame (see submit_send) -- send_to answering ok to one would
-    // promise something the owner has already decided not to do.
-    std::atomic<bool> closing{false};
-    // Close requests this connection has accepted. Non-zero for the rest of
-    // its life once one is queued. The owner-thread send_to() fast path falls
-    // back to the queued path while this is non-zero, so a send issued after
-    // close_connection() keeps the existing queue order (and its existing
-    // drop) instead of overtaking it.
-    //
-    // Counted before the queue attempt, not after it: the old flag was set only
-    // once submit_close() returned, and a handler already running on the owner
-    // thread could pass the fast-path check in that window and write ahead of a
-    // close that was already queued (R9-4). A count rather than a flag because
-    // close_connection() is called from any thread: a failed attempt gives back
-    // exactly the count it added, so it cannot clear a request another caller
-    // has queued successfully. A successful attempt leaves its count in place;
-    // the connection is closing from then on, so there is nothing to clear.
-    std::atomic<uint32_t> close_requests{0};
-    bool       fin_sent = false;
-    // A graceful close whose final read dispatched requests still has their
-    // replies queued, and the FIN waits for them. At most one queue round may
-    // be spent waiting -- a peer that keeps sending cannot hold the close open
-    // with more input -- and the round has an owner, because only the side that
-    // deferred knows what the wait was for:
-    //
-    //   close       -- drain_input_then_close() deferred; the round ends in a
-    //                  park.
-    //   peer_closed -- finish_peer_closed() deferred; the round ends in
-    //                  whatever finish_peer_closed() decides once the replies
-    //                  have landed in wbuf -- a FIN, or "nothing left, close
-    //                  now".
-    //
-    // One bool cannot say which, and conflating them cost the peer its last
-    // answer: taken as "the round has been spent, park now" rather than "the
-    // round is still owed", it parked the close one round early, with wbuf
-    // still empty and the FIN therefore immediate -- over replies whose own
-    // deferral had not run yet.
-    enum class deferred_round_kind : uint8_t { none = 0, close, peer_closed };
-    deferred_round_kind deferred_round = deferred_round_kind::none;
-    // Input this graceful close still owes the peer: the bytes that were
-    // buffered and unserved when the close was first requested.
-    // drain_input_then_close() may spend queue rounds on them, because
-    // handle_read stops at a fixed per-call budget and one pass cannot be
-    // assumed to have served a whole backlog -- but on nothing beyond them, so
-    // a peer that keeps sending cannot hold the close open with fresh input.
-    // Negative means "not measured yet". Reactor-thread-only.
-    int64_t    close_input_bytes = -1;
+    // The close state now lives in `fsm` (docs/close-fsm.md): closing,
+    // close_requests, fin_sent, deferred_round, close_input_bytes,
+    // close_started_at_ms and is_closed moved there. The two
+    // fields kept here are read-path, not close state:
     // Bytes this connection's handle_read() has taken off the socket since
     // drain_input_then_close() zeroed it, which is always either nobody or the
     // graceful close: it is how a round can be charged for input that arrived
@@ -466,11 +750,11 @@ struct connection {
     // handle_write consults it to finish a parked close deterministically the
     // moment the drain completes, instead of waiting for a spurious EPOLLIN.
     bool       peer_closed = false;
-    int64_t    close_started_at_ms = 0;   // when the graceful close was parked
-    int64_t    fin_sent_at_ms = 0;        // when shutdown(SHUT_WR) returned
+    // Graceful-close state machine (closing, close_requests, fin_sent,
+    // deferred_round, close_input_bytes, close_started_at_ms, is_closed).
+    close_fsm  fsm;
 
     // Shared across threads from here down:
-    std::atomic<bool>   is_closed{false};
     // admission credit for output: bytes reserved and not yet handed to the
     // kernel, whether they are still sitting in a queued send task or already
     // sitting in wbuf. It is one number covering both because neither one alone
@@ -510,19 +794,6 @@ struct connection {
             ::close(fd); fd = -1;
         }
     }
-};
-
-// How far a drain got. These used to be 0 / 1 / -1 with two different outcomes
-// sharing the 0: the while-loop ending because wbuf was empty, and EPIPE. The
-// first means every queued byte reached the kernel and the caller should go on
-// to whatever comes next; the second means not one more byte will ever leave,
-// and treating them alike is what put the connection's fate in the hands of
-// `wbuf.empty()` at each call site -- a fact none of them said out loud.
-enum class drain_outcome {
-    drained,   // wbuf is empty: everything owed has reached the kernel
-    stalled,   // fair-share budget spent, or EAGAIN: EPOLLOUT will resume it
-    dead,      // EPIPE: this socket's write direction is finished, permanently
-    error,     // any other failure: fatal
 };
 
 // One closed connection, held until its close callback has run. The conn is
@@ -580,10 +851,10 @@ class sub_reactor {
     void wakeup() noexcept;
     void drain_wakeup() noexcept;
     void process_pending() noexcept;
-    // Returns the number of frames this call handed to the message handler.
-    // Zero means the read produced no work at all, which
-    // drain_input_then_close() uses to tell "the peer asked for nothing more"
-    // from "answers are queued behind us".
+    // Returns the number of frames this call parsed and served (PING and PONG
+    // included, since a PING produces a PONG). Zero means the read produced no
+    // work at all, which drain_input_then_close() uses to tell "the peer asked
+    // for nothing more" from "answers are queued behind us".
     int  handle_read(connection* c) noexcept;
     void handle_write(connection* c) noexcept;
     void parse_frames(connection* c, int& frames_left) noexcept;
@@ -617,6 +888,12 @@ class sub_reactor {
     void flush_close_callbacks() noexcept;
     void arm_write(connection* c) noexcept;
     void disarm_write(connection* c) noexcept;
+    // The one place that computes the epoll interest from
+    // (read_paused, peer_closed, write_armed) and applies it.
+    void apply_interest(connection* c, const char* fail_reason) noexcept;
+    void pause_read(connection* c) noexcept;
+    void resume_read(connection* c) noexcept;
+    void maybe_resume_read(connection* c) noexcept;
     void do_tick() noexcept;
     drain_outcome drain_wbuf_to_socket(connection* c) noexcept;
     // Typed queue tasks. Sends and closes are inline (no std::function
@@ -725,7 +1002,6 @@ class sub_reactor {
     // entry is now one object, so a partial notification is not representable.
     std::vector<closed_conn> pending_closes_;
 
-    std::unordered_map<int, connection*>                      fd_index_;
     std::unordered_map<uint64_t, std::shared_ptr<connection>> conns_;
 
     std::vector<uint8_t> frame_scratch_;
@@ -743,11 +1019,11 @@ class multi_reactor_server {
  public:
     // Install handlers before start; never replace them while running. Handlers
     // run concurrently across workers and must not throw or destroy this
-    // server. A throw from a message handler or from the open transition of a
-    // conn-state handler is caught and dropped, because nothing is left to
-    // undo by then and the exception already belongs to the application. The
-    // close-side callbacks (conn-state false and close_handler) run on a
-    // noexcept path, where a throw reaches std::terminate.
+    // server. A throw from a message handler or from a conn-state handler,
+    // including the close-side transitions, is caught and dropped, because
+    // nothing is left to undo by then and the exception already belongs to the
+    // application. Close-side throws are counted in callback_exceptions; before
+    // that they reached std::terminate because the flush is noexcept.
     // Message payload/peer/reason references are borrowed for the call only.
     // send_to/close_connection are permitted. stop from a callback requests
     // shutdown only; the controlling thread must subsequently call stop to join
@@ -768,6 +1044,9 @@ class multi_reactor_server {
                                              const char*)>;
 
     struct config {
+        // Where to listen. The default accepts on every interface, and there
+        // is no TLS, no authentication and no per-IP limit anywhere above this
+        // line: whatever can route to this port is a client.
         std::string bind_addr        = "0.0.0.0";
         // 0 means "kernel, pick one" -- and then port() is the only way to
         // learn what was picked, so start() succeeding says nothing about
@@ -777,9 +1056,38 @@ class multi_reactor_server {
         // backlog only from above, so 0 would pass straight through as a
         // zero-length accept queue -- connections refused under load, silently.
         int         backlog         = 1024;
+        // Opt-in SO_REUSEPORT. Off by default: with it on, a second process can
+        // bind the same port without error and the kernel silently splits
+        // connections between them, so a stale instance is no longer visible as
+        // a failed bind. Multi-process deployments (one server per process,
+        // same port) turn it on deliberately.
+        bool        reuse_port      = false;
+        // 0 means one per hardware thread; resolved_reactor_count() clamps to
+        // [1, k_max_reactors], and every consumer reads that rather than this.
         int         num_reactors     = 0;
+        // Admission ceiling. A connection arriving when this many are already
+        // admitted is accepted and closed at once, counted in rejected. Must be
+        // > 0. Does not bound memory by itself: rbuf/wbuf are allocated per
+        // connection, so the product of this and those sizes is the real bill.
         int         max_connections  = 10000;
+        // Ceiling on the buffer bytes admitted connections may reserve. 0 means
+        // max_connections * (rbuf_capacity + wbuf_capacity) -- the bill the
+        // connection count already implies. Set it lower to bound memory
+        // independently of the count; start() refuses a value smaller than one
+        // connection's buffers and warns when it admits fewer connections.
+        size_t      max_total_buffer_bytes = 0;
+        // Most live connections one numeric peer address may hold. 0 (default)
+        // is unlimited. A peer over the cap is accepted and closed at once,
+        // counted in rejected and ip_rejections.
+        int         max_connections_per_ip = 0;
+        // Close a connection after this long with no bytes received. Measured
+        // in bytes, not frames: a peer dribbling a partial frame is not idle,
+        // and frame_assembly_timeout_ms is what bounds that. Must be > 0.
         int         idle_timeout_ms   = 120000;
+        // How often each reactor runs its deadline scan. Every timeout here
+        // fires on one of these boundaries, so this is the granularity they all
+        // share. Must be > 0; start() warns when it is coarser than a deadline
+        // it governs.
         int         tick_ms          = 500;
         // A frame must complete within this deadline once its first byte
         // arrives; 0 means 5 x idle_timeout_ms. Unlike idle_timeout_ms this
@@ -787,6 +1095,11 @@ class multi_reactor_server {
         // cannot hold the connection forever. Must be >= 0 (start() refuses
         // negative).
         int         frame_assembly_timeout_ms = 0;
+        // Per-connection read buffer, allocated on accept. Must be >=
+        // MAX_FRAME_SIZE (start() refuses otherwise): a frame that does not fit
+        // is closed as incomplete, so a smaller buffer makes a legal maximum
+        // frame undeliverable. The floor is 65544, not the 65536 that "64 KiB"
+        // suggests -- 8 bytes of header sit outside MAX_FRAME_PAYLOAD.
         size_t      rbuf_capacity    = MAX_FRAME_SIZE;
         // One maximum frame, not 256KB. The write buffer is allocated per
         // accepted connection, so it is most of the per-connection memory cost:
@@ -801,12 +1114,32 @@ class multi_reactor_server {
         // this down to wbuf_capacity anyway, so a larger default would only be
         // a number that reads as a promise it does not keep.
         size_t      max_pending_bytes = MAX_FRAME_SIZE;
+        // Cap on the kernel send buffer of each accepted socket. 0 leaves the
+        // OS default. A smaller buffer makes read backpressure engage sooner
+        // and bounds the kernel memory one connection can pin; the kernel
+        // enforces its own minimum, so a tiny value is clamped, not refused.
+        size_t      socket_send_buffer_bytes = 0;
+        // Read-side backpressure. Above the high mark the reactor stops
+        // reading (and drops EPOLLIN) until pending output falls to the low
+        // mark; this is what lets a slow-but-alive client be slowed down
+        // instead of reset when its replies back up. 0 means "decide for me":
+        // high = 3/4 of the effective max_pending_bytes, low = high / 2.
+        // Explicit values must satisfy 0 < low < high <= max_pending_bytes;
+        // start() validates them after the max_pending_bytes clamp.
+        size_t      read_high_watermark_bytes = 0;
+        size_t      read_low_watermark_bytes  = 0;
+        // Most bytes one connection may hand to the kernel in a single drain
+        // before drain_wbuf_to_socket() returns and the reactor moves on, so
+        // one fast sender cannot monopolise the loop. Despite the name it is
+        // not a per-iteration budget: every readable connection gets its own.
+        // Must be > 0.
         size_t      write_budget_bytes = 256 * 1024;
-        // Grace period for a half-closed connection: after our FIN went out we
-        // keep reading until the peer's FIN, but never longer than this. Bounds
-        // the descriptor cost of a peer that ACKs the FIN and never answers it.
-        // Must be > 0 (start() refuses otherwise): with no deadline a parked
-        // close leaks the fd and its admission slot forever.
+        // Total budget for a graceful close, counted from the moment it is
+        // parked: drain wbuf, send the FIN, then wait for the peer's FIN. It
+        // bounds the descriptor cost of a peer that ACKs the FIN and never
+        // answers it, and of one that never lets the drain finish. Must be > 0
+        // (start() refuses otherwise): with no deadline a parked close leaks
+        // the fd and its admission slot forever.
         int         close_linger_ms    = 5000;
 
         // Optional handler offload pool. 0 (default) keeps the message handler
@@ -831,6 +1164,40 @@ class multi_reactor_server {
             return 5LL * static_cast<int64_t>(idle_timeout_ms);
         }
 
+        // Read watermarks, with "0 means decide for me" resolved against the
+        // *effective* max_pending_bytes (start() clamps it to wbuf_capacity).
+        // Derived high leaves a quarter of the ceiling unused so a PONG can
+        // still be admitted just below it.
+        size_t resolved_read_high_watermark_bytes() const noexcept {
+            if (read_high_watermark_bytes > 0) return read_high_watermark_bytes;
+            const size_t maxp = max_pending_bytes;
+            size_t high = maxp - maxp / 4;
+            if (high == 0) high = maxp;
+            return high;
+        }
+        size_t resolved_read_low_watermark_bytes() const noexcept {
+            if (read_low_watermark_bytes > 0) return read_low_watermark_bytes;
+            const size_t high = resolved_read_high_watermark_bytes();
+            const size_t low = high / 2;
+            return low > 0 ? low : high;
+        }
+
+        // Buffer bytes one connection reserves, and the global ceiling they
+        // are admitted against. The product saturates instead of wrapping: a
+        // wrapped budget would be a small number that rejects everything.
+        size_t per_connection_buffer_bytes() const noexcept {
+            return rbuf_capacity + wbuf_capacity;
+        }
+        size_t resolved_max_total_buffer_bytes() const noexcept {
+            if (max_total_buffer_bytes > 0) return max_total_buffer_bytes;
+            const size_t per = per_connection_buffer_bytes();
+            if (per == 0) return 0;
+            const size_t cap = static_cast<size_t>(max_connections);
+            if (cap > static_cast<size_t>(-1) / per)
+                return static_cast<size_t>(-1);
+            return cap * per;
+        }
+
         // What this configuration actually resolves to, with "0 means decide
         // for me" resolved and the ceiling applied. Two places computing it
         // independently is how a number like this ends up disagreeing with
@@ -848,24 +1215,26 @@ class multi_reactor_server {
 
     explicit multi_reactor_server(config cfg) noexcept : cfg_(std::move(cfg)) {}
     // Destroying from inside a callback cannot work, and it must not be quiet
-    // about it. stop() below declines to join the calling thread -- a thread
-    // cannot join itself -- so accept_thread_ is still joinable when this body
-    // returns, and std::thread::~thread calls std::terminate(). That message,
-    // "terminate called without an active exception", names neither this server
-    // nor the reason; a reader who cannot tell what died learns nothing. Say it
-    // here, then let the terminate happen: there is no correct recovery -- the
+    // about it. stop() below declines to join the calling thread, since a
+    // thread cannot join itself, so accept_thread_ is still joinable when this
+    // body returns and std::thread::~thread calls std::terminate(). The default
+    // message, "terminate called without an active exception", names neither
+    // this server nor the reason, so a reader cannot tell what died. Say it
+    // here, then let the terminate happen: there is no correct recovery. The
     // fix is for the last owner to be released after the controlling thread's
-    // stop() has joined, which is what the contract above now asks for.
+    // stop() has joined, which is what the contract above asks for.
     ~multi_reactor_server() noexcept {
         if (callback_server_ == this) {
             std::fprintf(stderr,
-                         "[fatal] multi_reactor_server destroyed from "
-                         "inside its own callback: stop() cannot join the "
-                         "calling thread, "
-                         "so the accept/worker threads are still joinable and "
-                         "std::thread::~thread is about to terminate. Call "
-                         "stop() from the controlling thread, and release the "
-                         "last owner only after it has returned.\n");
+                         "[fatal] multi_reactor_server destroyed from inside "
+                         "its own callback.\n"
+                         "  stop() cannot join the calling thread, so the "
+                         "accept/worker threads\n"
+                         "  are still joinable and std::thread::~thread is "
+                         "about to terminate.\n"
+                         "  Call stop() from the controlling thread, and "
+                         "release the last owner\n"
+                         "  only after it has returned.\n");
             std::fflush(stderr);
         }
         stop();
@@ -874,9 +1243,13 @@ class multi_reactor_server {
     multi_reactor_server(const multi_reactor_server&) = delete;
     multi_reactor_server& operator=(const multi_reactor_server&) = delete;
 
+    // One call per DATA frame, in arrival order per connection. A throw is
+    // caught and dropped (see the contract above).
     void set_message_handler(message_handler h) noexcept {
         msg_handler_ = std::move(h);
     }
+    // open==true once the connection is admitted, false when it is gone. The
+    // close side runs on the deferred path, where a throw terminates.
     void set_conn_state_handler(conn_state_handler h) noexcept {
         state_handler_ = std::move(h);
     }
@@ -886,19 +1259,49 @@ class multi_reactor_server {
         close_handler_ = std::move(h);
     }
 
+    // Binds, listens and starts the accept thread and the reactors. False --
+    // with no thread created and the lifecycle left stopped -- when called from
+    // a callback, when the server is not fully stopped, or when the
+    // configuration is refused; the bounds are on the fields above, and every
+    // one of them is checked here rather than at first use.
     bool start() noexcept;
+    // Abortive and idempotent. Stops accepting, closes the listening socket and
+    // tears every connection down without draining it: queued output is
+    // discarded and the peer sees RST rather than FIN. Joins the accept thread
+    // and every reactor, so it belongs on the controlling thread; called from a
+    // callback it only requests a stop and returns, leaving the join to a later
+    // call. Queued offload tasks are dropped, not run.
     void stop()  noexcept;
     // Stop accepting, ask every open connection to close gracefully, and wait
     // up to timeout_ms for them to disappear before the normal (abortive) stop.
-    // Returns true if every connection drained; false if the deadline was hit
-    // and the remainder were aborted. Call from the controlling thread, not a
-    // callback.
+    // true means the connection table and the admission count are both empty --
+    // which a connection aborted at the end of close_linger_ms satisfies just
+    // as well, so true does not promise that nothing was reset; stats().aborted
+    // is the counter that separates the two. false means the deadline was hit
+    // with something still open, or that this was called from a callback, where
+    // it only requests a stop and returns. Call from the controlling thread.
     bool stop_gracefully(int timeout_ms) noexcept;
+    // Asks the running server to wind down and returns without joining
+    // anything, which is what makes it the one lifecycle call a callback may
+    // use. The reactors see the state at their next tick, and the controlling
+    // thread still has to call stop() to join the threads and close the fds.
+    // Not safe from a signal handler: it takes accept_fd_mutex_ and writes the
+    // wake eventfd.
     void request_stop() noexcept { request_stop_internal(); }
 #ifdef INDUSTRIAL_TCP_TESTING
     std::atomic<bool> fail_worker_for_test{false};
     std::atomic<bool> fail_accept_for_test{false};
+    // One-shot: the next submit_close() reports a full queue. Used to prove
+    // that a refused close request still reaches the connection through the
+    // tick sweep.
+    std::atomic<bool> fail_close_enqueue_for_test{false};
 #endif
+    // Blocks while is_running() holds, polling every 200ms. That is not the
+    // same as "until stop() was called": a reactor or accept failure clears the
+    // same flag, so returning means the server is down, not that it was asked
+    // to stop. Never call it from a callback -- that thread would be waiting
+    // for a condition only its own exit can satisfy, while stop() waits to join
+    // it.
     void wait()  noexcept;
 
     // ok means accepted (written straight to wbuf on the owner thread, or
@@ -908,20 +1311,27 @@ class multi_reactor_server {
                         size_t len) noexcept;
     // True means the request reached the owning reactor's queue. False means it
     // did not -- the reactor refused it (its queue is at the cap) or there is
-    // no owner to hand it to -- and the connection is still open. Either way it
-    // is counted into close_requests_dropped: a close nobody asked for is bad,
-    // but a close nobody was told about is how a connection outlives its own
-    // owner.
+    // no owner to hand it to -- and the connection is still open. Both failure
+    // paths count it into close_requests_dropped: a close nobody asked for is
+    // bad, but a close nobody was told about is how a connection outlives its
+    // own owner.
     bool       close_connection(uint64_t conn_id) noexcept;
 
     // Runs fn on a handler-pool worker; tasks submitted for one connection run
     // in order. Returns false when no pool is configured/running or its queue
     // is full. A message handler can copy its payload and call this, then
     // return; the reactor is not blocked. fn runs off the reactor thread, so
-    // send_to from it uses the queued path.
+    // send_to from it uses the queued path. True means queued, not "will run":
+    // stop() discards what is still waiting, and a connection closing does not
+    // cancel an accepted task -- only its later send_to fails.
     bool offload(uint64_t conn_id, std::function<void()> fn) noexcept;
 
     size_t connection_count() const noexcept;
+    // Snapshot of every live connection id. The only public call that can
+    // throw: it allocates once per shard, so bad_alloc reaches the caller.
+    // stop_gracefully() calls it from a noexcept function on a 10ms loop, and
+    // catches the exception there so a bad_alloc falls through to stop() and a
+    // returned false rather than terminating the process.
     std::vector<uint64_t> connection_ids() const;
 
     // Where the listening socket actually is. Equals config::port unless that
@@ -931,6 +1341,11 @@ class multi_reactor_server {
     // must not keep reporting one. Read it after start(), not before.
     uint16_t port() const noexcept;
 
+    // Live counters, not a snapshot: the reference stays valid until the server
+    // is destroyed, and values keep moving while they are read. Each field is
+    // atomic on its own; a group of them read together is not a consistent
+    // picture, and the four traffic counters are published once per loop
+    // iteration, so they can trail by an iteration under load.
     const server_stats& stats() const noexcept { return stats_; }
 
     // sub_reactor internal interface
@@ -1023,13 +1438,16 @@ class multi_reactor_server {
     std::atomic<life>     life_{life::stopped};
     std::atomic<bool>     failed_{false};
     // True while the accept thread may hand new connections to reactors.
-    // Cleared before a graceful drain so no new connection arrives after the
-    // snapshot; stop() clears it as well.
+    // Cleared at the start of a graceful drain, so no new connection is
+    // admitted while it runs; stop() clears it as well.
     std::atomic<bool>     accepting_{false};
     std::atomic<uint64_t> next_conn_id_{1};
     std::atomic<size_t>   next_reactor_{0};
-    // Lifecycle calls are serialized; submissions hold their barrier only until
-    // queued. stop releases it before joining so worker callbacks can finish.
+    // Serializes start() and stop(); stop_gracefully() only takes it through
+    // its final stop(), so it assumes the same controlling thread as those two
+    // and must not run concurrently with them. Submissions hold their barrier
+    // only until queued. stop releases it before joining so worker callbacks
+    // can finish.
     std::mutex lifecycle_mutex_;
     // Covers publication, wake writes, and fd teardown.
     std::mutex accept_fd_mutex_;
@@ -1060,6 +1478,10 @@ class multi_reactor_server {
     std::array<conn_shard, k_conn_shards> conn_shards_;
     // Queued accepted sockets + live connections, owned by admission tickets.
     std::atomic<size_t> admitted_{0};
+    // Admission hardening, resolved by start() from the configuration.
+    size_t                       per_conn_buffer_bytes_ = 0;
+    size_t                       max_buffer_bytes_ = 0;
+    std::shared_ptr<ip_admission> ip_table_;
 
     std::vector<std::unique_ptr<sub_reactor>> reactors_;
     std::thread                              accept_thread_;
@@ -1099,19 +1521,21 @@ inline bool sub_reactor::start() noexcept {
     }
 
     struct epoll_event ev{};
-    ev.events = EPOLLIN; ev.data.fd = wake_fd_;
+    ev.events = EPOLLIN; ev.data.u64 = REACTOR_WAKE_TAG;
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) < 0) {
         ::close(wake_fd_); ::close(epoll_fd_);
         wake_fd_ = epoll_fd_ = -1; running_.store(false); return false;
     }
 
-    // Computed here rather than in the constructor: picking reactor count and
+    // Computed here rather than in the constructor: the reactor count and the
     // connection ceiling are both decisions the server makes later, and this is
     // the first point at which both are final.
     const size_t share =
         static_cast<size_t>(server_->cfg_.max_connections) /
         static_cast<size_t>(server_->cfg_.resolved_reactor_count());
     pending_task_cap_ = std::max(k_min_pending_tasks, share * 4);
+    // Both batch vectors reserve the cap up front, so the swap in
+    // process_pending() never allocates.
     try {
         pending_tasks_.reserve(pending_task_cap_);
         active_tasks_.reserve(pending_task_cap_);
@@ -1175,14 +1599,11 @@ inline void sub_reactor::cleanup() noexcept {
         // last bytes. Abort explicitly, and account the undelivered bytes as
         // drops rather than pretending they went out.
         std::shared_ptr<connection> c = conns_.begin()->second;
-        connection* raw = c.get();
-        c.reset();
-        close_conn(raw, "server shutdown", false);
+        close_conn(c.get(), "server shutdown", false);
     }
     flush_close_callbacks();
     active_tasks_.clear();
     conns_.clear();
-    fd_index_.clear();
 }
 
 inline void sub_reactor::wakeup() noexcept {
@@ -1230,7 +1651,6 @@ inline bool sub_reactor::enqueue(queue_task task) noexcept {
                 1, std::memory_order_relaxed);
             return false;
         }
-        // Both batch vectors reserve this limit before the worker starts.
         pending_tasks_.emplace_back(std::move(task));
         server_->stats_ref().pending_tasks_total.fetch_add(
             1, std::memory_order_relaxed);
@@ -1272,9 +1692,10 @@ inline void sub_reactor::handle_task(
         c->last_recv_ms = now_ms();
         c->rbuf.init(server_->rbuf_capacity());
         c->wbuf.init(server_->wbuf_capacity());
+        c->fsm.attach(&c->wbuf, &c->rbuf, &c->pending_bytes);
 
         struct epoll_event ev{};
-        ev.events = EPOLLIN; ev.data.fd = t.fd.fd;
+        ev.events = EPOLLIN; ev.data.u64 = t.id;
         if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, t.fd.fd, &ev) < 0) {
             server_->stats_ref().epoll_ctl_errors.fetch_add(
                 1, std::memory_order_relaxed);
@@ -1283,9 +1704,17 @@ inline void sub_reactor::handle_task(
             return;  // The task's fd_guard closes the descriptor.
         }
         c->fd = t.fd.release();
+        if (server_->cfg_.socket_send_buffer_bytes > 0) {
+            const size_t asked = server_->cfg_.socket_send_buffer_bytes;
+            int sndbuf = asked > static_cast<size_t>(INT_MAX)
+                             ? INT_MAX
+                             : static_cast<int>(asked);
+            // Best-effort: the kernel clamps to its own minimum, and a
+            // failure here only means the OS default is kept.
+            setsockopt(c->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        }
 
         try {
-            fd_index_[c->fd] = c.get();
             conns_[t.id] = c;
         } catch (...) {
             // Roll back through the same path every other failure uses, so the
@@ -1350,12 +1779,12 @@ inline void sub_reactor::handle_task(send_task& task) noexcept {
     auto it = conns_.find(id);
     if (it == conns_.end()) return;
     connection* c = it->second.get();
-    // A parked close still accepts the reply queued before it: submit_close
-    // only marks the connection and then returns to this batch, so this
-    // task runs first. Anything arriving after that point is refused here
+    // A parked close still accepts the reply queued before it: the close task
+    // only marks the connection when it runs, and it runs after this one in the
+    // same batch. Anything arriving after that point is refused here
     // -- the FIN is already reserved for what we owe the peer.
-    if (c->is_closed.load(std::memory_order_acquire) ||
-        c->closing.load(std::memory_order_acquire)) {
+    if (c->fsm.is_closed.load(std::memory_order_acquire) ||
+        c->fsm.closing.load(std::memory_order_acquire)) {
         c->pending_bytes.fetch_sub(f.size(), std::memory_order_relaxed);
         // One refusal, two questions, two counters: how many replies never went
         // out (queue_drops) and how much data the peer never received
@@ -1367,6 +1796,7 @@ inline void sub_reactor::handle_task(send_task& task) noexcept {
             f.size(), std::memory_order_relaxed);
         server_->stats_ref().queue_drops.fetch_add(
             1, std::memory_order_relaxed);
+        maybe_resume_read(c);
         return;
     }
 
@@ -1392,6 +1822,7 @@ inline void sub_reactor::handle_task(send_task& task) noexcept {
             f.size(), std::memory_order_relaxed);
         server_->stats_ref().queue_drops.fetch_add(
             1, std::memory_order_relaxed);
+        maybe_resume_read(c);
         return;
     }
     c->wbuf.write(f.data(), f.size());
@@ -1423,14 +1854,15 @@ inline bool sub_reactor::try_send_local(multi_reactor_server* expected,
     if (it == conns_.end()) return false;   // another reactor owns it
 
     connection* c = it->second.get();
-    if (c->is_closed.load(std::memory_order_acquire) ||
-        c->closing.load(std::memory_order_acquire)) {
+    if (c->fsm.is_closed.load(std::memory_order_acquire) ||
+        c->fsm.closing.load(std::memory_order_acquire)) {
         *out = send_result::closed;
         return true;
     }
     // A close request is already ahead of this send: take the queued path so
     // the frame is ordered after it and dropped, exactly as before.
-    if (c->close_requests.load(std::memory_order_acquire) != 0) return false;
+    if (c->fsm.close_requests.load(std::memory_order_acquire) != 0)
+        return false;
 
     const size_t frame_size = FRAME_HEADER_SIZE + len;
     // No room now: take the queued path, which reserves the frame and lets the
@@ -1474,6 +1906,9 @@ inline bool sub_reactor::try_send_local(multi_reactor_server* expected,
 }
 
 inline bool sub_reactor::submit_close(uint64_t id) noexcept {
+#ifdef INDUSTRIAL_TCP_TESTING
+    if (server_->fail_close_enqueue_for_test.exchange(false)) return false;
+#endif
     return enqueue(queue_task{close_task{id}});
 }
 
@@ -1532,28 +1967,36 @@ inline void sub_reactor::handle_task(park_close_task& task) noexcept {
     park_close(keep.get(), "requested");
 }
 
+// The one place that turns the connection's interest state into an epoll
+// registration. Every writer goes through it, or a pause can be silently
+// undone: arm_write used to set EPOLLIN unconditionally, and resume_read on a
+// peer-FIN'd parked socket would restore the busy-poll the park is there to
+// avoid. fail_reason names the caller for the epoll_ctl_errors close.
+inline void sub_reactor::apply_interest(connection* c,
+                                        const char* fail_reason) noexcept {
+    if (c->fd < 0) return;
+    struct epoll_event ev{};
+    ev.data.u64 = c->id;
+    if (!c->read_paused && !c->peer_closed) ev.events |= EPOLLIN;
+    if (c->write_armed) ev.events |= EPOLLOUT;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, c->fd, &ev) == 0) return;
+    if (errno == ENOENT) {
+        // Registered set out of sync (fd was re-added elsewhere): restore it
+        // with ADD.
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, c->fd, &ev) == 0) return;
+    }
+    server_->stats_ref().epoll_ctl_errors.fetch_add(
+        1, std::memory_order_relaxed);
+    close_conn(c, fail_reason, false);
+}
+
 inline void sub_reactor::arm_write(connection* c) noexcept {
     // Nothing asked for can ever leave a dead write side, and asking for it
     // each time bytes arrive would spin this reactor on level-triggered
     // EPOLLOUT for the rest of the connection's life.
     if (c->write_armed || c->fd < 0) return;
-    struct epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = c->fd;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, c->fd, &ev) == 0) {
-        c->write_armed = true;
-        return;
-    }
-    if (errno == ENOENT) {
-        // Registered set out of sync (fd was re-added elsewhere): restore it
-        // with ADD and adopt the write interest in the same call.
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, c->fd, &ev) == 0) {
-            c->write_armed = true;
-            return;
-        }
-    }
-    server_->stats_ref().epoll_ctl_errors.fetch_add(
-        1, std::memory_order_relaxed);
-    close_conn(c, "epoll write registration failed", false);
+    c->write_armed = true;
+    apply_interest(c, "epoll write registration failed");
 }
 
 inline void sub_reactor::disarm_write(connection* c) noexcept {
@@ -1569,16 +2012,45 @@ inline void sub_reactor::disarm_write(connection* c) noexcept {
     // (handle_write, after the drain emptied wbuf, and the fin_sent path) have
     // already established there is nothing left to write. Leaving it to the
     // caller is what keeps this function a plain state transition.
-    struct epoll_event ev{};
-    ev.events = EPOLLIN; ev.data.fd = c->fd;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, c->fd, &ev) < 0 &&
-        errno != ENOENT) {
-        server_->stats_ref().epoll_ctl_errors.fetch_add(
-            1, std::memory_order_relaxed);
-        close_conn(c, "epoll read registration failed", false);
-        return;
-    }
     c->write_armed = false;
+    apply_interest(c, "epoll read registration failed");
+}
+
+// Stop reading from the kernel: the peer has more requests than we are willing
+// to have in flight. Dropping EPOLLIN is what applies TCP backpressure; the
+// read side resumes from the drain or from the tick fallback.
+inline void sub_reactor::pause_read(connection* c) noexcept {
+    if (c->read_paused || c->peer_closed || c->fd < 0 ||
+        c->fsm.is_closed.load(std::memory_order_acquire))
+        return;
+    c->read_paused = true;
+    // A continuation queued before the pause would keep the loop on a zero
+    // epoll timeout; take it off the list now.
+    unschedule_read(c);
+    server_->stats_ref().read_pauses.fetch_add(1, std::memory_order_relaxed);
+    apply_interest(c, "epoll pause registration failed");
+}
+
+inline void sub_reactor::resume_read(connection* c) noexcept {
+    if (!c->read_paused) return;
+    c->read_paused = false;
+    // The assembly deadline measures peer dribbling; time spent not reading
+    // because our own output was backed up is not the peer's doing.
+    if (c->frame_started_at_ms != 0) c->frame_started_at_ms = now_ms();
+    apply_interest(c, "epoll resume registration failed");
+    if (c->fsm.is_closed.load(std::memory_order_acquire) || c->peer_closed)
+        return;
+    // Frames already in rbuf are not going to produce another EPOLLIN: the
+    // kernel had its say when they arrived. Queue a continuation so they are
+    // served now, not at the next unrelated event.
+    if (c->rbuf.readable() > 0) schedule_read(c);
+}
+
+inline void sub_reactor::maybe_resume_read(connection* c) noexcept {
+    if (!c->read_paused) return;
+    if (c->pending_bytes.load(std::memory_order_relaxed) <=
+        server_->cfg_.resolved_read_low_watermark_bytes())
+        resume_read(c);
 }
 
 inline drain_outcome sub_reactor::drain_wbuf_to_socket(connection* c) noexcept {
@@ -1647,6 +2119,10 @@ inline drain_outcome sub_reactor::drain_wbuf_to_socket(connection* c) noexcept {
         c->pending_bytes.fetch_sub(
             static_cast<size_t>(k), std::memory_order_relaxed);
         bytes_sent_local_ += static_cast<uint64_t>(k);
+        c->last_drain_progress_ms = now_ms();
+        // The peer is keeping up: reopen the read side once the backlog has
+        // fallen to the low mark.
+        maybe_resume_read(c);
     }
     return drain_outcome::drained;
 }
@@ -1656,10 +2132,14 @@ inline drain_outcome sub_reactor::drain_wbuf_to_socket(connection* c) noexcept {
 // mistaken for a peer that has gone quiet.
 inline int sub_reactor::handle_read(connection* c) noexcept {
     unschedule_read(c);
+    // A paused connection may still be invoked: an event already in the batch,
+    // or a continuation queued before the pause was applied. Do not read, and
+    // do not reschedule (schedule_read refuses while paused too).
+    if (c->read_paused) return 0;
     constexpr int k_read_budget  = 64 * 1024;
     constexpr int k_frame_budget = 256;
     int bytes_left = k_read_budget, frames_left = k_frame_budget;
-    // Frames this call handed to the handler. Every exit reports it, because
+    // Frames this call parsed and served. Every exit reports it, because
     // "the peer asked nothing more" and "the peer asked, and answers for it are
     // now queued behind whichever task called us" are not distinguishable from
     // outside -- and only the second one has something to wait for.
@@ -1669,7 +2149,19 @@ inline int sub_reactor::handle_read(connection* c) noexcept {
         if (!server_->is_running()) return dispatched();
         // Parse whatever is already a complete frame
         parse_frames(c, frames_left);
-        if (c->is_closed.load(std::memory_order_acquire)) return dispatched();
+        if (c->fsm.is_closed.load(std::memory_order_acquire))
+            return dispatched();
+        // parse_frames may have paused us at a frame boundary (or the PING
+        // reservation did). Either way, do not go on to recv().
+        if (c->read_paused) return dispatched();
+        // No frame was buffered, but output is already over the high mark:
+        // stop before the syscall, which is what lets TCP push back.
+        if (!c->fsm.closing.load(std::memory_order_acquire) &&
+            c->pending_bytes.load(std::memory_order_relaxed) >=
+                server_->cfg_.resolved_read_high_watermark_bytes()) {
+            pause_read(c);
+            return dispatched();
+        }
         if (frames_left <= 0 || bytes_left <= 0) {
             schedule_read(c);
             return dispatched();
@@ -1748,27 +2240,28 @@ inline int sub_reactor::handle_read(connection* c) noexcept {
 inline void sub_reactor::handle_write(connection* c) noexcept {
     // Past our FIN there is nothing left to write, and the EPOLLOUT bit is kept
     // clear, so an event arriving here is stale: just make sure it is off.
-    if (c->fin_sent) {
+    if (c->fsm.fin_sent) {
         disarm_write(c); return;
     }
     const drain_outcome r = drain_wbuf_to_socket(c);
-    if (r == drain_outcome::error) {
-        close_conn(c, "send error", false); return;
-    }
-    // Nothing more will ever leave this socket, so there is nothing for the
-    // rest of this function to wait for: no FIN can be negotiated (it requires
-    // an empty wbuf first) and no later EPOLLOUT can deliver what is queued.
-    // Ending it here rather than waiting is also what keeps this from becoming
-    // the write-side echo of the busy-poll the read side was cured of -- a
-    // socket with send-buffer space and a broken peer reports EPOLLOUT on every
-    // single epoll_wait, and leaving the interest armed would have this reactor
-    // re-run a failing sendmsg until some outside deadline noticed.
-    if (r == drain_outcome::dead) {
-        close_conn(c, "write side dead", false);
+    const close_action a = c->fsm.on_drain_result(r);
+    if (a == close_action::close_abort) {
+        // Nothing more will ever leave this socket, so there is nothing for the
+        // rest of this function to wait for: no FIN can be negotiated (it
+        // requires an empty wbuf first) and no later EPOLLOUT can deliver what
+        // is queued. Ending it here rather than waiting is also what keeps this
+        // from becoming the write-side echo of the busy-poll the read side was
+        // cured of -- a socket with send-buffer space and a broken peer reports
+        // EPOLLOUT on every single epoll_wait, and leaving the interest armed
+        // would have this reactor re-run a failing sendmsg until some outside
+        // deadline noticed.
+        const char* reason =
+            r == drain_outcome::dead ? "write side dead" : "send error";
+        close_conn(c, reason, false);
         return;
     }
     // fair-share budget or EAGAIN: EPOLLOUT refires
-    if (!c->wbuf.empty()) return;
+    if (a == close_action::none) return;
 
     // A parked peer-close finishes here, deterministically, instead of waiting
     // for the next spurious EPOLLIN to notice the drain completed.
@@ -1816,7 +2309,7 @@ inline void sub_reactor::handle_write(connection* c) noexcept {
     // Adding a guard here would move that accounting nowhere and would make
     // every EPOLLOUT on a parked socket wait another iteration to ask again.
     disarm_write(c);
-    if (c->closing.load(std::memory_order_acquire) &&
+    if (c->fsm.closing.load(std::memory_order_acquire) &&
         !try_begin_write_shutdown(c)) {
         // shutdown() failed on a socket that was writable a moment ago: the
         // only way left to end this connection is a reset, which is at least
@@ -1828,13 +2321,12 @@ inline void sub_reactor::handle_write(connection* c) noexcept {
 // Sends FIN and records it. Reads stay armed: the connection is now waiting for
 // the peer's own FIN (or close_linger_ms, enforced by do_tick).
 inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
-    if (c->fin_sent || c->fd < 0) return c->fin_sent;
+    if (c->fsm.fin_sent || c->fd < 0) return c->fsm.fin_sent;
     // Never FIN over bytes still in wbuf: they would be lost, and the peer
     // would see a clean end to a truncated stream.
-    if (!c->wbuf.empty()) return false;
+    if (!c->fsm.wbuf_empty()) return false;
     if (::shutdown(c->fd, SHUT_WR) < 0) return false;
-    c->fin_sent = true;
-    c->fin_sent_at_ms = now_ms();
+    c->fsm.fin_sent = true;
     return true;
 }
 
@@ -1870,45 +2362,22 @@ inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
 // because a deadline is all it can be sure of. Every half-close initiated by
 // the peer paid for that with an RST it never earned (P0-5).
 inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
-    if (c->is_closed.load(std::memory_order_acquire)) return;
-    if (!c->wbuf.empty()) {
+    if (c->fsm.is_closed.load(std::memory_order_acquire)) return;
+    if (!c->fsm.wbuf_empty()) {
         // Parked with the write side still productive. Read interest is dropped
         // for the rest of the drain (see the header comment): the only thing a
-        // read could deliver is the FIN we have already seen.
+        // read could deliver is the FIN we have already seen. apply_interest
+        // derives that from peer_closed, and still recovers an ENOENT
+        // registration with ADD -- without that recovery the socket goes
+        // silent and the drain never resumes (measured: 3MB of 16MB, then
+        // nothing). A registration the kernel will not accept ends the
+        // connection: EPOLLIN left armed on a FIN'd socket is a read event on
+        // every epoll_wait, each one re-running recv() -> 0 -> this same
+        // failing call (measured: ~170k/s, one core, until the linger abort).
         if (c->fd >= 0) {
-            struct epoll_event wev{};
-            wev.events  = EPOLLOUT;
-            wev.data.fd = c->fd;
-            if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, c->fd, &wev) == 0) {
-                c->write_armed = true;
-                return;                    // parked: handle_write resumes it
-            }
-            if (errno == ENOENT) {
-                // Registered set out of sync, the same way arm_write can
-                // find it. Recovering with ADD is not optional here: ENOENT
-                // means the fd is in no interest list at all, so without this
-                // the socket goes silent and the drain never resumes -- a peer
-                // that comes back and reads gets what was already in flight
-                // and then hangs (measured: 3MB of 16MB, then nothing).
-                if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, c->fd, &wev) == 0) {
-                    c->write_armed = true;
-                    return;
-                }
-            }
-            // any other failure: the interest list cannot be made to match what
-            // this connection needs, and EPOLLIN is still armed on a socket the
-            // peer has already FIN'd -- level-triggered, that is a read event
-            // on every single epoll_wait for as long as the drain takes, and
-            // every one of them re-runs recv() -> 0 -> this function -> the
-            // same failing call (measured: ~170k/s, one whole core, up to
-            // idle_timeout_ms + close_linger_ms, then a forced abort that drops
-            // everything still owed). Same verdict arm_write and disarm_write
-            // already reach for the same syscall: end it, rather than let a
-            // connection that cannot be maintained be maintained anyway.
-            server_->stats_ref().epoll_ctl_errors.fetch_add(
-                1, std::memory_order_relaxed);
-            close_conn(c, "epoll park registration failed", false);
-            return;
+            c->write_armed = true;
+            apply_interest(c, "epoll park registration failed");
+            return;                    // parked: handle_write resumes it
         }
         // fd < 0 means the descriptor is already detached, and the only place
         // that detaches it is teardown_closed() -- which sets is_closed first,
@@ -1918,22 +2387,26 @@ inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
         // -1.
         return;                    // parked close finishes in handle_write
     }
-    if (!c->closing.load(std::memory_order_acquire) &&
-        c->deferred_round == connection::deferred_round_kind::none &&
-        c->pending_bytes.load(std::memory_order_relaxed) > 0) {
-        c->deferred_round = connection::deferred_round_kind::peer_closed;
+    switch (c->fsm.on_peer_fin()) {
+      case close_action::defer_peer_closed: {
         const uint64_t id = c->id;
         if (enqueue(queue_task{finish_peer_closed_task{id}})) return;
         // The hand-off failed (queue full, or the reactor is going down): a
         // late FIN beats an answer nobody can wait for any longer.
-    }
-    if (c->closing.load(std::memory_order_acquire) && !c->fin_sent) {
+        break;
+      }
+      case close_action::send_fin:
         // Still closing on our side and the peer declared itself done too: the
         // only thing left is the FIN. Anything a handler queued was drained
         // above or is still passing through the socket buffer, ahead of it.
         if (!try_begin_write_shutdown(c)) {
             teardown_closed(c, "peer closed", false); return;
         }
+        break;
+      case close_action::close_graceful:
+        break;
+      default:
+        return;   // none: is_closed was already checked at the top
     }
     teardown_closed(c, "peer closed", true);
 }
@@ -1941,8 +2414,24 @@ inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
 inline void sub_reactor::parse_frames(connection* c,
                                       int& frames_left) noexcept {
     uint8_t hdr[FRAME_HEADER_SIZE];
+    // is_closed is checked in the loop, not only by the callers. A message
+    // handler runs application code between frames, and that code may call
+    // send_to(); if its arm_write() fails, the connection is torn down before
+    // this loop gets back to the header. Continuing would keep parsing and
+    // dispatching frames on a connection the reactor has already retired.
     while (server_->is_running() && frames_left > 0 &&
+           !c->fsm.is_closed.load(std::memory_order_acquire) &&
            c->rbuf.readable() >= FRAME_HEADER_SIZE) {
+        // Read backpressure stops here, at a frame boundary with the header
+        // still untouched, so the frame can be retried intact after resume. A
+        // graceful close overrides it: close_input_bytes and close_linger_ms
+        // are what bound input during a close.
+        if (!c->fsm.closing.load(std::memory_order_acquire) &&
+            c->pending_bytes.load(std::memory_order_relaxed) >=
+                server_->cfg_.resolved_read_high_watermark_bytes()) {
+            pause_read(c);
+            return;
+        }
         c->rbuf.peek(hdr, FRAME_HEADER_SIZE);
         uint16_t magic = (static_cast<uint16_t>(hdr[0]) << 8) | hdr[1];
         if (magic != FRAME_MAGIC) {
@@ -1969,6 +2458,45 @@ inline void sub_reactor::parse_frames(connection* c,
             return;
         }
 
+        // A PING has to reserve its PONG before the frame is committed. A
+        // failed reservation then leaves the frame in rbuf to retry after
+        // resume -- and a retried frame must not have been counted as
+        // received. A closing connection reserves nothing: its PING is dropped
+        // below, and reserving just to subtract again would be a window in
+        // which a PONG could stop a FIN.
+        bool pong_reserved = false;
+        if (type == frame_type::PING &&
+            !c->fsm.closing.load(std::memory_order_acquire)) {
+            const auto& pong = pong_frame();
+            size_t pending = c->pending_bytes.load(std::memory_order_relaxed);
+            while (pending <= server_->cfg_.max_pending_bytes &&
+                   pong.size() <= server_->cfg_.max_pending_bytes - pending) {
+                if (c->pending_bytes.compare_exchange_weak(
+                        pending, pending + pong.size(),
+                        std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    pong_reserved = true;
+                    break;
+                }
+            }
+            // The loop-top high-mark check should have made this unreachable;
+            // an explicit high mark equal to max_pending_bytes can leave a
+            // window. Pause and retry the same frame instead of resetting a
+            // peer whose only fault is reading slowly.
+            if (!pong_reserved) {
+                pause_read(c);
+                return;
+            }
+            // Unreachable by the pending<=max_pending<=wbuf_capacity
+            // invariant; kept because the alternative to this branch is a
+            // partial frame in the stream.
+            if (c->wbuf.writable() < pong.size()) {
+                c->pending_bytes.fetch_sub(
+                    pong.size(), std::memory_order_relaxed);
+                close_conn(c, "wbuf full on pong", false); return;
+            }
+        }
+
         c->rbuf.consume(FRAME_HEADER_SIZE);
         // This frame is complete; the next partial one starts a new deadline.
         c->frame_started_at_ms = 0;
@@ -1982,47 +2510,18 @@ inline void sub_reactor::parse_frames(connection* c,
         --frames_left;
 
         if (type == frame_type::PING) {
-            const auto& pong = pong_frame();
-            size_t pending = c->pending_bytes.load(std::memory_order_relaxed);
-            bool reserved = false;
-            while (pending <= server_->cfg_.max_pending_bytes &&
-                   pong.size() <= server_->cfg_.max_pending_bytes - pending) {
-                if (c->pending_bytes.compare_exchange_weak(
-                        pending, pending + pong.size(),
-                        std::memory_order_relaxed,
-                        std::memory_order_relaxed)) {
-                    reserved = true;
-                    break;
-                }
-            }
-            // The whole-frame rule applies here too: a PONG that cannot go out
-            // means the peer has no receive capacity left, so force the close.
-            // The two causes are reported separately because their remedies
-            // differ, and the wbuf half is unreachable by the invariant above
-            // -- all that can really happen is pending_bytes hitting
-            // max_pending_bytes, and calling that "wbuf full" sends whoever
-            // reads the close callback the wrong way.
-            if (!reserved) {
-                close_conn(c, "pending bytes at limit on pong", false); return;
-            }
-            if (c->wbuf.writable() < pong.size()) {
-                c->pending_bytes.fetch_sub(
-                    pong.size(), std::memory_order_relaxed);
-                close_conn(c, "wbuf full on pong", false); return;
-            }
-            if (c->closing.load(std::memory_order_acquire)) {
+            if (!pong_reserved) {
                 // Mid-close: the FIN is already (or about to be) behind
                 // everything we owe the peer. Queueing a PONG after it would
                 // either be sent past the FIN -- which the kernel refuses --
                 // or silently lost. The peer is entitled to nothing more than
                 // the reply it asked for.
-                c->pending_bytes.fetch_sub(
-                    pong.size(), std::memory_order_relaxed);
                 server_->stats_ref().frames_dropped_on_close.fetch_add(
                     1, std::memory_order_relaxed);
                 c->rbuf.consume(len);
                 continue;
             }
+            const auto& pong = pong_frame();
             c->wbuf.write(pong.data(), pong.size());
             // frames_sent is likewise counted on leaving wbuf (see
             // submit_send). Idempotent move toward a target state; no
@@ -2031,7 +2530,7 @@ inline void sub_reactor::parse_frames(connection* c,
             // close_conn only marks and unlists now and runs no callback on
             // this stack -- though a failed arm just above may already have
             // closed it.
-            if (c->is_closed.load(std::memory_order_acquire)) return;
+            if (c->fsm.is_closed.load(std::memory_order_acquire)) return;
             c->rbuf.consume(len);
         } else if (type == frame_type::PONG) {
             c->rbuf.consume(len);
@@ -2068,6 +2567,9 @@ inline void sub_reactor::parse_frames(connection* c,
     }
 
     // A header that has not arrived in full is also a frame in progress.
+    // Nothing is stamped once the connection is closed: there is no assembly
+    // deadline left to run on it.
+    if (c->fsm.is_closed.load(std::memory_order_acquire)) return;
     if (c->rbuf.readable() > 0 &&
         c->rbuf.readable() < FRAME_HEADER_SIZE &&
         c->frame_started_at_ms == 0) {
@@ -2097,7 +2599,6 @@ inline void sub_reactor::unregister_conn(connection* c,
         lg.l_linger = 0;
         setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
     }
-    fd_index_.erase(c->fd);
     epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, c->fd, nullptr);
     ::close(c->fd);
     c->fd = -1;
@@ -2111,13 +2612,13 @@ inline void sub_reactor::unregister_conn(connection* c,
     // done so: what it buys is that a reader added later cannot find `closing`
     // stale-true on a descriptor that is gone, which is a small mercy next to
     // the alternative.
-    c->closing.store(false, std::memory_order_release);
+    c->fsm.closing.store(false, std::memory_order_release);
 }
 
 // A connection that was accepted and then refused by its own registration --
 // the map insert threw, or on_connection_opened said no. unregister_conn()
-// already took the descriptor, the epoll registration and the fd_index_ entry,
-// and used to be the whole of the rollback: the conns_ entry survived it as a
+// already took the descriptor and the epoll registration, and used to be the
+// whole of the rollback: the conns_ entry survived it as a
 // conn with fd == -1, not closed and not closing. do_tick then read it as idle
 // and parked a graceful close whose try_begin_write_shutdown() cannot even
 // start (fd < 0), so it died only when the linger expired -- idle_timeout_ms +
@@ -2132,23 +2633,24 @@ inline void sub_reactor::discard_rejected_conn(connection* c) noexcept {
     unregister_conn(c);
     conns_.erase(c->id);
     server_->on_connection_closed(c->id);
-    c->is_closed.store(true, std::memory_order_release);
+    c->fsm.is_closed.store(true, std::memory_order_release);
     // The task holds the last reference and would release the ticket on return
     // either way; releasing it here instead frees the admission slot now rather
     // than whenever the ghost was going to be reaped.
     c->admission.reset();
 }
 
-// pending_bytes is reserved at enqueue time and released on two paths only: a
-// successful sendmsg (drain_wbuf_to_socket) and an explicit whole-frame drop
-// (capacity reject in submit_send / PONG). A closing connection takes a third,
-// previously missing path: the bytes still sitting in wbuf are never sent, so
-// they must be subtracted here or the reservation leaks for the lifetime of the
+// pending_bytes is reserved when a frame is admitted and released wherever that
+// frame stops being owed: written to the kernel (drain_wbuf_to_socket), dropped
+// whole (capacity reject, closing connection, refused PONG), or rolled back
+// because the submission failed. The bytes still sitting in wbuf are the case
+// handled here: the connection is going away, so they will never be sent, and
+// the reservation must be subtracted or it leaks for the lifetime of the
 // connection -- and any watermark built on it stays permanently inflated.
 //
 // Bytes still reserved by queued-but-unwritten send tasks are NOT handled here:
-// submit_send already releases them on the is_closed path, so this function
-// must never try to guess at them (it would double-count).
+// the send task itself releases them when it runs against a closed connection,
+// so this function must never try to guess at them (it would double-count).
 inline void sub_reactor::discard_pending_output(connection* c) noexcept {
     const size_t remaining = c->wbuf.readable();
     if (remaining == 0) return;
@@ -2186,7 +2688,7 @@ inline void sub_reactor::close_conn(connection* c, const char* reason,
                                   bool graceful) noexcept {
     // A graceful close of a live connection is parked; one that has already
     // sent its FIN (or is aborted) is torn down right here.
-    if (graceful && !c->fin_sent) {
+    if (graceful && !c->fsm.fin_sent) {
         park_close(c, reason); return;
     }
     teardown_closed(c, reason, graceful);
@@ -2212,30 +2714,34 @@ inline void sub_reactor::close_conn(connection* c, const char* reason,
 // first FIN is still in flight) must not restart the drain or skip it.
 inline void sub_reactor::park_close(connection* c,
                                     const char* reason) noexcept {
-    if (c->is_closed.load(std::memory_order_acquire) || c->fin_sent) return;
-    if (!c->closing.load(std::memory_order_acquire)) {
-        c->closing.store(true, std::memory_order_release);
-        c->close_started_at_ms = now_ms();
-    }
+    const close_action a = c->fsm.on_graceful();
+    if (a == close_action::none) return;
+    // A close overrides read backpressure. The FIN exchange needs read
+    // interest to see the peer's FIN even when this connection was paused;
+    // close_linger_ms bounds how long that wait may last.
+    resume_read(c);
     // Hand over what is already queued; whatever does not fit in the socket
     // buffer stays in wbuf and is finished by handle_write (EPOLLOUT armed).
     const drain_outcome r = drain_wbuf_to_socket(c);
-    if (r == drain_outcome::error) {
+    switch (c->fsm.on_drain_result(r)) {
+      case close_action::close_abort:
+        // Once the socket refuses writes for good there is no graceful close
+        // left to honour -- nothing owed can leave, so no FIN can honestly
+        // follow it. Waiting would change nothing except which deadline does
+        // this same abort later.
         teardown_closed(c, reason, false); return;
-    }
-    // Once the socket refuses writes for good there is no graceful close left
-    // to honour -- nothing owed can leave, so no FIN can honestly follow it.
-    // Waiting would change nothing except which deadline does this same abort
-    // later.
-    if (r == drain_outcome::dead) {
-        teardown_closed(c, reason, false); return;
-    }
-    if (!c->wbuf.empty()) {
-        arm_write(c); return;
+      case close_action::none:
+        arm_write(c); return;   // stalled: wbuf non-empty, EPOLLOUT resumes
+      case close_action::drain_complete:
+        break;   // wbuf empty, FIN goes out below
+      default:
+        break;   // unreachable: on_drain_result returns only the three above
     }
     // wbuf empty: either every byte is in the socket buffer, or sendmsg stopped
     // exactly on the budget boundary. In both cases nothing more can be queued
-    // (`closing` refuses submissions), so the FIN goes out now.
+    // (`closing` refuses submissions), so this is where the FIN goes out. If
+    // shutdown() fails there is no FIN to wait for, and do_tick's close_linger
+    // deadline becomes the only thing left to end the connection.
     try_begin_write_shutdown(c);
 }
 
@@ -2272,11 +2778,11 @@ inline void sub_reactor::park_close(connection* c,
 // what was already buffered when the close was asked for: fresh arrivals do not
 // extend it, so a peer that keeps sending cannot hold the close open.
 inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
-    if (c->is_closed.load(std::memory_order_acquire) || c->fin_sent) return;
-
-    // Measured before the read: what had arrived and had not been served yet.
-    if (c->close_input_bytes < 0)
-        c->close_input_bytes = static_cast<int64_t>(c->rbuf.readable());
+    if (c->fsm.on_request() == close_action::none) return;
+    // A close overrides read backpressure: the budget below (measured from
+    // what was already buffered) bounds how much this may serve, and the peer
+    // is owed answers to the requests it sent before the close.
+    resume_read(c);
 
     c->drain_read_bytes = 0;
     const size_t queued_before = c->rbuf.readable();
@@ -2284,7 +2790,9 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
     // handle_read has its own exits: the peer's FIN may have arrived in the
     // same read, or the socket may have errored. Either way the connection is
     // already accounted for and there is nothing left for this request to do.
-    if (c->is_closed.load(std::memory_order_acquire) || c->fin_sent) return;
+    if (c->fsm.is_closed.load(std::memory_order_acquire) ||
+        c->fsm.fin_sent)
+        return;
 
     // Charged in bytes, and for every byte the call handed out -- including the
     // ones that arrived during it. Charging `served * FRAME_HEADER_SIZE` made
@@ -2305,59 +2813,36 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
     // of it. What survives past that is at most one read budget of the newest
     // input, bounded by k_read_budget and independent of how much the peer
     // sends.
+    int64_t dealt = 0;
     if (served > 0) {
-        const int64_t dealt = static_cast<int64_t>(queued_before)
-                            + static_cast<int64_t>(c->drain_read_bytes)
-                            - static_cast<int64_t>(c->rbuf.readable());
-        if (dealt > 0) c->close_input_bytes -= dealt;
+        dealt = static_cast<int64_t>(queued_before)
+              + static_cast<int64_t>(c->drain_read_bytes)
+              - static_cast<int64_t>(c->rbuf.readable());
         c->drain_read_bytes = 0;
     }
 
-    // More of the owed input is still buffered and the budget allows another
-    // round: come back for it. Parking here would refuse the replies of frames
-    // this close promised to serve. Progress is required (served > 0) so a peer
-    // that stops mid-frame cannot keep the close pending on a half a frame.
-    if (served > 0 && !c->rbuf.empty() && c->close_input_bytes > 0) {
+    // The decisions below live in close_fsm::on_input_drained. The
+    // defer_drain_input and defer_park cases are the two "answers are queued
+    // behind this batch" branches; none is the peer_closed round already
+    // being owned. Progress is required (served > 0) so a peer that stops
+    // mid-frame cannot hold the close open on a half a frame. Case F's "11 of
+    // 22 bytes" is the defer_park case: parking early would set `closing`,
+    // submit_send refuses the reply, and the peer gets an orderly FIN over a
+    // request we took in, handled, and answered into nothing.
+    close_action a = c->fsm.on_input_drained(served, dealt);
+    if (a == close_action::defer_drain_input) {
         const uint64_t id = c->id;
         if (enqueue(queue_task{drain_input_task{id}})) return;
         // The hand-off failed: park below rather than keeping it pending.
+        a = c->fsm.on_input_defer_failed();
     }
-
-    // Nothing further to read, yet bytes are still reserved: replies whose
-    // handler already ran -- possibly two batches apart, with this task landing
-    // between them. Parking now side-effects every one of them into `closing`,
-    // which submit_send refuses, and the peer gets an orderly FIN over a
-    // request we took in, handled, and answered into nothing (case F: 11 of 22
-    // bytes).
-    // Their reservations still standing is what makes them visible here.
-    if (served == 0 &&
-        c->deferred_round == connection::deferred_round_kind::none &&
-        c->pending_bytes.load(std::memory_order_relaxed) > 0) {
-        c->deferred_round = connection::deferred_round_kind::close;
+    if (a == close_action::defer_park) {
         const uint64_t id = c->id;
         if (enqueue(queue_task{park_close_task{id}})) return;
         // The hand-off failed: park here rather than keeping it forever.
+    } else if (a != close_action::drain_wbuf) {
+        return;   // none: peer_closed round owns it, or already done
     }
-    // The peer's FIN arrived in the same read that dispatched these frames, and
-    // finish_peer_closed() already claimed the round: it is queued to come back
-    // once the replies have landed in wbuf. Parking here would set `closing`
-    // and -- wbuf still being empty -- send the FIN at once, over the very
-    // replies that deferral exists to protect. The close ends in the task that
-    // owns the round, which is also the only one that can see whether anything
-    // is still owed.
-    if (c->deferred_round ==
-        connection::deferred_round_kind::peer_closed) return;
-
-    if (served == 0 ||
-        c->deferred_round == connection::deferred_round_kind::close) {
-        park_close(c, "requested");
-        return;
-    }
-
-    c->deferred_round = connection::deferred_round_kind::close;
-    const uint64_t id = c->id;
-    if (enqueue(queue_task{park_close_task{id}})) return;
-
     // Nothing came of the hand-off -- queue full, or the reactor is going down.
     // A late close beats an answer nobody would wait for, so honour it here.
     park_close(c, "requested");
@@ -2371,7 +2856,7 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
 inline void sub_reactor::teardown_closed(connection* c, const char* reason,
                                        bool graceful) noexcept {
     bool expected = false;
-    if (!c->is_closed.compare_exchange_strong(expected, true,
+    if (!c->fsm.is_closed.compare_exchange_strong(expected, true,
                                              std::memory_order_acq_rel))
         return;
     // reason is not stored on the connection: it is forwarded straight into the
@@ -2392,7 +2877,7 @@ inline void sub_reactor::teardown_closed(connection* c, const char* reason,
             keep_alive = it->second; conns_.erase(it);
         }
     }
-    // fd_index_ erase + EPOLL_CTL_DEL + close + fd = -1
+    // EPOLL_CTL_DEL + close + fd = -1
     unregister_conn(c, graceful);
 
     server_->stats_ref().closed.fetch_add(1, std::memory_order_relaxed);
@@ -2449,14 +2934,34 @@ inline void sub_reactor::flush_close_callbacks() noexcept {
     for (auto& e : batch) {
         finish_close(e.conn);              // connection may die here
         auto& sh = server_->state_handler_ref();
-        if (sh) sh(e.id, e.peer, false);
-        if (server_->close_handler_)
-            server_->close_handler_(e.id, e.peer, e.reason.c_str());
+        // Each callback is contained separately: a throw from the state
+        // handler must not suppress the close notification, and either one is
+        // an application bug rather than a reason to terminate a server that
+        // has already torn the connection down.
+        if (sh) {
+            try {
+                sh(e.id, e.peer, false);
+            } catch (...) {
+                server_->stats_ref().callback_exceptions.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+        if (server_->close_handler_) {
+            try {
+                server_->close_handler_(e.id, e.peer, e.reason.c_str());
+            } catch (...) {
+                server_->stats_ref().callback_exceptions.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
     }
 }
 
 inline void sub_reactor::schedule_read(connection* c) noexcept {
-    if (c->read_pending) return;
+    // A paused connection must not enter the continuation list: the loop runs
+    // continuations with a zero epoll timeout, so a paused entry would turn
+    // every iteration into a spin that handle_read immediately declines.
+    if (c->read_paused || c->read_pending) return;
     c->read_pending = true;
     c->read_prev = read_tail_;
     if (read_tail_) read_tail_->read_next = c;
@@ -2499,23 +3004,53 @@ inline void sub_reactor::do_tick() noexcept {
     // conns_ between being chosen and being closed, and nothing else holds a
     // reference across that gap.
     using connection_ptr = std::shared_ptr<connection>;
-    std::vector<connection_ptr> idle;   // graceful: may still owe bytes
+    std::vector<connection_ptr> wanted;    // queue refused; sweep owes a close
+    std::vector<connection_ptr> resumable;  // paused, backlog below low
+    std::vector<connection_ptr> idle;      // graceful: may still owe bytes
     std::vector<connection_ptr> expired;   // past its deadline: forced
     std::vector<connection_ptr> stalled;   // frame never completed
     for (auto& kv : conns_) {
         connection* c = kv.second.get();
-        if (c->closing.load(std::memory_order_acquire)) {
+        // close_connection() could not queue its task. The request still
+        // stands, so perform the same drain-then-close here. Checked before
+        // the deadline sweeps: a requested close must not be reclassified as
+        // an idle timeout, and the connection may already be closing (then the
+        // flag is just a stale retry and the deadline logic below owns it).
+        if (c->fsm.close_wanted.load(std::memory_order_acquire) &&
+            c->fsm.close_wanted.exchange(false, std::memory_order_acq_rel) &&
+            !c->fsm.closing.load(std::memory_order_acquire)) {
+            wanted.push_back(kv.second);
+            continue;
+        }
+        if (c->fsm.closing.load(std::memory_order_acquire)) {
             // A closing connection has a deadline regardless of which stage it
             // reached, and it is the same value for both: how long the close
             // may take. last_recv_ms is useless here (the peer has nothing left
             // to send), so measure from the close itself; park_close stamps
             // close_started_at_ms before any of the stages that can stall.
-            if (linger > 0 && c->fd >= 0 && c->close_started_at_ms != 0 &&
-                now - c->close_started_at_ms >= linger)
+            if (linger > 0 && c->fd >= 0 && c->fsm.close_started_at_ms != 0 &&
+                now - c->fsm.close_started_at_ms >= linger)
                 expired.push_back(kv.second);
             continue;
         }
-        if (c->last_recv_ms < cutoff) {
+        // A paused connection resumes here when the backlog has fallen to the
+        // low mark. The drain path resumes immediately; this covers releases
+        // that happen on a caller thread (send_to's rollback), which cannot
+        // touch this reactor's epoll registration.
+        if (c->read_paused) {
+            if (c->pending_bytes.load(std::memory_order_relaxed) <=
+                server_->cfg_.resolved_read_low_watermark_bytes()) {
+                resumable.push_back(kv.second);
+                continue;
+            }
+            // Still backpressured. The idle check below still applies, but it
+            // must count drain progress as activity: while paused, no inbound
+            // bytes are stamped, and a peer that is reading steadily is not
+            // idle just because it is slow.
+        }
+        const int64_t last_activity =
+            std::max(c->last_recv_ms, c->last_drain_progress_ms);
+        if (last_activity < cutoff) {
             server_->stats_ref().idle_timeouts.fetch_add(
                 1, std::memory_order_relaxed);
             // Default (graceful): an idle connection is still a legitimate peer
@@ -2526,14 +3061,19 @@ inline void sub_reactor::do_tick() noexcept {
         }
         // Bytes keep arriving but the frame never completes. This is the case
         // idle_timeout_ms deliberately does not catch; abort rather than park
-        // so the slot is released now.
-        if (c->frame_started_at_ms != 0 && frame_timeout > 0 &&
+        // so the slot is released now. A paused connection is exempt: it is
+        // not reading, so a frame left incomplete is our backpressure, not the
+        // peer dribbling. resume_read() restarts the deadline.
+        if (!c->read_paused && c->frame_started_at_ms != 0 &&
+            frame_timeout > 0 &&
             now - c->frame_started_at_ms >= frame_timeout) {
             server_->stats_ref().frame_assembly_timeouts.fetch_add(
                 1, std::memory_order_relaxed);
             stalled.push_back(kv.second);
         }
     }
+    for (auto& c : wanted)    drain_input_then_close(c.get());
+    for (auto& c : resumable) resume_read(c.get());
     for (auto& c : idle)    close_conn(c.get(), "idle timeout");
     for (auto& c : expired) close_conn(c.get(), "close linger expired", false);
     for (auto& c : stalled)
@@ -2599,43 +3139,66 @@ inline void sub_reactor::loop() noexcept {
                 break;
             }
             for (int i = 0; i < n; ++i) {
-                int      fd = events[i].data.fd;
+                // Events carry the connection id, not the descriptor. A
+                // descriptor can be recycled by a close + accept in the same
+                // batch, and a stale event would then act on the new
+                // connection; an id is never reused, so a retired one simply
+                // fails the lookup below.
+                const uint64_t tag = events[i].data.u64;
                 uint32_t ev = events[i].events;
 
-                if (fd == wake_fd_) {
-                    drain_wakeup(); process_pending(); continue;
+                // Only drain the wake count here. Queue work still runs once
+                // after the whole batch, so a task that creates a connection
+                // cannot make a later event in this same batch refer to it.
+                if (tag == REACTOR_WAKE_TAG) {
+                    drain_wakeup(); continue;
                 }
 
-                auto it = fd_index_.find(fd);
-                if (it == fd_index_.end()) continue;
-                connection* c = it->second;
+                auto it = conns_.find(tag);
+                if (it == conns_.end()) continue;   // retired connection
 
                 // ---- hold a shared_ptr alive across the whole event dispatch
                 // ----
-                std::shared_ptr<connection> keep_alive;
-                {
-                    auto cit = conns_.find(c->id);
-                    if (cit != conns_.end()) keep_alive = cit->second;
-                }
+                std::shared_ptr<connection> keep_alive = it->second;
                 if (!keep_alive) continue;
+                connection* c = keep_alive.get();
 
-                // HUP/ERR is the kernel telling us the socket is already broken
-                // (or the peer is gone for good); draining into it cannot work.
-                // Abort so the peer is not left waiting on a stream that will
-                // never complete.
-                if (ev & (EPOLLHUP | EPOLLERR)) {
+                // EPOLLERR is the kernel telling us the socket is broken (a
+                // reset, typically); draining into it cannot work. Abort so the
+                // peer is not left waiting on a stream that will never
+                // complete.
+                if (ev & EPOLLERR) {
                     close_conn(c, "hup/err", false); continue;
                 }
+                // EPOLLHUP is not an error by itself. Linux raises it once both
+                // directions are shut -- exactly the state a server-initiated
+                // graceful close reaches: our shutdown(SHUT_WR), then the
+                // peer's FIN. The event normally carries EPOLLIN as well, and
+                // that is the path that knows whether the close is parked and
+                // should finish orderly (handle_read -> recv() == 0 ->
+                // finish_peer_closed). Checking HUP first classified the last
+                // step of every such close as an abort: `aborted` incremented,
+                // the close reason read "hup/err", and any input the peer had
+                // already sent was dropped (measured: clean client close after
+                // the server's FIN -> reason "hup/err", aborted=1).
                 if (ev & EPOLLIN) {
                     handle_read(c);
-                    if (c->is_closed.load(std::memory_order_acquire)) continue;
+                    if (c->fsm.is_closed.load(std::memory_order_acquire))
+                        continue;
+                } else if (ev & EPOLLHUP) {
+                    // Nothing readable is left: both directions are shut and
+                    // the read path has no EOF to report. End it.
+                    close_conn(c, "hup/err", false); continue;
                 }
                 if (ev & EPOLLOUT) {
                     handle_write(c);
                 }
             }
             // Deferred close callbacks run with no per-connection stack frames
-            // alive, so a callback may stop() or destroy the server safely.
+            // alive, so a callback may call stop() -- which from there only
+            // requests shutdown. Destroying the server is still forbidden (see
+            // the class contract): the calling thread is one stop() would have
+            // to join.
             flush_close_callbacks();
             process_pending();
             flush_close_callbacks();
@@ -2685,7 +3248,11 @@ inline bool multi_reactor_server::init_listen_socket() noexcept {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef SO_REUSEPORT
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+        // Opt-in: with it on, a second process can bind this port and the
+        // kernel splits connections between them, so a failed bind no longer
+        // tells anyone that a stale instance is still running.
+        if (cfg_.reuse_port)
+            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
         if (p->ai_family == AF_INET6) {
             int zero = 0;
@@ -2776,6 +3343,67 @@ inline bool multi_reactor_server::start() noexcept {
     if (cfg_.max_pending_bytes > cfg_.wbuf_capacity) {
         cfg_.max_pending_bytes = cfg_.wbuf_capacity;
     }
+    // Resolved after the clamp, so a derived high mark never exceeds the
+    // ceiling the rest of the reactor will actually enforce.
+    {
+        const size_t high = cfg_.resolved_read_high_watermark_bytes();
+        const size_t low  = cfg_.resolved_read_low_watermark_bytes();
+        if (high == 0 || high > cfg_.max_pending_bytes ||
+            low == 0 || low >= high) {
+            std::fprintf(stderr,
+                         "[error] read watermarks must satisfy "
+                         "0 < low < high <= max_pending_bytes "
+                         "(low=%zu high=%zu max_pending_bytes=%zu)\n",
+                         low, high, cfg_.max_pending_bytes);
+            life_.store(life::stopped, std::memory_order_release);
+            return false;
+        }
+    }
+    // Admission budget. The product is resolved after the buffer sizes are
+    // known; a budget below one connection's buffers could never admit
+    // anything, which is a configuration error rather than a policy.
+    if (cfg_.rbuf_capacity >
+        static_cast<size_t>(-1) - cfg_.wbuf_capacity) {
+        std::fprintf(
+            stderr,
+            "[error] rbuf_capacity + wbuf_capacity overflows size_t\n");
+        life_.store(life::stopped, std::memory_order_release);
+        return false;
+    }
+    per_conn_buffer_bytes_ = cfg_.per_connection_buffer_bytes();
+    max_buffer_bytes_ = cfg_.resolved_max_total_buffer_bytes();
+    if (per_conn_buffer_bytes_ == 0 ||
+        max_buffer_bytes_ < per_conn_buffer_bytes_ ||
+        cfg_.max_connections_per_ip < 0) {
+        std::fprintf(stderr,
+                     "[error] admission config invalid: per-connection buffers="
+                     "%zu, max_total_buffer_bytes=%zu, "
+                     "max_connections_per_ip=%d\n",
+                     per_conn_buffer_bytes_, max_buffer_bytes_,
+                     cfg_.max_connections_per_ip);
+        life_.store(life::stopped, std::memory_order_release);
+        return false;
+    }
+    if (max_buffer_bytes_ / per_conn_buffer_bytes_ <
+        static_cast<size_t>(cfg_.max_connections)) {
+        const size_t admittable = max_buffer_bytes_ / per_conn_buffer_bytes_;
+        std::fprintf(stderr,
+                     "[warn] max_total_buffer_bytes=%zu admits about %zu of "
+                     "max_connections=%d (each reserves %zu bytes)\n",
+                     max_buffer_bytes_, admittable, cfg_.max_connections,
+                     per_conn_buffer_bytes_);
+    }
+    if (cfg_.max_connections_per_ip > 0 && !ip_table_) {
+        try {
+            ip_table_ = std::make_shared<ip_admission>();
+        } catch (...) {
+            std::fprintf(stderr,
+                         "[error] could not allocate the per-IP admission "
+                         "table\n");
+            life_.store(life::stopped, std::memory_order_release);
+            return false;
+        }
+    }
 
     // ---- fd ceiling: raise it if we can, and say how far it goes if we cannot
     // ----
@@ -2787,8 +3415,14 @@ inline bool multi_reactor_server::start() noexcept {
     // before reporting anything.
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        // Descriptors the server needs besides one per connection: the accept
+        // epoll + eventfd (2), one epoll + eventfd per reactor, and a small
+        // margin. The old flat +64 under-counted from 32 reactors upwards.
+        const uintmax_t overhead =
+            static_cast<uintmax_t>(
+                2 * (1 + cfg_.resolved_reactor_count())) + 16;
         const uintmax_t needed =
-            static_cast<uintmax_t>(cfg_.max_connections) + 64;
+            static_cast<uintmax_t>(cfg_.max_connections) + overhead;
         // Compare in uintmax_t, never int: RLIM_INFINITY is "no limit", and
         // narrowing it to int wraps negative, which read as "too low" and
         // printed a spurious warning on unlimited configurations.
@@ -2816,7 +3450,7 @@ inline bool multi_reactor_server::start() noexcept {
                 static_cast<uintmax_t>(rl.rlim_cur),
                 static_cast<uintmax_t>(rl.rlim_max),
                 cfg_.max_connections,
-                cur > 64 ? cur - 64 : 0);
+                cur > overhead ? cur - overhead : 0);
         }
     }
 
@@ -2975,12 +3609,36 @@ inline bool multi_reactor_server::stop_gracefully(int timeout_ms) noexcept {
     stop_accepting();
 
     const int64_t deadline = now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
+    // close_connection() queues a close_task every time it succeeds. Calling it
+    // for every still-open id on every 10 ms pass made a connection that was
+    // slow to drain collect one close request per pass -- on a large server
+    // enough of them to fill the reactor queues, where they competed with the
+    // drain/park continuations the close itself depends on. Ask once per id;
+    // only a request the queue actually refused is retried. The connection's
+    // own linger deadline bounds the rest.
+    std::unordered_set<uint64_t> requested;
     while (now_ms() < deadline) {
-        const std::vector<uint64_t> ids = connection_ids();
+        std::vector<uint64_t> ids;
+        try {
+            ids = connection_ids();
+        } catch (...) {
+            break;  // Could not snapshot; fall through to stop() below.
+        }
         if (ids.empty() && admitted_.load(std::memory_order_acquire) == 0) {
             break;
         }
-        for (uint64_t id : ids) (void)close_connection(id);
+        for (uint64_t id : ids) {
+            if (requested.count(id) != 0) continue;
+            if (!close_connection(id)) continue;
+            // Remembering the id must not turn into std::terminate: this
+            // function is noexcept, and an allocation failure here is not a
+            // reason to kill a server that is already shutting down. Failing to
+            // record it only means the next pass asks this one again.
+            try {
+                requested.insert(id);
+            } catch (...) {
+            }
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -3209,13 +3867,26 @@ inline void multi_reactor_server::accept_loop(
                 fd_guard cfd_guard(cfd);
 
                 bool reject = false;
+                bool over_budget = false;
                 {
                     if (admitted_.load() >=
                         static_cast<size_t>(cfg_.max_connections))
                         reject = true;
+                    // Advisory like the count above: this load races the
+                    // reservations by definition, and the ceiling is a bound
+                    // on the steady state, not a hard barrier.
+                    const size_t committed =
+                        stats_.buffer_bytes.load(std::memory_order_relaxed);
+                    over_budget =
+                        committed > max_buffer_bytes_ ||
+                        per_conn_buffer_bytes_ > max_buffer_bytes_ - committed;
+                    if (over_budget) reject = true;
                 }
                 if (reject) {
                     stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+                    if (over_budget)
+                        stats_.buffer_budget_rejections.fetch_add(
+                            1, std::memory_order_relaxed);
                     continue;   // cfd_guard closes it
                 }
 
@@ -3233,14 +3904,30 @@ inline void multi_reactor_server::accept_loop(
                 try {
                 char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
                 std::string peer = "unknown";
+                std::string ip_key = "unknown";
                 if (getnameinfo((struct sockaddr*)&ss, slen, hbuf, sizeof(hbuf),
                                 sbuf, sizeof(sbuf),
                                 NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
                     try {
+                        ip_key.assign(hbuf);
+                        // A dual-stack listener reports the same peer as
+                        // ::ffff:a.b.c.d for IPv4; key it as a.b.c.d so the
+                        // per-IP cap cannot be bypassed by spelling.
+                        static constexpr char k_mapped[] = "::ffff:";
+                        if (ip_key.size() > sizeof(k_mapped) - 1 &&
+                            ip_key.compare(0, sizeof(k_mapped) - 1, k_mapped) ==
+                                0 &&
+                            ip_key.find('.', sizeof(k_mapped) - 1) !=
+                                std::string::npos) {
+                            ip_key.erase(0, sizeof(k_mapped) - 1);
+                        }
                         peer.assign(hbuf);
                         peer.push_back(':');
                         peer.append(sbuf);
-                    } catch (...) { peer = "unknown"; }
+                    } catch (...) {
+                        peer = "unknown";
+                        ip_key = "unknown";
+                    }
                 }
 
                 sub_reactor* r = pick_reactor();
@@ -3248,13 +3935,29 @@ inline void multi_reactor_server::accept_loop(
 
                 uint64_t id = next_conn_id_.fetch_add(
                     1, std::memory_order_relaxed);
+                // REACTOR_WAKE_TAG is 0. Skipping the wrap keeps that sentinel
+                // unambiguous; the counter has to pass through 2^64 ids to get
+                // here, so this is a formality that costs nothing.
+                if (id == REACTOR_WAKE_TAG)
+                    id = next_conn_id_.fetch_add(
+                        1, std::memory_order_relaxed);
                 // Submission consumes ownership on both success and rejection.
                 // accepted is NOT bumped here: queueing a task is not a
                 // connection.
                 // The reactor bumps it once the socket is registered in both
                 // maps, so a task that fails during registration counts as
                 // rejected only.
-                auto admission = std::make_shared<admission_ticket>(admitted_);
+                auto admission = std::make_shared<admission_ticket>(
+                    admitted_, stats_.buffer_bytes, per_conn_buffer_bytes_,
+                    ip_table_, std::move(ip_key));
+                if (!admission->acquire_ip(cfg_.max_connections_per_ip)) {
+                    // The ticket's destructor gives back the global count and
+                    // byte reservation; no per-IP slot was taken.
+                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+                    stats_.ip_rejections.fetch_add(
+                        1, std::memory_order_relaxed);
+                    continue;   // cfd_guard closes it
+                }
                 if (!r->submit_new_connection(std::move(cfd_guard),
                                             std::move(peer), id,
                                             std::move(admission))) {
@@ -3295,10 +3998,10 @@ inline bool multi_reactor_server::on_connection_opened(
         shard.map[id] = std::move(c);
         return true;
     } catch (...) {
-        // No counter here either. queue_drops is "a frame was refused at
-        // enqueue", and there is no frame in this failure -- the false return
-        // is what the reactor counts as rejected, which is the one question
-        // this answer can support.
+        // No counter here either. queue_drops counts submissions refused at
+        // enqueue, and this failure happens after the task was accepted -- the
+        // false return is what the reactor counts as rejected, which is the one
+        // question this answer can support.
         return false;
     }
 }
@@ -3347,8 +4050,9 @@ inline send_result multi_reactor_server::send_to(uint64_t conn_id,
     // would describe a frame that is going into bytes_dropped on arrival. This
     // is not a shutdown or a disconnection that ok is allowed to be vague about
     // -- it is the close this caller asked for moments ago.
-    if (c->is_closed.load(std::memory_order_acquire) ||
-        c->closing.load(std::memory_order_acquire)) return send_result::closed;
+    if (c->fsm.is_closed.load(std::memory_order_acquire) ||
+        c->fsm.closing.load(std::memory_order_acquire))
+        return send_result::closed;
 
     std::vector<uint8_t> frame;
     try {
@@ -3400,7 +4104,7 @@ inline bool multi_reactor_server::close_connection(uint64_t conn_id) noexcept {
     // be silent: nothing anywhere recorded that this connection was asked to go
     // away, so it simply waited for idle timeout while the application believed
     // it had hung up. (The name says "dropped" because that is what happens to
-    // the request; the connection keeps living until something else ends it.)
+    // the immediate hand-off; the close itself is no longer lost -- see below.)
     if (!c->owner) {
         stats_.close_requests_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -3410,9 +4114,14 @@ inline bool multi_reactor_server::close_connection(uint64_t conn_id) noexcept {
     // queued, not from the moment the caller returns: otherwise a handler
     // already in flight can pass the fast-path check while the close task is
     // being appended, and write ahead of it (R9-4).
-    c->close_requests.fetch_add(1, std::memory_order_release);
+    c->fsm.close_requests.fetch_add(1, std::memory_order_release);
     if (!c->owner->submit_close(conn_id)) {
-        c->close_requests.fetch_sub(1, std::memory_order_release);
+        // The queue refused the task, but the request is still honoured:
+        // close_wanted gives it to do_tick's sweep, which performs the same
+        // drain-then-close the task would have. The count stays incremented so
+        // a send racing this path keeps taking the queued branch, and the
+        // refusal is still visible as close_requests_dropped.
+        c->fsm.close_wanted.store(true, std::memory_order_release);
         stats_.close_requests_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }

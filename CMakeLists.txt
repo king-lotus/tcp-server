@@ -41,7 +41,9 @@ if(TCP_BUILD_SUITES)
         backpressure
         reactor_spread
         config_budget
-        harness_selftest)
+        harness_selftest
+        watermark
+        hardening)
 
     foreach(suite IN LISTS TCP_SUITES)
         add_executable(${suite} verify/${suite}.cpp)
@@ -65,8 +67,8 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same ten runs run.sh performs: seven suites, plus the two that run a
-    # second time at a different reactor count.
+    # The same thirteen runs run.sh performs: eleven suites, plus the two that
+    # run a second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)
     add_test(NAME close_semantics_1_reactor
@@ -93,6 +95,10 @@ if(TCP_BUILD_SUITES)
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:config_budget>)
     add_test(NAME harness_selftest
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:harness_selftest>)
+    add_test(NAME watermark
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:watermark>)
+    add_test(NAME hardening
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:hardening>)
 
     # run.sh gives each case 180s so a hang presents as a failure; the same
     # bound here keeps ctest from outliving the CI job.
@@ -100,7 +106,7 @@ if(TCP_BUILD_SUITES)
                          idle_semantics ping_pong send_results backpressure
                          fault_injection reactor_spread
                          reactor_spread_2_reactors config_budget
-                         harness_selftest
+                         harness_selftest watermark hardening
                          PROPERTIES TIMEOUT 180)
 endif()
 
