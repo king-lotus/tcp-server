@@ -1,12 +1,11 @@
 // verify/fault_injection.cpp -- what a worker dying is supposed to look like.
 //
-// INDUSTRIAL_TCP_TESTING adds two switches so these paths can be exercised, and
-// until now nothing exercised them: two switches with no consumer, in a
-// directory whose only other check was compile-only. A switch nobody flips is no
-// more a test than a commented-out assert.
+// INDUSTRIAL_TCP_TESTING guards the fault switches these cases use. A switch
+// nobody flips is no more a test than a commented-out assert.
 //
-// Both switches raise exactly the same question, which is what recovery means
-// for a thread that left its loop through an exception rather than a request:
+// The exception switches (A and B) raise the same question: what recovery
+// means for a thread that left its loop through an exception rather than a
+// request.
 //
 //   A. fail_worker_for_test -- a reactor throwing out of loop() must be visible
 //      (reactor_failures, is_running() false), must not take the process with it,
@@ -31,6 +30,10 @@
 //      still close the connection. close_wanted records it and do_tick's sweep
 //      performs the drain-then-close within one tick, so a full queue delays
 //      the close instead of losing it.
+//   G. fail_epoll_add_for_test -- accept setup failing after the spare
+//      descriptor has been opened must release it too. start()'s recovery
+//      closes only the descriptors it knows about, and a failed start leaves
+//      the lifecycle at `stopped`, so stop() will not clean up afterwards.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -41,6 +44,7 @@
 //
 // Exit code 0 = all cases passed.
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -115,6 +119,22 @@ bool port_is_listening(uint16_t port) {
     const bool ok = ::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0;
     ::close(fd);
     return ok;
+}
+
+// Open descriptors in this process, counted through /proc. opendir() itself
+// holds one, but every count includes exactly one, so deltas are comparable.
+int count_open_fds() {
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (dir == nullptr) return -1;
+    int n = 0;
+    while (const struct dirent* e = ::readdir(dir)) {
+        if (std::strcmp(e->d_name, ".") == 0 ||
+            std::strcmp(e->d_name, "..") == 0)
+            continue;
+        ++n;
+    }
+    ::closedir(dir);
+    return n;
 }
 
 }  // namespace
@@ -346,6 +366,43 @@ int main() {
                             return f.server().connection_count() == 0;
                         }),
                         "the connection is gone");
+    }
+
+    // ---- G: a failed accept setup releases the spare descriptor ------------
+    //
+    // spare_fd_ is opened before the listen and wake registrations. An early
+    // return there used to skip accept_loop's close block, and start()'s
+    // recovery does not know about the spare; after a failed start the
+    // lifecycle is `stopped`, so stop() returns before cleaning up either.
+    // Count descriptors across the failure, the retry and the destructor.
+    {
+        std::printf("G. a failed start releases the spare descriptor\n");
+        const int before = count_open_fds();
+        harness::expect(before > 0, "the process descriptor count is readable");
+        if (before > 0) {
+            {
+                multi_reactor_server::config cfg = base;
+                cfg.num_reactors = 1;
+                multi_reactor_server server(cfg);
+                server.fail_epoll_add_for_test.store(true);
+                harness::expect(!server.start(),
+                                "start() fails when epoll registration fails");
+                const int after_fail = count_open_fds();
+                harness::expect(after_fail == before,
+                                "the failed start leaked no descriptors");
+
+                harness::expect(server.start(), "the retry starts");
+                harness::expect(server.is_running(), "the retried server runs");
+                server.stop();
+                const int after_stop = count_open_fds();
+                std::printf("      open fds: before=%d after_fail=%d "
+                            "after_stop=%d\n", before, after_fail, after_stop);
+                harness::expect(after_stop == before,
+                                "the retried server released its descriptors");
+            }
+            harness::expect(count_open_fds() == before,
+                            "destruction leaked no descriptors");
+        }
     }
 
     return harness::finish();

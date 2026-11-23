@@ -1064,6 +1064,62 @@ inline constexpr sub_reactor::dispatch_table sub_reactor::k_task_dispatch = (
     sub_reactor::make_task_dispatch(std::make_index_sequence<
         std::variant_size_v<sub_reactor::queue_task>>{}));
 
+// Builds the connection's display name ("host:service") and the key the per-IP
+// cap uses. A dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d, which
+// is stripped so spelling cannot bypass the cap. IPv6 is keyed by /64: the low
+// 64 bits are the peer's to choose, and a full-address key hands anyone with
+// one /64 a fresh slot per connection. A link-local scope suffix ("%eth0")
+// names an interface, not an address, so it is cut before parsing. getnameinfo
+// and allocation failure both leave the "unknown" keys, which the cap then
+// treats as one peer.
+// Not noexcept on purpose: if resetting the keys after a failed assignment
+// itself throws, admit_accept's catch must see it and reject the connection
+// rather than have std::terminate take every connection with it.
+inline void peer_strings_from_sockaddr(const struct sockaddr_storage& ss,
+                                       socklen_t slen, std::string* peer,
+                                       std::string* ip_key) {
+    char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+    *peer = "unknown";
+    *ip_key = "unknown";
+    if (::getnameinfo(reinterpret_cast<const struct sockaddr*>(&ss), slen,
+                      hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+                      NI_NUMERICHOST | NI_NUMERICSERV) != 0)
+        return;
+    try {
+        ip_key->assign(hbuf);
+        static constexpr char k_mapped[] = "::ffff:";
+        if (ip_key->size() > sizeof(k_mapped) - 1 &&
+            ip_key->compare(0, sizeof(k_mapped) - 1, k_mapped) == 0 &&
+            ip_key->find('.', sizeof(k_mapped) - 1) != std::string::npos) {
+            ip_key->erase(0, sizeof(k_mapped) - 1);
+        }
+        if (ip_key->find(':') != std::string::npos) {
+            char v6[INET6_ADDRSTRLEN];
+            const std::string::size_type pct = ip_key->find('%');
+            const std::string::size_type v6len =
+                pct == std::string::npos ? ip_key->size() : pct;
+            struct in6_addr a6{};
+            if (v6len < sizeof v6) {
+                std::memcpy(v6, ip_key->data(), v6len);
+                v6[v6len] = '\0';
+                if (::inet_pton(AF_INET6, v6, &a6) == 1) {
+                    std::memset(a6.s6_addr + 8, 0, 8);
+                    char masked[INET6_ADDRSTRLEN];
+                    if (::inet_ntop(AF_INET6, &a6, masked, sizeof masked) !=
+                        nullptr)
+                        ip_key->assign(masked);
+                }
+            }
+        }
+        peer->assign(hbuf);
+        peer->push_back(':');
+        peer->append(sbuf);
+    } catch (...) {
+        *peer = "unknown";
+        *ip_key = "unknown";
+    }
+}
+
 // ==================== multi_reactor_server ====================
 class multi_reactor_server {
  public:
@@ -1374,6 +1430,10 @@ class multi_reactor_server {
     // not accidentally compiled without its switches.
     std::atomic<bool> fail_worker_for_test{false};
     std::atomic<bool> fail_accept_for_test{false};
+    // One-shot: the next accept setup's first epoll registration fails, after
+    // the spare descriptor has been opened. Used to prove a failed start
+    // releases the spare as well as the descriptors start() knows about.
+    std::atomic<bool> fail_epoll_add_for_test{false};
     // One-shot: the next submit_close() reports a full queue. Used to prove
     // that a refused close request still reaches the connection through the
     // tick sweep.
@@ -1507,6 +1567,18 @@ class multi_reactor_server {
     // server that is still there.
     void        close_listen_socket() noexcept;
     void        accept_loop(std::promise<bool>& ready) noexcept;
+    // accept_loop's parts. open/close own the four descriptors this thread
+    // holds; accept_cleanup guarantees the close runs on every exit.
+    bool        open_accept_descriptors() noexcept;
+    void        close_accept_descriptors() noexcept;
+    enum class accept_salvage { progress, backoff, stop };
+    accept_salvage salvage_descriptor_exhaustion(int accept_errno) noexcept;
+    void        admit_accept(int cfd, const struct sockaddr_storage& ss,
+                             socklen_t slen) noexcept;
+    struct accept_cleanup {
+        multi_reactor_server* server;
+        ~accept_cleanup() { server->close_accept_descriptors(); }
+    };
     sub_reactor* pick_reactor() noexcept;
 
     config cfg_;
@@ -1514,9 +1586,9 @@ class multi_reactor_server {
     int epoll_fd_  = -1;
     int wake_fd_   = -1;
     // One descriptor held in reserve so that EMFILE can be answered instead of
-    // waited out (see the branch in accept_loop). Created in the setup block
-    // under accept_fd_mutex_, accept-thread-owned after that, and closed with
-    // the other two on the way out.
+    // waited out (see salvage_descriptor_exhaustion). Created by
+    // open_accept_descriptors() under accept_fd_mutex_, accept-thread-owned
+    // after that, and closed with the other two on the way out.
     int spare_fd_  = -1;
     // Rate limit for the out-of-descriptors warning: a storm would otherwise
     // print once per failed accept, which is hundreds of lines a second.
@@ -3935,45 +4007,207 @@ inline sub_reactor* multi_reactor_server::pick_reactor() noexcept {
     return reactors_[i].get();
 }
 
-inline void multi_reactor_server::accept_loop(
-        std::promise<bool>& ready) noexcept {
-    bool ok = false;
-    try {
-    {
+// Opens everything the accept thread owns. The caller's accept_cleanup closes
+// whatever was opened before a failure, so this may return early without
+// unwinding by hand.
+inline bool multi_reactor_server::open_accept_descriptors() noexcept {
     std::lock_guard<std::mutex> descriptors(accept_fd_mutex_);
     epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd_ >= 0) {
-        wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (wake_fd_ >= 0) {
-            // Held back for EMFILE. Failure is not fatal: without it the accept
-            // loop degrades to the old sleep-and-retry, which is worse but not
-            // wrong, and the branch below checks for the -1.
-            spare_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
-            struct epoll_event ev{};
-            ev.events = EPOLLIN; ev.data.fd = listen_fd_;
-            if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) == 0) {
-                ev.data.fd = wake_fd_;
-                if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) == 0) {
-                    ok = true;
-                }
-            }
-        }
+    if (epoll_fd_ < 0) return false;
+    wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake_fd_ < 0) return false;
+    // Held back for EMFILE. Failure is not fatal: without it the accept loop
+    // degrades to the old sleep-and-retry, which is worse but not wrong, and
+    // salvage_descriptor_exhaustion checks for the -1.
+    spare_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = listen_fd_;
+    if (fail_epoll_add_for_test.load(std::memory_order_relaxed)) {
+        fail_epoll_add_for_test.store(false, std::memory_order_relaxed);
+        return false;
     }
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) != 0)
+        return false;
+    ev.data.fd = wake_fd_;
+    return ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) == 0;
+}
+
+inline void multi_reactor_server::close_accept_descriptors() noexcept {
+    // The same mutex protects stop's wake write, so a descriptor number cannot
+    // be recycled between its check and that write.
+    std::lock_guard<std::mutex> descriptors(accept_fd_mutex_);
+    if (spare_fd_ >= 0) {
+        ::close(spare_fd_); spare_fd_ = -1;
+    }
+    if (wake_fd_ >= 0) {
+        ::close(wake_fd_); wake_fd_ = -1;
+    }
+    if (epoll_fd_ >= 0) {
+        ::close(epoll_fd_); epoll_fd_ = -1;
+    }
+    close_listen_socket();
+}
+
+// EMFILE and ENFILE, answered without giving up the accept round. progress
+// means a client was turned away or the round can retry immediately; backoff
+// means the table is full and nothing local can change that; stop means the
+// wake was stale and the caller should return to epoll_wait.
+inline multi_reactor_server::accept_salvage
+multi_reactor_server::salvage_descriptor_exhaustion(
+        int accept_errno) noexcept {
+    stats_.accept_errors.fetch_add(1, std::memory_order_relaxed);
+    // ENFILE is the system-wide table. Closing our own fd cannot free a slot
+    // there, so it keeps the backoff.
+    if (accept_errno == ENFILE) {
+        stats_.fd_exhausted_system.fetch_add(1, std::memory_order_relaxed);
+        return accept_salvage::backoff;
+    }
+    // Another thread can take the slot freed by closing the spare, so the
+    // reopen at the end of this block can fail. Try again here on a later
+    // EMFILE rather than leaving the rescue disabled until the next start().
+    if (spare_fd_ < 0)
+        spare_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (spare_fd_ < 0) return accept_salvage::backoff;
+
+    // Process-level exhaustion can be answered: spend the reserved descriptor
+    // on the connection the kernel is holding, reset it, and take a descriptor
+    // back. The peer learns in microseconds instead of waiting in the backlog
+    // for a slot that -- on a server that owns the machine -- never comes.
+    ::close(spare_fd_);
+    spare_fd_ = -1;
+    const int victim = ::accept4(listen_fd_, nullptr, nullptr,
+                                 SOCK_NONBLOCK | SOCK_CLOEXEC);
+    const int victim_errno = errno;
+    if (victim >= 0) {
+        // Never served, so never FIN: an orderly close would tell the peer the
+        // server hung up on purpose, which is a different lie.
+        struct linger lg{};
+        lg.l_onoff  = 1;
+        lg.l_linger = 0;
+        ::setsockopt(victim, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        ::close(victim);
+        stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+        stats_.fd_exhausted_drops.fetch_add(1, std::memory_order_relaxed);
+    }
+    spare_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const int64_t now = now_ms();
+    if (now - last_fd_log_ms_ >= 1000) {
+        last_fd_log_ms_ = now;
+        std::fprintf(stderr,
+            "[warn] out of descriptors: dropped %ju connection(s) so far; "
+            "raise RLIMIT_NOFILE or lower max_connections\n",
+            static_cast<uintmax_t>(stats_.fd_exhausted_drops.load()));
+    }
+    // accept4 allocates the descriptor before it looks at the queue, so with
+    // the table full it reports EMFILE even when nothing is waiting. EAGAIN
+    // here is that stale wake: the spare was spent and replaced and bought no
+    // progress, so the caller returns to epoll_wait instead of spending the
+    // rest of this round's 64. EINTR and ECONNABORTED describe the attempt,
+    // not an empty queue, so the round keeps its budget and retries.
+    if (victim < 0 && victim_errno != EINTR && victim_errno != ECONNABORTED)
+        return accept_salvage::stop;
+    return accept_salvage::progress;
+}
+
+// Admission, options, peer keys and hand-off for one accepted socket. The
+// guard owns cfd on every path that does not hand it to a reactor.
+inline void multi_reactor_server::admit_accept(
+        int cfd, const struct sockaddr_storage& ss,
+        socklen_t slen) noexcept {
+    fd_guard cfd_guard(cfd);
+    bool reject = false;
+    bool over_budget = false;
+    if (admitted_.load() >= static_cast<size_t>(cfg_.max_connections))
+        reject = true;
+    // Advisory like the count above: this load races the reservations by
+    // definition, and the ceiling is a bound on the steady state, not a hard
+    // barrier.
+    const size_t committed =
+        stats_.buffer_bytes.load(std::memory_order_relaxed);
+    over_budget = committed > max_buffer_bytes_ ||
+                  per_conn_buffer_bytes_ > max_buffer_bytes_ - committed;
+    if (over_budget) reject = true;
+    if (reject) {
+        stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+        if (over_budget)
+            stats_.buffer_budget_rejections.fetch_add(
+                1, std::memory_order_relaxed);
+        return;   // cfd_guard closes it
     }
 
+    int one = 1;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
+    setsockopt(cfd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
+    int ka_idle = 30, ka_intvl = 10, ka_cnt = 3;
+    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE,
+               &ka_idle, sizeof(ka_idle));
+    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL,
+               &ka_intvl, sizeof(ka_intvl));
+    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT,
+               &ka_cnt, sizeof(ka_cnt));
+
+    try {
+        std::string peer, ip_key;
+        peer_strings_from_sockaddr(ss, slen, &peer, &ip_key);
+
+        sub_reactor* r = pick_reactor();
+        if (!r) return;   // cfd_guard closes it
+
+        uint64_t id = next_conn_id_.fetch_add(
+            1, std::memory_order_relaxed);
+        // REACTOR_WAKE_TAG is 0. Skipping the wrap keeps that sentinel
+        // unambiguous; the counter has to pass through 2^64 ids to get here,
+        // so this is a formality that costs nothing.
+        if (id == REACTOR_WAKE_TAG)
+            id = next_conn_id_.fetch_add(1, std::memory_order_relaxed);
+        // Submission consumes ownership on both success and rejection.
+        // accepted is NOT bumped here: queueing a task is not a connection.
+        // The reactor bumps it once the socket is registered in both maps, so
+        // a task that fails during registration counts as rejected only.
+        auto admission = std::make_shared<admission_ticket>(
+            admitted_, stats_.buffer_bytes, per_conn_buffer_bytes_,
+            ip_table_, std::move(ip_key));
+        if (!admission->acquire_ip(cfg_.max_connections_per_ip)) {
+            // The ticket's destructor gives back the global count and byte
+            // reservation; no per-IP slot was taken.
+            stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+            stats_.ip_rejections.fetch_add(1, std::memory_order_relaxed);
+            return;   // cfd_guard closes it
+        }
+        if (!r->submit_new_connection(std::move(cfd_guard), std::move(peer),
+                                      id, std::move(admission))) {
+            stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+        }
+    } catch (...) {
+        // Before handoff, cfd_guard still owns the accepted socket.
+        stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void multi_reactor_server::accept_loop(
+        std::promise<bool>& ready) noexcept {
+    // One owner for every descriptor this thread opens. Constructed first, so
+    // a failed setup, an exception from the accept path, and the normal loop
+    // exit all run the same close block. Its absence was exactly the early
+    // return that used to leak spare_fd_.
+    accept_cleanup cleanup{this};
+    try {
+    const bool ok = open_accept_descriptors();
     try {
         ready.set_value(ok);
     } catch (...) {}
     // Descriptor setup failure is the accept loop's own failure: raise the
     // shared flag instead of forcing the whole lifecycle down, so start()
     // reports false through its normal recovery path rather than racing on the
-    // state.
+    // state. Returning is safe now: the guard above closes the spare as well
+    // as the descriptors start() knows about.
     if (!ok) {
         fail(); return;
     }
 
     std::array<struct epoll_event, 64> events{};
-    while (ok && accepting_.load(std::memory_order_acquire) && is_running()) {
+    while (accepting_.load(std::memory_order_acquire) && is_running()) {
         if (fail_accept_for_test.load(std::memory_order_relaxed)) {
             fail_accept_for_test.store(false, std::memory_order_relaxed);
             throw 1;
@@ -4014,212 +4248,18 @@ inline void multi_reactor_server::accept_loop(
                     // therefore should be countable -- without a counter the
                     // only symptom is "it stopped accepting and said nothing".
                     if (accept_errno == EMFILE || accept_errno == ENFILE) {
-                        stats_.accept_errors.fetch_add(
-                            1, std::memory_order_relaxed);
-                        // Process-level exhaustion can be answered: spend the
-                        // reserved descriptor on the connection the kernel is
-                        // holding, reset it, and take a descriptor back. The
-                        // peer learns in microseconds instead of waiting in the
-                        // backlog for a slot that -- on a server that owns the
-                        // machine -- never comes.
-                        //
-                        // ENFILE is the system-wide table. Closing our own fd
-                        // cannot free a slot there, so it keeps the backoff.
-                        //
-                        // Another thread can take the slot freed by closing
-                        // the spare, so the reopen at the end of this block
-                        // can fail. Try again here on a later EMFILE rather
-                        // than leaving the rescue disabled until the next
-                        // start().
-                        if (accept_errno == EMFILE && spare_fd_ < 0)
-                            spare_fd_ = ::open("/dev/null",
-                                               O_RDONLY | O_CLOEXEC);
-                        if (accept_errno == EMFILE && spare_fd_ >= 0) {
-                            ::close(spare_fd_);
-                            spare_fd_ = -1;
-                            const int victim = ::accept4(
-                                listen_fd_, nullptr, nullptr,
-                                SOCK_NONBLOCK | SOCK_CLOEXEC);
-                            const int victim_errno = errno;
-                            if (victim >= 0) {
-                                // Never served, so never FIN: an orderly close
-                                // would tell the peer the server hung up on
-                                // purpose, which is a different lie.
-                                struct linger lg{};
-                                lg.l_onoff  = 1;
-                                lg.l_linger = 0;
-                                ::setsockopt(victim, SOL_SOCKET, SO_LINGER,
-                                             &lg, sizeof(lg));
-                                ::close(victim);
-                                stats_.rejected.fetch_add(
-                                    1, std::memory_order_relaxed);
-                                stats_.fd_exhausted_drops.fetch_add(
-                                    1, std::memory_order_relaxed);
-                            }
-                            spare_fd_ = ::open("/dev/null",
-                                               O_RDONLY | O_CLOEXEC);
-                            const int64_t now = now_ms();
-                            if (now - last_fd_log_ms_ >= 1000) {
-                                last_fd_log_ms_ = now;
-                                std::fprintf(stderr,
-                                    "[warn] out of descriptors: dropped %ju "
-                                    "connection(s) so far; raise "
-                                    "RLIMIT_NOFILE or lower max_connections\n",
-                                    static_cast<uintmax_t>(
-                                        stats_.fd_exhausted_drops.load()));
-                            }
-                            // accept4 allocates the descriptor before it
-                            // looks at the queue, so with the table full it
-                            // reports EMFILE even when nothing is waiting.
-                            // EAGAIN here is that stale wake: the spare was
-                            // spent and replaced and bought no progress, so
-                            // go back to epoll_wait instead of spending the
-                            // rest of this round's 64. EINTR and
-                            // ECONNABORTED describe the attempt, not an empty
-                            // queue, so the round keeps its budget and retries.
-                            if (victim < 0 && victim_errno != EINTR &&
-                                victim_errno != ECONNABORTED) {
-                                break;
-                            }
-                            continue;   // progress was made; do not sleep
+                        const accept_salvage action =
+                            salvage_descriptor_exhaustion(accept_errno);
+                        if (action != accept_salvage::stop) {
+                            if (action == accept_salvage::backoff)
+                                std::this_thread::sleep_for(
+                                    std::chrono::milliseconds(1));
+                            continue;
                         }
-                        if (accept_errno == ENFILE)
-                            stats_.fd_exhausted_system.fetch_add(
-                                1, std::memory_order_relaxed);
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(1));
-                        continue;
                     }
                     break;
                 }
-                fd_guard cfd_guard(cfd);
-
-                bool reject = false;
-                bool over_budget = false;
-                {
-                    if (admitted_.load() >=
-                        static_cast<size_t>(cfg_.max_connections))
-                        reject = true;
-                    // Advisory like the count above: this load races the
-                    // reservations by definition, and the ceiling is a bound
-                    // on the steady state, not a hard barrier.
-                    const size_t committed =
-                        stats_.buffer_bytes.load(std::memory_order_relaxed);
-                    over_budget =
-                        committed > max_buffer_bytes_ ||
-                        per_conn_buffer_bytes_ > max_buffer_bytes_ - committed;
-                    if (over_budget) reject = true;
-                }
-                if (reject) {
-                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                    if (over_budget)
-                        stats_.buffer_budget_rejections.fetch_add(
-                            1, std::memory_order_relaxed);
-                    continue;   // cfd_guard closes it
-                }
-
-                int one = 1;
-                setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
-                setsockopt(cfd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
-                int ka_idle = 30, ka_intvl = 10, ka_cnt = 3;
-                setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE,
-                           &ka_idle, sizeof(ka_idle));
-                setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL,
-                           &ka_intvl, sizeof(ka_intvl));
-                setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT,
-                           &ka_cnt, sizeof(ka_cnt));
-
-                try {
-                char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
-                std::string peer = "unknown";
-                std::string ip_key = "unknown";
-                if (getnameinfo((struct sockaddr*)&ss, slen, hbuf, sizeof(hbuf),
-                                sbuf, sizeof(sbuf),
-                                NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-                    try {
-                        ip_key.assign(hbuf);
-                        // A dual-stack listener reports the same peer as
-                        // ::ffff:a.b.c.d for IPv4; key it as a.b.c.d so the
-                        // per-IP cap cannot be bypassed by spelling.
-                        static constexpr char k_mapped[] = "::ffff:";
-                        if (ip_key.size() > sizeof(k_mapped) - 1 &&
-                            ip_key.compare(0, sizeof(k_mapped) - 1, k_mapped) ==
-                                0 &&
-                            ip_key.find('.', sizeof(k_mapped) - 1) !=
-                                std::string::npos) {
-                            ip_key.erase(0, sizeof(k_mapped) - 1);
-                        }
-                        // Key IPv6 by /64. The low 64 bits are the interface
-                        // identifier, which the peer chooses: a full-address
-                        // key gives anyone holding one /64 a fresh slot per
-                        // connection, which is the whole cap bypassed. The
-                        // scope suffix getnameinfo appends for a link-local
-                        // address ("%eth0") names an interface, not an
-                        // address, so it is cut before parsing.
-                        if (ip_key.find(':') != std::string::npos) {
-                            char v6[INET6_ADDRSTRLEN];
-                            const std::string::size_type pct = ip_key.find('%');
-                            const std::string::size_type v6len =
-                                pct == std::string::npos ? ip_key.size() : pct;
-                            struct in6_addr a6{};
-                            if (v6len < sizeof v6) {
-                                std::memcpy(v6, ip_key.data(), v6len);
-                                v6[v6len] = '\0';
-                                if (::inet_pton(AF_INET6, v6, &a6) == 1) {
-                                    std::memset(a6.s6_addr + 8, 0, 8);
-                                    char masked[INET6_ADDRSTRLEN];
-                                    if (::inet_ntop(AF_INET6, &a6, masked,
-                                                    sizeof masked) != nullptr)
-                                        ip_key.assign(masked);
-                                }
-                            }
-                        }
-                        peer.assign(hbuf);
-                        peer.push_back(':');
-                        peer.append(sbuf);
-                    } catch (...) {
-                        peer = "unknown";
-                        ip_key = "unknown";
-                    }
-                }
-
-                sub_reactor* r = pick_reactor();
-                if (!r) continue;   // cfd_guard closes it
-
-                uint64_t id = next_conn_id_.fetch_add(
-                    1, std::memory_order_relaxed);
-                // REACTOR_WAKE_TAG is 0. Skipping the wrap keeps that sentinel
-                // unambiguous; the counter has to pass through 2^64 ids to get
-                // here, so this is a formality that costs nothing.
-                if (id == REACTOR_WAKE_TAG)
-                    id = next_conn_id_.fetch_add(
-                        1, std::memory_order_relaxed);
-                // Submission consumes ownership on both success and rejection.
-                // accepted is NOT bumped here: queueing a task is not a
-                // connection.
-                // The reactor bumps it once the socket is registered in both
-                // maps, so a task that fails during registration counts as
-                // rejected only.
-                auto admission = std::make_shared<admission_ticket>(
-                    admitted_, stats_.buffer_bytes, per_conn_buffer_bytes_,
-                    ip_table_, std::move(ip_key));
-                if (!admission->acquire_ip(cfg_.max_connections_per_ip)) {
-                    // The ticket's destructor gives back the global count and
-                    // byte reservation; no per-IP slot was taken.
-                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                    stats_.ip_rejections.fetch_add(
-                        1, std::memory_order_relaxed);
-                    continue;   // cfd_guard closes it
-                }
-                if (!r->submit_new_connection(std::move(cfd_guard),
-                                            std::move(peer), id,
-                                            std::move(admission))) {
-                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                }
-                } catch (...) {
-                    // Before handoff, cfd_guard still owns the accepted socket.
-                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                }
+                admit_accept(cfd, ss, slen);
             }
         }
     }
@@ -4230,20 +4270,6 @@ inline void multi_reactor_server::accept_loop(
             ready.set_value(false);
         } catch (...) {}
     }
-    // Close on every exit, including unexpected failure. The same mutex
-    // protects stop's wake write, preventing descriptor reuse between its check
-    // and write.
-    std::lock_guard<std::mutex> descriptors(accept_fd_mutex_);
-    if (spare_fd_ >= 0) {
-        ::close(spare_fd_); spare_fd_ = -1;
-    }
-    if (wake_fd_ >= 0) {
-        ::close(wake_fd_); wake_fd_ = -1;
-    }
-    if (epoll_fd_ >= 0) {
-        ::close(epoll_fd_); epoll_fd_ = -1;
-    }
-    close_listen_socket();
 }
 
 inline bool multi_reactor_server::on_connection_opened(

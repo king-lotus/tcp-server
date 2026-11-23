@@ -1,7 +1,8 @@
 # EMFILE test checklist — spare-descriptor hand-off
 
 Status: **implemented, with the baseline rows kept for comparison** · 2026-11-22.
-Target: `accept_loop()`'s `EMFILE` branch. The change is in
+Target: the `EMFILE` branch reached from `accept_loop()` (now
+`salvage_descriptor_exhaustion()`). The change is in
 `include/tcp-server-mt.h` (landed in `33f0479`), and the probe is
 `verify/evidence/probe_emfile.cpp`. It is driven by
 `verify/evidence/run_emfile.sh`, which CI runs in a separate step and which a
