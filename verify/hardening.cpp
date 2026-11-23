@@ -271,5 +271,72 @@ int main() {
         if (shared_b.is_running()) shared_b.stop();
     }
 
+    // ---- F: handlers cannot be installed while the server runs -------------
+    //
+    // Installing one is a store into a std::function that every reactor reads
+    // without synchronization. The setters used to accept the call anyway, so
+    // the only thing between an application and that race was a comment. Now
+    // the call is refused unless the lifecycle is stopped, and the refusal is
+    // visible twice: the return value, and handler_installs_refused.
+    {
+        std::printf("F. handler installers are refused while running\n");
+        multi_reactor_server server(base_config());
+        std::atomic<int> which{0};
+        harness::expect(server.set_message_handler(
+                            [&](uint64_t cid, const uint8_t*, size_t) {
+                                which.store(1, std::memory_order_relaxed);
+                                (void)server.send_to(cid, "1", 1);
+                            }), "the first install is accepted before start()");
+        harness::expect(server.start(), "start() ok");
+
+        harness::expect(!server.set_message_handler(
+                            [&](uint64_t cid, const uint8_t*, size_t) {
+                                which.store(2, std::memory_order_relaxed);
+                                (void)server.send_to(cid, "2", 1);
+                            }), "an install while running is refused");
+        harness::expect(!server.set_close_handler(
+                            [](uint64_t, const std::string&, const char*) {}),
+                        "the close handler is refused the same way");
+        harness::expect(!server.set_conn_state_handler(
+                            [](uint64_t, const std::string&, bool) {}),
+                        "the state handler is refused the same way");
+        harness::expect(server.stats().handler_installs_refused.load() == 3,
+                        "every refusal is counted");
+
+        harness::peer peer;
+        harness::expect(static_cast<bool>(peer.connect(server.port())),
+                        "client connected");
+        (void)peer.send(frame_type::DATA, "q", 1);
+        harness::frame reply;
+        const harness::status st = peer.expect_frame(&reply, 2000);
+        harness::expect(static_cast<bool>(st), "a reply came back", st.why);
+        harness::expect(which.load() == 1,
+                        "the refused install left the original handler in place");
+        harness::expect(reply.payload.size() == 1 && reply.payload[0] == '1',
+                        "and the reply is the one the original handler wrote");
+        peer.close();
+
+        server.stop();
+        harness::expect(server.set_message_handler(
+                            [&](uint64_t cid, const uint8_t*, size_t) {
+                                (void)server.send_to(cid, "3", 1);
+                            }), "a stopped server accepts a new handler");
+        harness::expect(server.start(), "the restart starts");
+        {
+            harness::peer again;
+            harness::expect(static_cast<bool>(again.connect(server.port())),
+                            "the restarted server accepts a client");
+            (void)again.send(frame_type::DATA, "q", 1);
+            harness::frame answer;
+            const harness::status again_st = again.expect_frame(&answer, 2000);
+            harness::expect(static_cast<bool>(again_st),
+                            "the restarted server answers", again_st.why);
+            harness::expect(answer.payload.size() == 1 &&
+                                answer.payload[0] == '3',
+                            "the handler installed after stop() is the one running");
+        }
+        server.stop();
+    }
+
     return harness::finish();
 }

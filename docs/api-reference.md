@@ -126,7 +126,7 @@ validated by `start()`; nothing is checked at construction.
 | `max_connections_per_ip` | `0` | Most live connections one peer address may hold; `0` is unlimited. IPv6 is keyed by `/64`, because the low 64 bits are chosen by the peer. Rejections are counted in `ip_rejections`. |
 | `idle_timeout_ms` | `120000` | Close a connection after this long with **no activity**, where activity is bytes received *or* bytes drained to the peer: a connection paused by backpressure is not receiving by design, and a slow reader is not idle. Must be > 0. |
 | `tick_ms` | `500` | Granularity of every deadline. Must be > 0; a tick coarser than a deadline makes that deadline late by up to one tick, and `start()` warns. |
-| `reactor_stall_timeout_ms` | `0` | Watchdog for a reactor alive but not completing a loop iteration for this long. 0 disables it; otherwise it must be at least `max(100, 2 × tick_ms)`. One iteration is `tick_ms` in `epoll_wait` plus the loop body (event batch, pending tasks, `do_tick`), so a timeout just over `tick_ms` reports healthy reactors; it must also exceed the longest expected body. With the watchdog on, the accept thread samples at least every `min(500 ms, timeout/2)`, so a stall shorter than the timeout plus one sample can fall between samples. Observational only: it increments `reactor_stalls` and logs. |
+| `reactor_stall_timeout_ms` | `0` | Watchdog for a reactor alive but not completing a loop iteration for this long. 0 disables it; otherwise it must be at least `max(100, 2 × tick_ms)`. One iteration is `tick_ms` in `epoll_wait` plus the loop body (event batch, pending tasks, `do_tick`), so a timeout just over `tick_ms` reports healthy reactors; it must also exceed the longest expected body. With the watchdog on, the accept thread samples at least every `min(500 ms, timeout/2)`, so a stall shorter than the timeout plus one sample can fall between samples. A stall has two effects, both on the accept side: the episode is counted once (`reactor_stalls`) and logged, and the reactor stops receiving **new** connections (`reactor_stall_skips`) until it has made progress for a full timeout window again. Its existing connections are not touched, and the server is never stopped. |
 | `frame_assembly_timeout_ms` | `0` | Deadline for one frame, measured from its first byte. `0` means 5 × `idle_timeout_ms`. Must be ≥ 0. |
 | `allow_unknown_frame_types` | `false` | Deliver a type outside `1`/`2`/`3` to the message handler as DATA instead of closing the connection. See [wire protocol](#wire-protocol). |
 | `rbuf_capacity` | `65544` | Per-connection read buffer. Must be ≥ 65544: a smaller one cannot hold a legal maximum frame. |
@@ -199,6 +199,23 @@ server keeps serving.
 The application is told about a close exactly once. If the notification cannot
 be allocated, the connection still goes away and `close_callbacks_dropped`
 records that the notification was lost.
+
+### Handlers
+
+```cpp
+bool set_message_handler(message_handler h) noexcept;
+bool set_conn_state_handler(conn_state_handler h) noexcept;
+bool set_close_handler(close_handler h) noexcept;
+```
+
+Install before `start()`. Each returns `false` and leaves the handler unchanged
+unless the lifecycle is fully `stopped`; the refusal is counted in
+`handler_installs_refused`. The check is made under the same mutex `start()` and
+`stop()` take, so a setter racing either one is refused rather than queued
+behind it — which is also why a setter called from a callback cannot deadlock
+`stop()`'s join. A caller that ignores the result keeps the old handler running,
+and that is otherwise invisible: no callback fires, no error is reported, and
+the code reads as though the install worked.
 
 ### Lifecycle
 
@@ -300,6 +317,21 @@ server is not running, the connection is unknown, or it has no owner. A refused
 queue hand-off still increments `close_requests_dropped` even though it returns
 `true`, because that counter is the queue-pressure signal, not a lost close.
 
+A close answers what it promised and no more. What it serves is the input already
+in the read buffer when the request is dequeued — the `close_input_bytes` budget
+— plus, at most, one read round (64 KiB / 256 frames) pulled out of the kernel
+receive buffer while that round runs. That round is exempt from the high-water
+pause; the connection's ordinary continuation after it is not, so output
+backpressure decides whether it gets to serve any more before the park. Requests
+still in the kernel buffer past that are parsed and handed to the message
+handler, but their replies are refused once the close parks, and the peer
+receives a FIN over them. Measured
+(`verify/evidence/probe_close_while_paused.cpp`): 4000 requests sitting in the
+kernel of a read-paused connection, 256 answered, then FIN — while
+`frames_recv` accounted for all 4000. Both numbers are real; only the second is
+a promise. A connection that was read-paused is where the gap is widest, because
+the pause exists precisely to leave bytes in the kernel.
+
 ```cpp
 bool offload(uint64_t conn_id, std::function<void()> fn) noexcept;
 ```
@@ -328,6 +360,7 @@ struct reactor_stats_view {
     size_t   connections;
     int64_t  last_progress_ms;
     bool     dead;
+    bool     stalled;
     bool     retired;
 };
 ```
@@ -346,9 +379,13 @@ count the reactor last published, reset to 0 by its teardown.
 iteration, 0 until it runs and 0 for a retired slot. `dead` is set when the
 reactor's loop failed and the reactor was quarantined: the slot takes no new
 connections, its connections were reset with the `reactor failure` close
-reason, and the server keeps serving on the remaining reactors. Each field is
-read atomically from a fixed slot array, so a snapshot can mix adjacent
-iterations; it is not a transactional view. The result is a vector, so this
+reason, and the server keeps serving on the remaining reactors. `stalled` is set
+while the watchdog sees no progress for `reactor_stall_timeout_ms`: no new
+connections are routed here, nothing is torn down, and the flag clears only
+after a full window of progress; it is always false when the watchdog is off,
+and quarantine clears it together with setting `dead`. Each field is read
+atomically from a fixed slot array, so a snapshot can mix adjacent iterations;
+it is not a transactional view. The result is a vector, so this
 call can throw `bad_alloc`.
 
 `port()` is the port actually bound: it equals `config::port` unless that was
@@ -400,7 +437,9 @@ iteration: exact when idle, up to one iteration behind under load.
 | `frame_assembly_timeouts` | A partial frame did not complete within `frame_assembly_timeout_ms`, even though bytes were arriving. |
 | `epoll_ctl_errors` | An `epoll_ctl` registration failed. |
 | `reactor_failures` | A reactor thread crashed or exited abnormally. That reactor is quarantined: it accepts no new connections, its connections are reset (close reason `reactor failure`), and the server keeps serving while another reactor is alive. The increment that empties the pool — or any accept-thread failure — is fatal. |
-| `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. Sampled at least every `min(500 ms, timeout/2)`; shorter transients can fall between samples, and a server that is no longer running is not sampled. Observational: the server is not stopped. |
+| `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. One increment per episode, not per sample: the episode ends when the reactor has made progress for a full window again. Sampled at least every `min(500 ms, timeout/2)`; shorter transients can fall between samples, and a server that is no longer running is not sampled. The server is not stopped. |
+| `reactor_stall_skips` | A new connection that would have gone to a stalled reactor went to a live one instead. Counted once per connection, not once per reactor passed over. Zero while the watchdog is off, and zero when every reactor is stalled: the accept loop then takes the bad hand-off rather than refusing the connection. |
+| `handler_installs_refused` | `set_message_handler`, `set_conn_state_handler` or `set_close_handler` was called while the server was not fully stopped, or the install itself failed, and the handler was left unchanged. Handlers are read by every worker without synchronization, so installing one while they run is a data race rather than a reconfiguration. |
 | `accept_errors` | `accept4` failed. `EMFILE` is answered with the reserved descriptor; `ENFILE` is not, and keeps the backoff. |
 | `fd_exhausted_drops` | A connection was reset because the process ran out of descriptors and the spare was spent on it. The peer learns immediately instead of waiting in the backlog. |
 | `fd_exhausted_system` | `accept4` failed with `ENFILE`: the system-wide descriptor table is full, which closing one's own spare cannot fix. |

@@ -63,7 +63,7 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o "$out/ping_pong"
     g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o "$out/send_results"
     g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o "$out/backpressure"
-    g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
+    g++ "${base_flags[@]}" "$@" verify/fault_injection.cpp \
         -o "$out/fault_injection"
     g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o "$out/reactor_spread"
     g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o "$out/config_budget"

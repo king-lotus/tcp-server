@@ -21,9 +21,6 @@ out_dir="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
 mkdir -p "$out_dir"
 out="$out_dir/$(basename "$src" .cpp)"
 flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -O1 -Iinclude)
-case "$src" in
-    *fault_injection*) flags+=(-DINDUSTRIAL_TCP_TESTING) ;;
-esac
 
 g++ "${flags[@]}" "$src" -o "$out" || { echo "build failed"; exit 2; }
 "$out" "$@"

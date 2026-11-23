@@ -311,10 +311,20 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 
 `close_connection(id)` 把请求投递给 owner reactor，然后：
 
-1. **先服务已经到达的请求**：`drain_input_then_close()` 读取并处理关闭请求到达时
-   已经缓冲的输入。它按 `handle_read` 的预算可能分多轮，但只服务“关闭时已经
-   在 `rbuf` 里的字节”，`close_input_bytes` 给这个额度封顶；关闭后新到的数据不能
-   无限延长关闭。
+1. **先服务已经到达的请求**：`drain_input_then_close()` 读取并处理已经可读的输入。
+   额度 `close_input_bytes` 是**关闭请求出队那一刻 `rbuf` 里的字节数**；它按
+   `handle_read` 的预算可能分多轮，关闭后新到的数据不能无限延长关闭。
+   **这个额度不含内核接收缓冲里的字节。** drain 会临时恢复读取，`draining_input`
+   让这一轮不受输出水位约束，因此它最多再从内核取出一个读预算（64 KiB / 256 帧）；
+   关闭落定（park）之前，连接的普通读续跑可能再多服务一些，但那条路径仍受高水位
+   约束。两者都不是承诺。读侧背压暂停中的连接差距最大——
+   暂停的存在就是为了把字节留在内核里。实测
+   （`verify/evidence/probe_close_while_paused.cpp`）：内核里排着 4000 个请求、
+   一次关闭 → 对端收到 256 个应答，然后 FIN；`frames_recv` 记到 4000，说明这些
+   请求都已被解析并交给 handler，没出去的只是应答。对端能依赖的只有线上的字节数。
+   这样定的理由：统计内核缓冲要 `FIONREAD`，排空它则让关闭等一个由对端控制的
+   管道、只剩 `close_linger_ms` 兜底——那等于把「我们不再理这个对端」的决定权
+   交给对端。
 2. **排空输出**：`park_close()` 置 `closing=true`，把 wbuf 里已有的字节尽量写进
    内核；写不完就打开 `EPOLLOUT`，由 `handle_write` 继续。
 3. **发 FIN**：wbuf 空了以后 `shutdown(SHUT_WR)`。关闭**之前**已经排队的应答
@@ -402,7 +412,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `idle_timeout_ms` | `120000` | 空闲关闭阈值，必须 > 0 |
 | `frame_assembly_timeout_ms` | `0` | 0 = `5 × idle_timeout_ms`；正数为绝对毫秒；必须 >= 0 |
 | `tick_ms` | `500` | 定时器粒度，必须 > 0 |
-| `reactor_stall_timeout_ms` | `0` | reactor 停滞看门狗；0 关闭，否则必须 >= `max(100, 2 × tick_ms)`（一轮循环 = `tick_ms` 的 `epoll_wait` + 循环体）；accept 线程至少每 `min(500 ms, timeout/2)` 采样一次；只观察（`reactor_stalls` + 日志），不停服 |
+| `reactor_stall_timeout_ms` | `0` | reactor 停滞看门狗；0 关闭，否则必须 >= `max(100, 2 × tick_ms)`（一轮循环 = `tick_ms` 的 `epoll_wait` + 循环体）；accept 线程至少每 `min(500 ms, timeout/2)` 采样一次。停滞有两个后果：计一次 `reactor_stalls` 并打日志；**新连接不再投给该 reactor**（`reactor_stall_skips`），直到它连续一个完整窗口有进展才恢复。既有连接不动，服务器不停 |
 | `rbuf_capacity` | `MAX_FRAME_SIZE` (65544) | 读缓冲；必须 >= 65544 |
 | `wbuf_capacity` | `MAX_FRAME_SIZE` (65544) | 写缓冲；必须 >= 8 |
 | `max_pending_bytes` | `MAX_FRAME_SIZE` (65544) | 单连接待发软上限；启动时会被压到 `<= wbuf_capacity` |
@@ -460,7 +470,9 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `frame_assembly_timeouts` | 不完整帧超过 `frame_assembly_timeout_ms`（字节仍在到达） |
 | `epoll_ctl_errors` | `epoll_ctl` 失败 |
 | `reactor_failures` | reactor 线程异常退出。该 reactor 被隔离：不再接新连接、其连接全部重置（关闭原因 `reactor failure`）；只要还有别的 reactor 存活，服务器继续服务 |
-| `reactor_stalls` | stall watchdog 发现某 reactor 超过 `reactor_stall_timeout_ms` 未完成一轮循环；采样间隔不超过 `min(500 ms, timeout/2)`，更短的瞬态可能落在两次采样之间；只在服务器运行中采样（仅观察，不停服） |
+| `reactor_stalls` | stall watchdog 发现某 reactor 超过 `reactor_stall_timeout_ms` 未完成一轮循环；每个"停滞 episode"计一次（连续一个完整窗口恢复后才算结束）；采样间隔不超过 `min(500 ms, timeout/2)`，更短的瞬态可能落在两次采样之间；只在服务器运行中采样；不停服 |
+| `reactor_stall_skips` | 本该投给停滞 reactor 的新连接改投给了存活 reactor。按连接计一次，不按被跳过的 reactor 计。看门狗关闭时为 0；全部 reactor 都停滞时也为 0（此时宁可按原轮转投递，也不拒绝连接） |
+| `handler_installs_refused` | `set_message_handler` / `set_conn_state_handler` / `set_close_handler` 在服务器未完全停止时被调用，或安装本身失败，handler 保持原样。worker 无同步地读这些 `std::function`，运行中替换是数据竞争而非"重新配置" |
 | `accept_errors` | `accept4` 因 fd 耗尽失败（EMFILE/ENFILE） |
 | `pending_tasks_total` | 累计入队任务数 |
 | `pending_tasks_depth` | 当前队列深度（gauge） |
@@ -716,7 +728,7 @@ python3 -m cpplint include/tcp-server-mt.h
 | `ping_pong` | PING/PONG、关闭途中到达的 PING |
 | `send_results` | `send_result` 每个值、`accept_errors`、关闭中发送、offload 串行且不阻塞 reactor |
 | `backpressure` | 广播时的队列上限与 `queue_drops` |
-| `fault_injection` | reactor/accept 线程异常后的恢复（需要 `INDUSTRIAL_TCP_TESTING`） |
+| `fault_injection` | reactor/accept 线程异常后的恢复（故障开关是私有成员，经 `industrial::test_access` 扳动） |
 | `reactor_spread` | 轮转分配确实把连接分到不同 reactor |
 | `config_budget` | 默认缓冲区预算、`ring_buffer` 就地写 API、新配置的校验 |
 | `watermark` | 读侧背压：暂停/恢复、关闭覆盖暂停、帧装配超时豁免 |

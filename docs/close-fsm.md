@@ -191,6 +191,33 @@ input the close may consume. Replies the drain produces still meet the normal
 `send_to` ceiling: a frame over it is refused as `overloaded` (counted), not
 silently lost to a teardown.
 
+### What a close answers while reads are paused
+
+`close_input_bytes` is measured from `rbuf` when the request is dequeued, and
+from nothing else. Bytes the kernel still holds at that point are not in the
+budget: the drain's own round pulls at most one read budget (64 KiB / 256 frames)
+of them into service, and `draining_input` exempts that round from the output
+watermark. The connection's ordinary read continuation may serve more before the
+park lands, but it is not exempt: it stops at the high watermark. Neither is a
+promise.
+
+The widest case is the one `draining_input` exists for: a connection that was
+read-paused. The pause exists precisely to leave bytes in the kernel, so at close
+time most of the backlog is exactly the part that is not counted.
+
+Measured (`verify/evidence/probe_close_while_paused.cpp`, one reactor, 4000
+requests waiting in the kernel of a paused connection): 4000 frames parsed and
+handed to the handler, **256 replies on the wire, then FIN** — no RST,
+`aborted` 0, `bytes_dropped` 2808. The other 3744 were handled and never reached
+the wire. `frames_recv` and the peer's byte count disagree by design; only the
+second one is a promise, because on the wire "handled" and "answered" are
+different events.
+
+Counting the kernel buffer would mean `FIONREAD` on every close; draining it
+would make the close wait on a pipe the peer controls, with `close_linger_ms` as
+the only deadline left. Both turn "we are done with this peer" into a decision
+the peer makes.
+
 **Where the side effects stay** (all in the reactor, none in the FSM):
 
 - `unregister_conn` (epoll DEL + fd close), `discard_pending_output` (byte accounting),

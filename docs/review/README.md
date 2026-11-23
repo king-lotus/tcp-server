@@ -1,6 +1,6 @@
 # Review record
 
-Nine rounds of code review against one header, `include/tcp-server-mt.h`, in
+Ten rounds of code review against one header, `include/tcp-server-mt.h`, in
 the order they happened.
 
 The files were named one at a time as they were written on 2026-10-17 and
@@ -10,7 +10,8 @@ The files were named one at a time as they were written on 2026-10-17 and
 on. **The names were never unified** -- they cite each other, and each is a
 snapshot of what was true when it was written; see the three cautions below. An
 index table absorbs the mess more cheaply than rewriting nine historical
-documents.
+documents. Round 10 breaks the naming again on purpose: it is the only one
+written against `refactor/close-fsm` rather than `main`.
 
 ## Contents
 
@@ -25,6 +26,7 @@ documents.
 | 7 | [CODE-REVIEW-2026-10-18-round7.md](CODE-REVIEW-2026-10-18-round7.md) | 2026-10-18 | one item from outside | When `close` and the peer's FIN land in one `handleRead`, the reply just queued is swallowed by an early FIN |
 | 8 | [CODE-REVIEW-2026-10-18-round8.md](CODE-REVIEW-2026-10-18-round8.md) | 2026-10-18 | four items from outside | The close budget denominated in frames rather than bytes; one connection counted in both `accepted` and `rejected` when `stateHandler` throws; `handleWrite` beating `processPending`; `unregisterConn` clearing `closing` while `cleanup` never rolled back |
 | 9 | [CODE-REVIEW-round9-2026-11-02.md](CODE-REVIEW-round9-2026-11-02.md) | 2026-11-02 | full static review | R9-1 to R9-4: a `bad_alloc` use-after-free window left by the close-task reset; three different fates for handler exceptions; shutdown-dropped `send_task` accounting; close-request ordering. Static only: every entry began as `[需核实]` |
+| 10 | [CODE-REVIEW-round10-2026-11-23.md](CODE-REVIEW-round10-2026-11-23.md) | 2026-11-23 | four items from outside | R10-1 to R10-5: new connections now route around a stalled reactor (with hysteresis); the always-present test switches are private behind a friend accessor; handler installers are refused while running; the close-while-paused budget is documented and measured (256 of 4000 answered); the CRLF complaint was a checkout artifact, but it broke `verify/run.sh` |
 
 Rounds 4, 7 and 8 are all "someone raised it, this side checked it" -- not full
 reviews, and much shorter accordingly. For what a full pass produces, read rounds
@@ -38,7 +40,7 @@ really was at the repository root. It is now `include/tcp-server-mt.h`.
 
 **Two, the line numbers have drifted.** A reference like `tcp-server-mt.h:880`
 holds only against the baseline it was written from. The header grew from 2032
-lines to more than 3,400, and a reflow to 80 columns plus translating the
+lines to more than 4,900, and a reflow to 80 columns plus translating the
 comments into English moved most lines in between. The baseline named at the top
 of each report is the tree its line numbers refer to.
 

@@ -188,6 +188,14 @@ asserting more than the design offers; case B2 in `verify/watermark.cpp` can
 assert the whole backlog only because its pending ceiling lets the drain round
 serve it.
 
+Measured rather than argued
+(`verify/evidence/probe_close_while_paused.cpp`): 4000 requests queued in the
+kernel of a paused connection, one close — 256 replies, then FIN. The other 3744
+were parsed and handed to the handler (`frames_recv` 4000) and never reached the
+wire. The public contract now says this in
+`close_connection` (docs/api-reference.md) and at `drain_input_then_close`; it
+used to be a property of the implementation that only this document knew.
+
 The pause deadline is a new deadline, not a reuse of `idle_timeout_ms`: a paused
 connection may legitimately stay paused for as long as the peer takes to read,
 and aborting it with reason `idle timeout` would misreport why. Proposed

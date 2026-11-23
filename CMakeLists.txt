@@ -50,11 +50,11 @@ if(TCP_BUILD_SUITES)
         target_link_libraries(${suite} PRIVATE tcp_server_mt)
     endforeach()
 
-    # fault_injection #errors without the macro on purpose: a suite that
-    # quietly compiles away is worse than one that refuses to build.
+    # No test-only define any more. The fault switches are unconditional
+    # private members (a class definition that varies with a macro is an ODR
+    # hazard) and reachable only through the friend accessor in the harness.
     add_executable(fault_injection verify/fault_injection.cpp)
     target_link_libraries(fault_injection PRIVATE tcp_server_mt)
-    target_compile_definitions(fault_injection PRIVATE INDUSTRIAL_TCP_TESTING)
 
     # TSan reserves a fixed shadow region and dies on kernels that hand out
     # high vm.mmap_rnd_bits. verify/run.sh wraps those runs in `setarch -R`,

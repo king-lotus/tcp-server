@@ -1,7 +1,8 @@
 // verify/fault_injection.cpp -- what a worker dying is supposed to look like.
 //
-// INDUSTRIAL_TCP_TESTING guards the fault switches these cases use. A switch
-// nobody flips is no more a test than a commented-out assert.
+// The fault switches these cases flip are private members of the server,
+// reachable through industrial::test_access (see harness.h). A switch nobody
+// flips is no more a test than a commented-out assert.
 //
 // The exception switches (A and B) raise the same question: what recovery
 // means for a thread that left its loop through an exception rather than a
@@ -51,11 +52,14 @@
 //      while the surviving reactor keeps the server running.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
-//   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
+//   g++ -std=c++17 -Wall -Wextra -pthread verify/fault_injection.cpp -o fault_injection
 //
-// The define is what unlocks the switches: without it this file does not compile,
-// which is the intended failure mode -- a test that quietly stops testing is
-// worse than one that refuses to build.
+// No -D any more. The switches used to live behind INDUSTRIAL_TCP_TESTING,
+// which made the class definition depend on a build flag -- an ODR hazard, and
+// the reason they became unconditional members. They are now private members
+// reachable only through industrial::test_access (verify/harness.h), so there
+// is nothing left for the macro to unlock and the file builds like every other
+// suite.
 //
 // Exit code 0 = all cases passed.
 #include <arpa/inet.h>
@@ -71,14 +75,11 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
-
-#ifndef INDUSTRIAL_TCP_TESTING
-#error "fault_injection.cpp requires -DINDUSTRIAL_TCP_TESTING; see the file header"
-#endif
 
 #include "harness.h"
 #include "tcp-server-mt.h"
@@ -188,7 +189,7 @@ int main() {
             }
         };
 
-        server.fail_worker_for_test.store(true);
+        industrial::test_access::fail_worker_once(server);
         harness::expect(wait_for(3000, [&] {
                             size_t n = 0, first = 0;
                             dead_slots(&n, &first);
@@ -215,7 +216,7 @@ int main() {
                         "the answer is a PONG");
 
         // A second failure leaves no reactor alive, which is fatal.
-        server.fail_worker_for_test.store(true);
+        industrial::test_access::fail_worker_once(server);
         harness::expect(wait_for(3000, [&] { return !server.is_running(); }),
                         "the last reactor's failure stops the server");
         harness::expect(server.stats().reactor_failures.load() == before + 2,
@@ -247,7 +248,7 @@ int main() {
         harness::expect(port_is_listening(port), "listening before the fault");
         const uint64_t before = server.stats().reactor_failures.load();
 
-        server.fail_accept_for_test.store(true);
+        industrial::test_access::fail_accept_once(server);
         harness::expect(wait_for(3000, [&] { return !server.is_running(); }),
                "the server stops reporting itself as running");
         harness::expect(server.stats().reactor_failures.load() > before,
@@ -277,8 +278,8 @@ int main() {
                 break;
             }
             const uint64_t before = server.stats().reactor_failures.load();
-            if (round % 2 == 0) server.fail_worker_for_test.store(true);
-            else                server.fail_accept_for_test.store(true);
+            if (round % 2 == 0) industrial::test_access::fail_worker_once(server);
+            else                industrial::test_access::fail_accept_once(server);
             if (!wait_for(3000, [&] { return !server.is_running(); })) {
                 std::printf("  [FAIL] round %d: the fault never took effect\n", round);
                 ++harness::failure_count();
@@ -418,7 +419,7 @@ int main() {
 
         const uint64_t dropped_before =
             f.stats().close_requests_dropped.load();
-        f.server().fail_close_enqueue_for_test.store(true);
+        industrial::test_access::fail_close_enqueue_once(f.server());
         // The queue refused the hand-off, but the request is honoured by the
         // tick sweep, so close_connection() reports acceptance. Everything
         // below this line -- the counted refusal, the FIN, the gone connection
@@ -460,7 +461,7 @@ int main() {
                 multi_reactor_server::config cfg = base;
                 cfg.num_reactors = 1;
                 multi_reactor_server server(cfg);
-                server.fail_epoll_add_for_test.store(true);
+                industrial::test_access::fail_epoll_add_once(server);
                 bool started = true;
                 harness::expect(
                     within(3000, "start() (epoll add fails)",
@@ -513,7 +514,7 @@ int main() {
                 cfg.handler_threads = 1;
                 cfg.handler_queue_limit = 64;
                 multi_reactor_server server(cfg);
-                server.fail_handler_pool_for_test.store(true);
+                industrial::test_access::fail_handler_pool_once(server);
                 bool started = true;
                 harness::expect(
                     within(3000, "start() (handler pool refuses)",
@@ -565,7 +566,7 @@ int main() {
                 cfg.port = port;
                 cfg.num_reactors = 2;
                 multi_reactor_server server(cfg);
-                server.fail_reactor_start_after_for_test.store(1);
+                industrial::test_access::fail_reactor_start_after(server, 1);
                 bool started = true;
                 harness::expect(
                     within(3000, "start() (second reactor refuses)",
@@ -640,7 +641,10 @@ int main() {
         std::atomic<bool> in_handler{false};
         std::atomic<bool> release{false};
         multi_reactor_server server(cfg);
-        server.set_message_handler([&](uint64_t, const uint8_t*, size_t) {
+        // Only "x" blocks. The routing case below needs the other reactor to
+        // keep serving while this one is stuck in here.
+        server.set_message_handler([&](uint64_t, const uint8_t* p, size_t n) {
+            if (n != 1 || p[0] != 'x') return;
             in_handler.store(true, std::memory_order_release);
             for (int i = 0; i < 3000 &&
                             !release.load(std::memory_order_acquire); ++i) {
@@ -664,9 +668,56 @@ int main() {
                             return server.stats().reactor_stalls.load() >= 1;
                         }), "a stalled reactor was counted");
         harness::expect(server.is_running(),
-                        "the watchdog is observational, not fatal");
+                        "a stalled reactor does not stop the server");
+
+        // Routing. Six connections opened while one reactor is blocked must all
+        // land on the other one. Without the skip the round-robin hands every
+        // second connection to the blocked reactor, where it waits in a queue
+        // nobody drains until this handler returns -- a peer watching a live
+        // TCP connection that never answers.
+        {
+            std::vector<std::unique_ptr<harness::peer>> routed;
+            for (int i = 0; i < 6; ++i) {
+                auto p = std::make_unique<harness::peer>();
+                if (!p->connect(server.port())) break;
+                (void)p->send(industrial::frame_type::DATA, "y", 1);
+                routed.push_back(std::move(p));
+            }
+            harness::expect(routed.size() == 6, "six connections opened");
+            size_t stalled_conns = 0, live_conns = 0;
+            bool   saw_stalled = false;
+            harness::expect(wait_for(2000, [&] {
+                const auto v = server.reactor_stats();
+                stalled_conns = live_conns = 0;
+                saw_stalled = false;
+                for (const auto& r : v) {
+                    if (r.retired) continue;
+                    if (r.stalled) {
+                        saw_stalled = true;
+                        stalled_conns += r.connections;
+                    } else {
+                        live_conns += r.connections;
+                    }
+                }
+                return saw_stalled && stalled_conns == 1 && live_conns == 6;
+            }), "new connections are routed to the live reactor");
+            harness::expect(server.stats().reactor_stall_skips.load() >= 1,
+                            "the reroutes are counted");
+        }
 
         release.store(true, std::memory_order_release);
+        // Hysteresis. The flag is not cleared by the first healthy sample: the
+        // reactor has to look fresh by half a window, and a full window has to
+        // have passed since the stall was declared. One episode stays one
+        // episode -- a re-admit-and-drop cycle would show up as reactor_stalls
+        // climbing past 1.
+        harness::expect(wait_for(3000, [&] {
+                            for (const auto& r : server.reactor_stats())
+                                if (!r.retired && r.stalled) return false;
+                            return true;
+                        }), "the stalled reactor is re-admitted after recovery");
+        harness::expect(server.stats().reactor_stalls.load() == 1,
+                        "one episode, counted once");
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         {
@@ -770,7 +821,7 @@ int main() {
                                    [&] { shrinking.stop(); }),
                             "the four-reactor run stops");
 
-            shrinking.resolved_reactor_count_for_test.store(2);
+            industrial::test_access::force_reactor_count(shrinking, 2);
             harness::expect(shrinking.start(), "the shrunken run starts");
             {
                 const auto v = shrinking.reactor_stats();
@@ -819,7 +870,7 @@ int main() {
             // A start that fails after the slots exist must leave them
             // published and retired, not empty: the lifetime counters are
             // still in the aggregate and must remain reconcilable.
-            shrinking.fail_handler_pool_for_test.store(true);
+            industrial::test_access::fail_handler_pool_once(shrinking);
             bool failed = true;
             harness::expect(
                 within(3000, "start() (handler pool refuses)",
@@ -842,7 +893,7 @@ int main() {
                                 "the failed start kept the sums reconcilable");
             }
 
-            shrinking.resolved_reactor_count_for_test.store(-1);
+            industrial::test_access::force_reactor_count(shrinking, -1);
             harness::expect(shrinking.start(),
                             "the server starts again after the refusal");
             harness::expect(within(3000, "stop()",
@@ -866,14 +917,25 @@ int main() {
         cfg.tick_ms = 20;
         cfg.idle_timeout_ms = 60000;
         cfg.close_linger_ms = 1000;
+        // The reactor has to be *stalled* before it is quarantined, or the
+        // assertion that quarantine drops the flag tests nothing.
+        cfg.reactor_stall_timeout_ms = 100;
 
         std::atomic<uint64_t> id{0};
         std::atomic<int> closed{0};
         std::atomic<int> reason_ok{0};
+        std::atomic<bool> in_handler{false};
+        std::atomic<bool> release{false};
         multi_reactor_server server(cfg);
         server.set_message_handler(
-            [&](uint64_t cid, const uint8_t*, size_t) {
+            [&](uint64_t cid, const uint8_t* p, size_t n) {
                 id.store(cid, std::memory_order_release);
+                if (n == 1 && p[0] == 'x') {
+                    in_handler.store(true, std::memory_order_release);
+                    while (!release.load(std::memory_order_acquire))
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                }
             });
         server.set_close_handler(
             [&](uint64_t, const std::string&, const char* reason) {
@@ -893,6 +955,9 @@ int main() {
                         "frame sent");
         harness::expect(wait_for(2000, [&] { return id.load() != 0; }),
                         "the connection is admitted");
+        harness::expect(wait_for(2000, [&] {
+                            return in_handler.load(std::memory_order_acquire);
+                        }), "the handler is blocking its reactor");
 
         // reactor_stats() is the only public way to learn which slot owns it.
         int owner = -1;
@@ -909,9 +974,18 @@ int main() {
                         "the owning reactor is identified");
 
         if (owner >= 0) {
+            harness::expect(wait_for(2500, [&] {
+                                const auto v = server.reactor_stats();
+                                return static_cast<size_t>(owner) < v.size() &&
+                                       v[owner].stalled;
+                            }), "the watchdog marks the doomed reactor stalled");
             const uint64_t failures_before =
                 server.stats().reactor_failures.load();
-            server.fail_worker_reactor_for_test.store(owner);
+            // Arm the failure while the reactor is still inside the handler,
+            // then let it return: its next loop iteration throws, so the slot
+            // goes from stalled to dead with both flags set for an instant.
+            industrial::test_access::fail_worker_reactor_once(server, owner);
+            release.store(true, std::memory_order_release);
             harness::expect(wait_for(3000, [&] {
                                 return server.stats().reactor_failures.load() >
                                        failures_before;
@@ -933,8 +1007,14 @@ int main() {
                                     static_cast<size_t>(owner) < v.size() &&
                                     v[owner].dead,
                                 "the targeted slot is marked dead");
+                harness::expect(static_cast<size_t>(owner) < v.size() &&
+                                    !v[owner].stalled,
+                                "quarantine drops the stall flag with it");
             }
         }
+        // If the owner was never identified the handler must still be let go,
+        // or stop() joins a reactor parked in it and the suite hangs.
+        release.store(true, std::memory_order_release);
         harness::expect(within(3000, "stop()", [&] { server.stop(); }),
                         "stop() completes");
         p.close();

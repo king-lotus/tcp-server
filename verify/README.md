@@ -57,7 +57,7 @@ worker 上的故障会被平均掉** —— 两个 reactor 时表现为"每隔�
 >
 > 之后同一台机器上又抓到三个（P0-4 / P0-5 / P0-6），全都在**关闭路径与启动发布**上。
 
-## `fault_injection.cpp` —— 让 `INDUSTRIAL_TCP_TESTING` 有消费者
+## `fault_injection.cpp` —— 让故障开关有消费者
 
 `fail_worker_for_test` / `fail_accept_for_test`（以及按索引精确定位某个 reactor 的
 `fail_worker_reactor_for_test`）是为"worker 从异常里退出以后该怎么办"准备的，
@@ -65,11 +65,15 @@ worker 上的故障会被平均掉** —— 两个 reactor 时表现为"每隔�
 没人去扳的开关，和被注释掉的断言一样，都不是测试。
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
+g++ -std=c++17 -Wall -Wextra -pthread \
     verify/fault_injection.cpp -o fault_injection && ./fault_injection
 ```
 
-没有那个宏时这个文件**编译不过**（`#error` 而不是静默少测一个用例——见下）。
+这些开关现在是服务器的**私有成员**：类定义不再随宏变化（两个编译单元对同一个
+类有不同定义是 ODR 违规），而"总是存在"不等于"谁都能碰"——只有 `harness.h` 里
+的 `industrial::test_access`（服务器声明的友元）能扳动它们。原来那个
+`INDUSTRIAL_TCP_TESTING` 宏因此失去意义，已删除；私有性本身由
+`verify/evidence/probe_test_hooks_private.sh` 守住（直接访问必须编译失败）。
 
 | 用例 | 断言 |
 |------|------|

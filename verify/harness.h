@@ -43,6 +43,57 @@
 
 #include "tcp-server-mt.h"
 
+namespace industrial {
+
+// The fault-injection switches in multi_reactor_server are private members,
+// present in every build so that the class definition cannot vary between
+// translation units. This struct is the only way in: the server declares it a
+// friend, and the suites are the only code that names it.
+//
+// Why it exists rather than making the switches public: a switch that any code
+// holding a server reference can flip is a way to kill a reactor from anywhere
+// in the process, and the always-present/public version was exactly that in
+// production builds. Private plus one friend keeps the ODR property (one class
+// definition for every build) and drops the reach.
+//
+// The methods are one-shot where the switch is one-shot: the reactor consumes
+// it with a load-then-exchange, so a test cannot leave a switch armed for the
+// next case by accident.
+struct test_access {
+    static void fail_worker_once(multi_reactor_server& s) noexcept {
+        s.fail_worker_for_test_.store(true, std::memory_order_relaxed);
+    }
+    static void fail_accept_once(multi_reactor_server& s) noexcept {
+        s.fail_accept_for_test_.store(true, std::memory_order_relaxed);
+    }
+    static void fail_worker_reactor_once(multi_reactor_server& s,
+                                         int index) noexcept {
+        s.fail_worker_reactor_for_test_.store(index,
+                                             std::memory_order_relaxed);
+    }
+    static void fail_epoll_add_once(multi_reactor_server& s) noexcept {
+        s.fail_epoll_add_for_test_.store(true, std::memory_order_relaxed);
+    }
+    static void fail_handler_pool_once(multi_reactor_server& s) noexcept {
+        s.fail_handler_pool_for_test_.store(true, std::memory_order_relaxed);
+    }
+    static void fail_reactor_start_after(multi_reactor_server& s,
+                                         int index) noexcept {
+        s.fail_reactor_start_after_for_test_.store(
+            index, std::memory_order_relaxed);
+    }
+    static void fail_close_enqueue_once(multi_reactor_server& s) noexcept {
+        s.fail_close_enqueue_for_test_.store(true, std::memory_order_relaxed);
+    }
+    static void force_reactor_count(multi_reactor_server& s,
+                                    int count) noexcept {
+        s.resolved_reactor_count_for_test_.store(
+            count, std::memory_order_relaxed);
+    }
+};
+
+}  // namespace industrial
+
 namespace harness {
 
 // An operation that can fail, with the reason it did. No exceptions: the

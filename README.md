@@ -22,7 +22,7 @@ run it -- `verify/` is that machine.
   skips both.
 - **Closing is staged, not `close(fd)`.** A connection is marked `closing`
   first, drains the replies already queued, and only then FINs. That semantic is
-  where nine rounds of review landed most often and where the probes are
+  where ten rounds of review landed most often and where the probes are
   densest. `stop()` is the immediate exception: it aborts whatever is still
   open. `stop_gracefully(ms)` stops accepting, closes every connection
   gracefully, and waits up to `ms` before that same stop.
@@ -138,7 +138,7 @@ include/tcp-server-mt.h   the only deliverable
 verify/                   runtime suites, the peer harness, one-off probes
 docs/api-reference.md     the public surface: config, lifecycle, send/close, stats
 docs/testing.md           how a suite is written, and how the harness is tested
-docs/review/              nine rounds of review, with an index
+docs/review/              ten rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
 ```
 
