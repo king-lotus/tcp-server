@@ -77,6 +77,10 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 | C | 12 轮「启动 → 注入故障 → stop → 再启动」→ 每次都留下一个还能重新起来的服务器 |
 | D | `close_linger_ms` / `backlog <= 0` 在 `start()` 被拒绝（否则 fd/准入泄漏或零长度 accept 队列） |
 | E | message handler 抛异常 → 被吞掉（与 R8-2 的 open state handler 同处理），连接继续分发 |
+| F | close 队列拒绝 → `close_wanted` 记录请求，tick sweep 在一拍内完成关闭 |
+| G | accept setup 在 spare fd 打开后失败 → 全部描述符（含 spare）释放；重试与析构均无泄漏 |
+| H | handler pool 启动失败（listen、reactor、accept 线程均已存在）→ 完整回滚、端口释放、重试成功 |
+| I | 第二个 reactor 启动失败 → 已启动的子集被停止、无 fd 泄漏、重试成功 |
 
 `stop()` 一律包在带超时的 `within()` 里跑：恢复路径死锁时的表现只是"测试跑得久"，
 而退出码分不清那和一台慢机器有什么区别。
@@ -97,19 +101,25 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 8192 一帧不差 —— 卡住的位置正好是那条常量。它是故意先红着提交的（`f8a6523`）。
 
+队列现在还为控制任务保留 64 个槽位：`send_task` 在 `cap - 64` 停止入队，而
+close/drain/park/new-connection 仍可用满 cap。因此 case B 在数据队列已满时仍能把
+close 排进队列，`close_requests_dropped` 保持 0，而不是退回 `close_wanted` 的
+tick sweep。
+
 ## `send_results.cpp` —— send_to 的五种回答、两个计数器，外加 offload
 
 `send_to()` 是应用往连接上放字节的唯一入口，`send_result` 是它能拿回的全部信息。但第六轮之前，
 四个失败态（`not_connected` / `too_large` / `overloaded` / `invalid_argument`）**整个 verify/ 里没有任何
 一条断言碰过**。"正确但无人守护"是最糟的一种状态：任何一次编辑都能改掉它，而所有配置仍然全绿。
 
-覆盖的三件事：
+覆盖的用例：
 
 | 用例 | 断言 |
 |------|------|
 | 五种回答 | 每个值各一条，且都落在真正产生它的状态上；`overloaded` 用"帧大于 32 字节上限"达成，不去和排空赛跑 |
 | 关闭中发送 | `closed`，且不留 `queue_drops` / `bytes_dropped`（R6-3） |
 | `accept_errors` | 子进程把 `RLIMIT_NOFILE` 的**硬**限制压到 20，父进程连 40 个peer 撑爆它；拒绝的 accept 必须被计数 |
+| accept rescue | EMFILE 救援的重试判定：EINTR/ECONNABORTED 保留本轮，EAGAIN/EMFILE 停止本轮 |
 | handler offload | 两条同连接请求由 offload 任务返回，顺序与到达一致；任务睡眠期间另一连接的 PING 仍被 reactor 及时应答 |
 
 `accept_errors` 那条必须 fork：描述符上限是**每进程**的，得让"耗尽的一方"和"不停敲门的一方"是两个进程。

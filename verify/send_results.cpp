@@ -28,7 +28,9 @@
 //      the owner has already decided to refuse (R6-3), and must not leave a
 //      queue_drops behind while saying ok.
 //   3. accept_errors climbs when the descriptor ceiling is lower than the number
-//      of peers knocking, instead of the loop going quiet.
+//      of peers knocking, instead of the loop going quiet. The EMFILE salvage's
+//      retry decision is pinned separately: EINTR/ECONNABORTED keep the round,
+//      EAGAIN/EMFILE stop it.
 //   4. hup/err, asked rather than assumed: whether this host reports an aborted
 //      connection at all is checked first, because an abort that arrives as an
 //      ordinary FIN never reaches the branch, and asserting against a break the
@@ -244,6 +246,23 @@ void case_accept_errors() {
 
     harness::expect(WIFEXITED(status) && WEXITSTATUS(status) == 0,
            "refused accepts are counted, not swallowed");
+}
+
+// ---- accept rescue retry policy -----------------------------------------
+// The EMFILE salvage returns to the accept round only when the victim accept
+// was interrupted or the queued peer aborted. EAGAIN means the queue was
+// observed empty, and EMFILE means the descriptor table is still full; neither
+// is helped by retrying the same round, so both stop it.
+void case_accept_retry_policy() {
+    std::printf("accept rescue: which failures keep the accept round alive\n");
+    harness::expect(industrial::accept_salvage_retries(EINTR),
+                    "EINTR retries");
+    harness::expect(industrial::accept_salvage_retries(ECONNABORTED),
+                    "ECONNABORTED retries");
+    harness::expect(!industrial::accept_salvage_retries(EAGAIN),
+                    "EAGAIN stops the round");
+    harness::expect(!industrial::accept_salvage_retries(EMFILE),
+                    "EMFILE stops the round");
 }
 
 // ---- 3. hup/err ---------------------------------------------------------
@@ -485,6 +504,7 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     case_five_outcomes();
     case_accept_errors();
+    case_accept_retry_policy();
     case_hup_err();
     case_offload();
     case_offload_queue_limit();

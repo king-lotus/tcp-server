@@ -34,6 +34,12 @@
 //      descriptor has been opened must release it too. start()'s recovery
 //      closes only the descriptors it knows about, and a failed start leaves
 //      the lifecycle at `stopped`, so stop() will not clean up afterwards.
+//   H. fail_handler_pool_for_test -- the deepest start failure: the listening
+//      socket, reactors and accept thread already exist. The rollback must
+//      join, stop and release all of them, leaving the port free for a retry.
+//   I. fail_reactor_start_after_for_test -- a reactor refusing after earlier
+//      ones started must leave no partial set (epoll/eventfd/thread) behind,
+//      and the retry must succeed.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -242,7 +248,9 @@ int main() {
         cfg.close_linger_ms = 1;
         multi_reactor_server server_ok(cfg);
         harness::expect(server_ok.start(), "close_linger_ms=1 still accepted");
-        if (server_ok.is_running()) server_ok.stop();
+        if (server_ok.is_running())
+            harness::expect(within(3000, "stop()", [&] { server_ok.stop(); }),
+                            "stop() completes");
 
         // The one accept-side setting that silently degrades: Linux clamps
         // backlog only from above (somaxconn), so 0 goes through as a
@@ -259,7 +267,9 @@ int main() {
         cfg.backlog = 1;
         multi_reactor_server server_b_ok(cfg);
         harness::expect(server_b_ok.start(), "backlog=1 still accepted");
-        if (server_b_ok.is_running()) server_b_ok.stop();
+        if (server_b_ok.is_running())
+            harness::expect(within(3000, "stop()", [&] { server_b_ok.stop(); }),
+                            "stop() completes");
     }
 
     // ---- E: a message handler that throws --------------------------------
@@ -385,15 +395,134 @@ int main() {
                 cfg.num_reactors = 1;
                 multi_reactor_server server(cfg);
                 server.fail_epoll_add_for_test.store(true);
-                harness::expect(!server.start(),
+                bool started = true;
+                harness::expect(
+                    within(3000, "start() (epoll add fails)",
+                           [&] { started = server.start(); }),
+                    "start() returns");
+                harness::expect(!started,
                                 "start() fails when epoll registration fails");
                 const int after_fail = count_open_fds();
                 harness::expect(after_fail == before,
                                 "the failed start leaked no descriptors");
 
-                harness::expect(server.start(), "the retry starts");
+                bool retried = false;
+                harness::expect(
+                    within(3000, "start() (retry)",
+                           [&] { retried = server.start(); }),
+                    "the retry returns");
+                harness::expect(retried, "the retry starts");
                 harness::expect(server.is_running(), "the retried server runs");
-                server.stop();
+                harness::expect(within(3000, "stop()",
+                                       [&] { server.stop(); }),
+                                "stop() completes");
+                const int after_stop = count_open_fds();
+                std::printf("      open fds: before=%d after_fail=%d "
+                            "after_stop=%d\n", before, after_fail, after_stop);
+                harness::expect(after_stop == before,
+                                "the retried server released its descriptors");
+            }
+            harness::expect(count_open_fds() == before,
+                            "destruction leaked no descriptors");
+        }
+    }
+
+    // ---- H: a failed handler-pool start rolls a live server back -----------
+    //
+    // By the time start_handler_pool() refuses, the listening socket, every
+    // reactor and the accept thread exist. The rollback must join the accept
+    // thread, stop the reactors, release every descriptor and leave the port
+    // bindable so the retry can succeed.
+    {
+        std::printf("H. a failed handler-pool start rolls back completely\n");
+        const int before = count_open_fds();
+        const uint16_t port = free_port();
+        harness::expect(before > 0 && port != 0,
+                        "descriptor count and port are available");
+        if (before > 0 && port != 0) {
+            {
+                multi_reactor_server::config cfg = base;
+                cfg.port = port;
+                cfg.num_reactors = 1;
+                cfg.handler_threads = 1;
+                cfg.handler_queue_limit = 64;
+                multi_reactor_server server(cfg);
+                server.fail_handler_pool_for_test.store(true);
+                bool started = true;
+                harness::expect(
+                    within(3000, "start() (handler pool refuses)",
+                           [&] { started = server.start(); }),
+                    "start() returns");
+                harness::expect(!started,
+                                "start() fails when the handler pool refuses");
+                harness::expect(!port_is_listening(port),
+                                "the failed start released the listen socket");
+                const int after_fail = count_open_fds();
+                harness::expect(after_fail == before,
+                                "the failed start leaked no descriptors");
+
+                bool retried = false;
+                harness::expect(
+                    within(3000, "start() (retry)",
+                           [&] { retried = server.start(); }),
+                    "the retry returns");
+                harness::expect(retried, "the retry starts");
+                harness::expect(server.is_running(), "the retried server runs");
+                harness::expect(within(3000, "stop()",
+                                       [&] { server.stop(); }),
+                                "stop() completes");
+                const int after_stop = count_open_fds();
+                std::printf("      open fds: before=%d after_fail=%d "
+                            "after_stop=%d\n", before, after_fail, after_stop);
+                harness::expect(after_stop == before,
+                                "the retried server released its descriptors");
+            }
+            harness::expect(count_open_fds() == before,
+                            "destruction leaked no descriptors");
+        }
+    }
+
+    // ---- I: a partially started reactor set is rolled back ------------------
+    //
+    // The failpoint refuses the second reactor, after the first one is
+    // running. The rollback must stop the started subset, release its epoll,
+    // eventfd and thread, and leave the port bindable for the retry.
+    {
+        std::printf("I. a partial reactor set is rolled back\n");
+        const int before = count_open_fds();
+        const uint16_t port = free_port();
+        harness::expect(before > 0 && port != 0,
+                        "descriptor count and port are available");
+        if (before > 0 && port != 0) {
+            {
+                multi_reactor_server::config cfg = base;
+                cfg.port = port;
+                cfg.num_reactors = 2;
+                multi_reactor_server server(cfg);
+                server.fail_reactor_start_after_for_test.store(1);
+                bool started = true;
+                harness::expect(
+                    within(3000, "start() (second reactor refuses)",
+                           [&] { started = server.start(); }),
+                    "start() returns");
+                harness::expect(!started,
+                                "start() fails when the second reactor refuses");
+                harness::expect(!port_is_listening(port),
+                                "the failed start released the listen socket");
+                const int after_fail = count_open_fds();
+                harness::expect(after_fail == before,
+                                "the partial reactor set leaked no descriptors");
+
+                bool retried = false;
+                harness::expect(
+                    within(3000, "start() (retry)",
+                           [&] { retried = server.start(); }),
+                    "the retry returns");
+                harness::expect(retried, "the retry starts");
+                harness::expect(server.is_running(), "the retried server runs");
+                harness::expect(within(3000, "stop()",
+                                       [&] { server.stop(); }),
+                                "stop() completes");
                 const int after_stop = count_open_fds();
                 std::printf("      open fds: before=%d after_fail=%d "
                             "after_stop=%d\n", before, after_fail, after_stop);

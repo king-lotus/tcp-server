@@ -401,15 +401,15 @@ That is 39 suite runs across the three configurations, plus cpplint. The single
 `[SKIP]` is `send_results`' `hup/err` case, which asks the host whether an
 aborted connection is reported as an error before asserting on it.
 
-One suite needed its assertion updated, because it encoded the old
-`close_connection` contract:
+One suite changed shape when the reactor queue grew a reserved control window.
+A reply flood now stops 64 slots short of the cap, so the close in
+`backpressure` case B is queued rather than refused:
 
 ```cpp
-- harness::expect(!queued, "close_connection() reports that it did not get through");
-+ harness::expect(queued, "close_connection() accepts a request the queue refused");
+harness::expect(dropped == 0,
+                "the reserved slot kept the close out of the refused path");
 ```
 
-The counter half of that case (`close_requests_dropped` still moves) is
-unchanged and still passes. Both assertions are now in the repository, in
-`verify/backpressure.cpp` and `verify/fault_injection.cpp`, and the 39-run
-matrix above was taken with those versions.
+The refused-close fallback is still covered by `fault_injection` case F, which
+forces the refusal with its one-shot hook and checks that `close_wanted` still
+drives the close. The 39-run matrix above predates the reserved window.

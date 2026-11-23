@@ -285,7 +285,9 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 1. **单连接 `max_pending_bytes`**（默认 65544）：覆盖“还在队列里的帧 + 已在 wbuf
    里的字节”。这是软上限，超过时 `overloaded` 且 `queue_drops++`。
 2. **每 reactor 任务队列上限**：`max(8192, (max_connections / reactors) * 4)`。
-   满时提交被拒绝，同样计入 `queue_drops`。
+   满时提交被拒绝，同样计入 `queue_drops`。数据帧在距上限 64 个槽位处就停止入队，
+   这 64 个槽位留给 close/drain/park/new-connection，避免回复风暴拒绝掉推进关闭
+   所必需的任务。
 3. **读侧水位线**：`pending_bytes` 超过 `read_high_watermark_bytes` 时，reactor
    停在帧边界、取消 `EPOLLIN`，让 TCP 对发送方施加压力；降到
    `read_low_watermark_bytes` 及以下再恢复。暂停期间跳过帧装配超时扫描，
@@ -323,11 +325,11 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 5. **销毁连接**：`teardown_closed()` → `close(fd)`，然后在安全栈帧上执行延迟的
    `conn_state_handler(false)` 和 `close_handler`。
 
-`close_connection()` 返回 `true` 只表示“请求立即到达了 reactor 队列”，不表示连接
-已经关闭。返回 `false` 表示请求没送到（没有 owner 或队列满）；但请求不会丢：
-连接上的 `close_wanted` 会记录它，`do_tick()` 的扫描在一个 tick 内执行同样的
-“先排输入、再关闭”。每次队列拒绝计入 `close_requests_dropped`，它是队列压力的
-信号，不再表示关闭被放弃。
+`close_connection()` 返回 `true` 表示关闭已被接受：请求已进入 reactor 队列，或
+队列已满时记录在 `close_wanted`，由 `do_tick()` 的扫描在一个 tick 内执行同样的
+“先排输入、再关闭”。返回 `false` 只表示没有可关闭的对象（服务器未运行、连接未知、
+没有 owner）。队列拒绝仍会计入 `close_requests_dropped`（队列压力信号），但请求
+不会丢。
 
 ### 6.2 中止（内部路径）
 

@@ -101,7 +101,9 @@ handler fails to compile, and a reordered table is not representable.
 
 The queue is per reactor, and its capacity scales with the connections that
 reactor can be asked to serve, because a broadcast to every connection lands
-entirely on one queue at a time.
+entirely on one queue at a time. Data frames stop 64 slots short of the cap;
+that reserve is what lets close/drain/park/new-connection tasks still be
+admitted while a reply flood has filled the rest.
 
 ### Read backpressure
 

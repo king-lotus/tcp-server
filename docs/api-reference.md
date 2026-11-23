@@ -288,11 +288,13 @@ bool close_connection(uint64_t conn_id) noexcept;
 
 Starts a graceful close: pending output is drained, then FIN, then the peer's
 FIN is awaited — all within the single `close_linger_ms` budget, counted from
-the moment the close is parked. Returns `true` if the request
-reached the owning reactor's queue, `false` if it did not — the server is not
-running, the connection is unknown, it has no owner, or the queue refused it. A
-`false` does not close anything: the connection stays open until something else
-ends it. Every `false` is counted in `close_requests_dropped`.
+the moment the close is parked. Returns `true` when the close was accepted:
+queued to the owning reactor, or — when that queue was at its cap — recorded in
+`close_wanted` for the tick sweep, which performs the same drain-then-close
+within one tick. Returns `false` only when there is nothing to close: the
+server is not running, the connection is unknown, or it has no owner. A refused
+queue hand-off still increments `close_requests_dropped` even though it returns
+`true`, because that counter is the queue-pressure signal, not a lost close.
 
 ```cpp
 bool offload(uint64_t conn_id, std::function<void()> fn) noexcept;
@@ -353,7 +355,7 @@ iteration: exact when idle, up to one iteration behind under load.
 | `frames_recv` | A frame was parsed and consumed. A frame rejected from its header (bad magic, over-length, unknown type) is counted in `parse_errors` or `unknown_frame_types` instead. |
 | `frames_sent` | A frame's last byte reaches the kernel — not when it is queued. |
 | `bytes_recv` / `bytes_sent` | Bytes read from / written to sockets. |
-| `queue_drops` | A whole frame is refused, either for exceeding `max_pending_bytes` or because a reactor queue is full. Control tasks refused by the same queues are counted here too. |
+| `queue_drops` | A whole frame is refused, either for exceeding `max_pending_bytes` or because a reactor queue is full. `send_task` submissions stop 64 slots short of the per-reactor cap, leaving that headroom for close/drain/park/new-connection tasks; frames refused there land here too. Control tasks refused at the full cap are counted here as well. |
 | `bytes_dropped` | Bytes accepted for a connection but never sent: a frame dropped whole (capacity reject, or arriving after the close began), or output still buffered when the connection was torn down. |
 | `aborted` | A connection ended with a reset rather than a graceful close. |
 | `frames_dropped_on_close` | A frame arriving for a connection that is already closing, and therefore not answered. |

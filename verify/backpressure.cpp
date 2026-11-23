@@ -132,14 +132,16 @@ int main() {
     peer.close();
     }
 
-    // ---- B: a close the queue refuses must say so ---------------------------
+    // ---- B: a reply flood leaves the close a reserved slot ------------------
     //
     // Same construction as A (one held worker, everything else raised out of
-    // reach) but asked to close instead of send: with the queue full, enqueue
-    // refuses, and until that is counted nothing anywhere records that this
-    // connection was ever asked to go away -- it just waits for idle timeout.
+    // reach). Data tasks stop k_control_task_reserve slots below the cap, so
+    // while the queue is refusing replies there is still room for the close
+    // that ends the exchange. Before the reserve, this close was refused and
+    // counted in close_requests_dropped; the task then ran from close_wanted
+    // on the next tick instead of from the queue.
     {
-        std::printf("B. a close the queue refuses is countable\n");
+        std::printf("B. a reply flood still leaves room for the close\n");
 
         multi_reactor_server::config bcfg;
         bcfg.bind_addr = "127.0.0.1";
@@ -183,22 +185,19 @@ int main() {
         harness::expect(refused > 0, "the queue cap actually refused frames");
 
         const uint64_t before = server.stats().close_requests_dropped.load();
-        // The queue refused the task, but the request is honoured anyway: it is
-        // recorded in the connection and do_tick performs the same
-        // drain-then-close within one tick. True therefore means "accepted",
-        // not "queued", and the refusal stays visible in the counter for
-        // operations -- reporting failure here used to make callers retry a
-        // close that was already guaranteed.
+        // The close may use the slots data tasks are not allowed to touch, so
+        // it queues behind the denied replies instead of being refused. The
+        // close_requests_dropped counter is what separates the two: the
+        // close_wanted fallback increments it, the reserved slot does not.
         const bool queued = server.server().close_connection(
             conn_id.load(std::memory_order_acquire));
+        const uint64_t dropped =
+            server.stats().close_requests_dropped.load() - before;
         std::printf("      close_requests_dropped +%llu, returned %s\n",
-                    (unsigned long long)(server.stats().close_requests_dropped.load()
-                                         - before),
-                    queued ? "true" : "false");
-        harness::expect(queued,
-                        "close_connection() accepts a request the queue refused");
-        harness::expect(server.stats().close_requests_dropped.load() > before,
-               "a close the queue refused is counted, not swallowed");
+                    (unsigned long long)dropped, queued ? "true" : "false");
+        harness::expect(queued, "close_connection() accepts the close");
+        harness::expect(dropped == 0,
+               "the reserved slot kept the close out of the refused path");
 
         release.store(true, std::memory_order_release);
         server.stop();

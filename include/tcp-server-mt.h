@@ -859,6 +859,7 @@ struct closed_conn {
 
 // ==================== sub_reactor ====================
 class sub_reactor {
+    friend class multi_reactor_server;
  public:
     sub_reactor(int idx, multi_reactor_server* server) noexcept
         : idx_(idx), server_(server) {}
@@ -1040,7 +1041,15 @@ class sub_reactor {
     // reply plus a close per broadcast, and the floor keeps small servers where
     // they were.
     static constexpr size_t k_min_pending_tasks = 8192;
+    // Slots held back for close/drain/park/new-connection tasks, so a flood of
+    // application replies cannot refuse the tasks that make progress. Data
+    // tasks stop this many short of pending_task_cap_; control tasks may use
+    // the whole cap, which bounds the reserve by construction.
+    static constexpr size_t k_control_task_reserve = 64;
+    static_assert(k_min_pending_tasks > k_control_task_reserve,
+                  "the reserve must leave a data-task slot");
     size_t pending_task_cap_ = k_min_pending_tasks;
+    size_t data_task_cap_ = k_min_pending_tasks - k_control_task_reserve;
     std::mutex              pending_mutex_;
     std::vector<queue_task> pending_tasks_;
     std::vector<queue_task> active_tasks_;
@@ -1434,6 +1443,15 @@ class multi_reactor_server {
     // the spare descriptor has been opened. Used to prove a failed start
     // releases the spare as well as the descriptors start() knows about.
     std::atomic<bool> fail_epoll_add_for_test{false};
+    // One-shot: the next handler-pool start refuses, after the listening
+    // socket, the reactors and the accept thread exist. Used to prove the
+    // deepest start rollback joins and releases all of them. Checked before
+    // the no-pool early return, so it fires on any configuration.
+    std::atomic<bool> fail_handler_pool_for_test{false};
+    // -1 = off. Otherwise the Nth reactor start (zero-based) refuses, after
+    // N reactors have already started, which exercises the partial-set
+    // teardown. One-shot: reset to -1 when it fires.
+    std::atomic<int> fail_reactor_start_after_for_test{-1};
     // One-shot: the next submit_close() reports a full queue. Used to prove
     // that a refused close request still reaches the connection through the
     // tick sweep.
@@ -1561,6 +1579,29 @@ class multi_reactor_server {
     void stop_handler_pool() noexcept;
     void handler_worker() noexcept;
 
+    // start()'s phases. validate_start_config() resolves and checks the
+    // configuration, leaving the lifecycle at stopped when it refuses. The
+    // resource phases are undone by rollback_start(); start_rollback runs that
+    // undo on any exit between the first acquired resource and success.
+    bool validate_start_config() noexcept;
+    void warn_deadline_granularity() noexcept;
+    void warn_fd_ceiling() noexcept;
+    bool start_reactors() noexcept;
+    bool start_accept_and_handlers() noexcept;
+    void rollback_start() noexcept;
+    struct start_rollback {
+        explicit start_rollback(multi_reactor_server* s) noexcept
+            : server(s) {}
+        start_rollback(const start_rollback&) = delete;
+        start_rollback& operator=(const start_rollback&) = delete;
+        start_rollback(start_rollback&&) = delete;
+        start_rollback& operator=(start_rollback&&) = delete;
+        ~start_rollback() { if (armed) server->rollback_start(); }
+        void dismiss() noexcept { armed = false; }
+        multi_reactor_server* server;
+        bool armed = true;
+    };
+
     bool        init_listen_socket() noexcept;
     // The one place the listening socket is closed, so that "no socket" and "no
     // port" cannot drift apart: a port() that outlives its socket reads like a
@@ -1671,6 +1712,15 @@ class multi_reactor_server {
 // ====================================================================
 
 inline bool sub_reactor::start() noexcept {
+    if (server_->fail_reactor_start_after_for_test.load(
+            std::memory_order_relaxed) >= 0) {
+        if (server_->fail_reactor_start_after_for_test.fetch_sub(
+                1, std::memory_order_relaxed) == 0) {
+            server_->fail_reactor_start_after_for_test.store(
+                -1, std::memory_order_relaxed);
+            return false;
+        }
+    }
     if (running_.exchange(true)) return true;
 
     epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
@@ -1698,6 +1748,7 @@ inline bool sub_reactor::start() noexcept {
         static_cast<size_t>(server_->cfg_.max_connections) /
         static_cast<size_t>(server_->cfg_.resolved_reactor_count());
     pending_task_cap_ = std::max(k_min_pending_tasks, share * 4);
+    data_task_cap_ = pending_task_cap_ - k_control_task_reserve;
     // Both batch vectors reserve the cap up front, so the swap in
     // process_pending() never allocates.
     try {
@@ -1807,10 +1858,17 @@ inline void sub_reactor::process_pending() noexcept {
 }
 
 inline bool sub_reactor::enqueue(queue_task task) noexcept {
+    // A reply flood stops at data_task_cap_; close/drain/park and
+    // new-connection tasks may use the reserved slots up to the full cap.
+    // Same deque, so submission order (answer, then close) is unchanged.
+    // Both caps are written before this reactor's thread starts and never
+    // change while it runs, so reading them here, outside the mutex, is safe.
+    const size_t cap = std::holds_alternative<send_task>(task)
+                           ? data_task_cap_ : pending_task_cap_;
     {
         std::lock_guard<std::mutex> lk(pending_mutex_);
         if (!running_.load() || !server_->is_running() ||
-            pending_tasks_.size() >= pending_task_cap_) {
+            pending_tasks_.size() >= cap) {
             server_->stats_ref().queue_drops.fetch_add(
                 1, std::memory_order_relaxed);
             return false;
@@ -3525,12 +3583,10 @@ inline void multi_reactor_server::close_listen_socket() noexcept {
     bound_port_.store(0, std::memory_order_release);
 }
 
-inline bool multi_reactor_server::start() noexcept {
-    if (callback_server_ == this) return false;
-    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
-    if (life_.load(std::memory_order_acquire) != life::stopped) return false;
-    life_.store(life::starting, std::memory_order_release);
-    failed_.store(false, std::memory_order_release);
+// Checks and resolves everything start() needs before it acquires a resource.
+// Refusal is just false: start()'s rollback guard owns the lifecycle reset and
+// every cleanup, so no branch here can forget one.
+inline bool multi_reactor_server::validate_start_config() noexcept {
     if (!reactors_.empty() || accept_thread_.joinable() ||
         cfg_.rbuf_capacity < MAX_FRAME_SIZE ||
         cfg_.wbuf_capacity < FRAME_HEADER_SIZE ||
@@ -3542,26 +3598,10 @@ inline bool multi_reactor_server::start() noexcept {
         cfg_.handler_threads < 0 ||
         cfg_.handler_threads > config::k_max_handler_threads ||
         (cfg_.handler_threads > 0 && cfg_.handler_queue_limit == 0)) {
-        life_.store(life::stopped, std::memory_order_release);
         return false;
     }
 
-    // Deadline granularity: these timeouts only fire on tick boundaries, so a
-    // tick coarser than the deadline silently stretches it by up to a full
-    // tick. Warn rather than refuse -- a coarse tick with long deadlines is a
-    // legitimate choice; a coarse tick with a 200ms promise is a surprise.
-    if (cfg_.tick_ms > cfg_.close_linger_ms ||
-        cfg_.tick_ms > cfg_.idle_timeout_ms ||
-        static_cast<int64_t>(cfg_.tick_ms) >
-            cfg_.resolved_frame_assembly_timeout_ms()) {
-        std::fprintf(stderr,
-                     "[warn] tick_ms=%d is coarser than close_linger_ms=%d / "
-                     "idle_timeout_ms=%d / frame_assembly_timeout_ms=%" PRId64
-                     ": these deadlines only fire on tick boundaries, so each "
-                     "can land up to a full tick late\n",
-                     cfg_.tick_ms, cfg_.close_linger_ms, cfg_.idle_timeout_ms,
-                     cfg_.resolved_frame_assembly_timeout_ms());
-    }
+    warn_deadline_granularity();
 
     // Configuration validation
     if (cfg_.max_pending_bytes > cfg_.wbuf_capacity) {
@@ -3579,7 +3619,6 @@ inline bool multi_reactor_server::start() noexcept {
                          "0 < low < high <= max_pending_bytes "
                          "(low=%zu high=%zu max_pending_bytes=%zu)\n",
                          low, high, cfg_.max_pending_bytes);
-            life_.store(life::stopped, std::memory_order_release);
             return false;
         }
     }
@@ -3591,7 +3630,6 @@ inline bool multi_reactor_server::start() noexcept {
         std::fprintf(
             stderr,
             "[error] rbuf_capacity + wbuf_capacity overflows size_t\n");
-        life_.store(life::stopped, std::memory_order_release);
         return false;
     }
     per_conn_buffer_bytes_ = cfg_.per_connection_buffer_bytes();
@@ -3605,7 +3643,6 @@ inline bool multi_reactor_server::start() noexcept {
                      "max_connections_per_ip=%d\n",
                      per_conn_buffer_bytes_, max_buffer_bytes_,
                      cfg_.max_connections_per_ip);
-        life_.store(life::stopped, std::memory_order_release);
         return false;
     }
     if (max_buffer_bytes_ / per_conn_buffer_bytes_ <
@@ -3624,19 +3661,39 @@ inline bool multi_reactor_server::start() noexcept {
             std::fprintf(stderr,
                          "[error] could not allocate the per-IP admission "
                          "table\n");
-            life_.store(life::stopped, std::memory_order_release);
             return false;
         }
     }
+    return true;
+}
 
-    // ---- fd ceiling: raise it if we can, and say how far it goes if we cannot
-    // ----
-    // Warning and starting anyway hands operations a server that accepts the
-    // first thousand connections and then refuses everything without a word,
-    // which is worse than refusing to boot: it looks healthy until it isn't.
-    // Raising the soft limit is the one action here that cannot make things
-    // worse -- the hard ceiling stays where the environment put it -- so try it
-    // before reporting anything.
+// Deadline granularity: these timeouts only fire on tick boundaries, so a tick
+// coarser than the deadline silently stretches it by up to a full tick. Warn
+// rather than refuse -- a coarse tick with long deadlines is a legitimate
+// choice; a coarse tick with a 200ms promise is a surprise.
+inline void multi_reactor_server::warn_deadline_granularity() noexcept {
+    if (cfg_.tick_ms > cfg_.close_linger_ms ||
+        cfg_.tick_ms > cfg_.idle_timeout_ms ||
+        static_cast<int64_t>(cfg_.tick_ms) >
+            cfg_.resolved_frame_assembly_timeout_ms()) {
+        std::fprintf(stderr,
+                     "[warn] tick_ms=%d is coarser than close_linger_ms=%d / "
+                     "idle_timeout_ms=%d / frame_assembly_timeout_ms=%" PRId64
+                     ": these deadlines only fire on tick boundaries, so each "
+                     "can land up to a full tick late\n",
+                     cfg_.tick_ms, cfg_.close_linger_ms, cfg_.idle_timeout_ms,
+                     cfg_.resolved_frame_assembly_timeout_ms());
+    }
+}
+
+// ---- fd ceiling: raise it if we can, and say how far it goes if we
+// cannot ----
+// Warning and starting anyway hands operations a server that accepts the first
+// thousand connections and then refuses everything without a word, which is
+// worse than refusing to boot: it looks healthy until it isn't. Raising the
+// soft limit is the one action here that cannot make things worse -- the hard
+// ceiling stays where the environment put it -- so try it before reporting.
+inline void multi_reactor_server::warn_fd_ceiling() noexcept {
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         // Descriptors the server needs besides one per connection: the accept
@@ -3677,10 +3734,84 @@ inline bool multi_reactor_server::start() noexcept {
                 cur > overhead ? cur - overhead : 0);
         }
     }
+}
 
-    if (!init_listen_socket()) {
-        life_.store(life::stopped, std::memory_order_release); return false;
+// Starts every reactor. A partial set is left in place for the caller's
+// rollback guard, which is the single owner of teardown; a reactor that never
+// made it into the vector is cleaned by its own destructor.
+inline bool multi_reactor_server::start_reactors() noexcept {
+    // Same resolution as everywhere else; see config::resolved_reactor_count
+    // for why this is not computed here.
+    const int n_reactors = cfg_.resolved_reactor_count();
+    try {
+        reactors_.reserve(static_cast<size_t>(n_reactors));
+        for (int i = 0; i < n_reactors; ++i) {
+            auto r = std::make_unique<sub_reactor>(i, this);
+            if (!r->start()) return false;
+            reactors_.push_back(std::move(r));
+        }
+        return true;
+    } catch (...) {
+        return false;
     }
+}
+
+// Startup handshake: returns once the accept thread reports in. Success means
+// "the accept loop is armed, no component has failed, and the handler pool is
+// up", not "the lifecycle counter is still false". A component that died
+// during bring-up raises failed_ instead of rewriting the lifecycle state, so
+// the verdict returned here cannot be flipped out from under the caller.
+inline bool multi_reactor_server::start_accept_and_handlers() noexcept {
+    accepting_.store(true, std::memory_order_release);
+    try {
+        auto ready = std::make_shared<std::promise<bool>>();
+        auto fut = ready->get_future();
+        accept_thread_ = std::thread([this, ready]() noexcept {
+            accept_loop(*ready);
+        });
+        if (fut.get()) {
+            return !failed_.load(std::memory_order_acquire) &&
+                   start_handler_pool();
+        }
+    } catch (...) {
+    }
+    return false;
+}
+
+// Undo every resource phase start() may have reached. Safe at any point after
+// start() publishes `starting`: fields that were never created are -1 or
+// empty. The wake makes a parked accept thread leave epoll_wait(...,500)
+// immediately; the join still happens before any descriptor is touched, and
+// its own guard has normally closed them already.
+inline void multi_reactor_server::rollback_start() noexcept {
+    accepting_.store(false, std::memory_order_release);
+    wake_accept_loop();
+    life_.store(life::stopping, std::memory_order_release);
+    stop_handler_pool();
+    if (accept_thread_.joinable()) accept_thread_.join();
+    for (auto& r : reactors_) r->stop();
+    reactors_.clear();
+    close_accept_descriptors();
+    failed_.store(false, std::memory_order_release);
+    life_.store(life::stopped, std::memory_order_release);
+}
+
+inline bool multi_reactor_server::start() noexcept {
+    if (callback_server_ == this) return false;
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    if (life_.load(std::memory_order_acquire) != life::stopped) return false;
+    life_.store(life::starting, std::memory_order_release);
+    failed_.store(false, std::memory_order_release);
+    // Armed before validation: every refusal below, including a configuration
+    // check that forgets its own cleanup, lands in the same rollback. Fields
+    // that do not exist yet are -1 or empty there.
+    start_rollback rollback{this};
+
+    if (!validate_start_config()) return false;
+
+    warn_fd_ceiling();
+
+    if (!init_listen_socket()) return false;
 
     // ---- running must be visible before any worker thread is constructed ----
     // Every worker asks is_running() whether it should keep working, and every
@@ -3698,80 +3829,16 @@ inline bool multi_reactor_server::start() noexcept {
     // socket was accepted and closed again immediately, no logs, no counters
     // anyone thinks to read.
     //
-    // Everything above here already fails through the recovery path below and
+    // Everything above here already fails through the rollback guard and
     // reports false; everything below here is threads that read this value the
     // moment they come into existence. There is nothing left to wait for.
     life_.store(life::running, std::memory_order_release);
 
-    // Same resolution as everywhere else; see config::resolved_reactor_count
-    // for why this is not computed here.
-    int n_reactors = cfg_.resolved_reactor_count();
+    if (!start_reactors()) return false;
+    if (!start_accept_and_handlers()) return false;
 
-    try {
-        reactors_.reserve(n_reactors);
-    }
-    catch (...) {
-        close_listen_socket();
-        life_.store(life::stopped, std::memory_order_release);
-        return false;
-    }
-
-    try {
-    for (int i = 0; i < n_reactors; ++i) {
-        auto r = std::make_unique<sub_reactor>(i, this);
-        if (!r->start()) {
-            for (auto& rr : reactors_) rr->stop();
-            reactors_.clear();
-            close_listen_socket();
-            life_.store(life::stopped, std::memory_order_release); return false;
-        }
-        reactors_.push_back(std::move(r));
-    }
-    } catch (...) {
-        for (auto& r : reactors_) r->stop();
-        reactors_.clear();
-        close_listen_socket();
-        life_.store(life::stopped, std::memory_order_release); return false;
-    }
-
-    // ---- startup handshake: start() returns once the accept thread reports in
-    // ----
-    // Success means "the accept loop is armed and no component has failed yet",
-    // not "the lifecycle counter is still false". A component that died during
-    // bring-up raises failed_ instead of rewriting the lifecycle state, so the
-    // verdict returned here cannot be flipped out from under the caller.
-    // running itself was published further up, before any worker existed.
-    accepting_.store(true, std::memory_order_release);
-    try {
-        auto ready = std::make_shared<std::promise<bool>>();
-        auto fut = ready->get_future();
-        accept_thread_ = std::thread([this, ready]() noexcept {
-            accept_loop(*ready);
-        });
-        if (fut.get()) {
-            if (!failed_.load(std::memory_order_acquire) &&
-                start_handler_pool()) {
-                return true;
-            }
-        }
-    } catch (...) {
-    }
-    accepting_.store(false, std::memory_order_release);
-    life_.store(life::stopping, std::memory_order_release);
-    stop_handler_pool();
-    if (accept_thread_.joinable()) accept_thread_.join();
-    for (auto& r : reactors_) r->stop();
-    reactors_.clear();
-    if (wake_fd_ >= 0) {
-        ::close(wake_fd_); wake_fd_ = -1;
-    }
-    if (epoll_fd_ >= 0) {
-        ::close(epoll_fd_); epoll_fd_ = -1;
-    }
-    close_listen_socket();
-    failed_.store(false, std::memory_order_release);
-    life_.store(life::stopped, std::memory_order_release);
-    return false;
+    rollback.dismiss();
+    return true;
 }
 
 inline void multi_reactor_server::stop() noexcept {
@@ -3896,6 +3963,12 @@ inline void multi_reactor_server::wake_accept_loop() noexcept {
 }
 
 inline bool multi_reactor_server::start_handler_pool() noexcept {
+    // Checked before the no-pool return, so arming the failpoint always refuses
+    // and is always consumed, whatever handler_threads is.
+    if (fail_handler_pool_for_test.load(std::memory_order_relaxed)) {
+        fail_handler_pool_for_test.store(false, std::memory_order_relaxed);
+        return false;
+    }
     if (cfg_.handler_threads <= 0) return true;
     handler_running_.store(true, std::memory_order_release);
     try {
@@ -4049,6 +4122,14 @@ inline void multi_reactor_server::close_accept_descriptors() noexcept {
     close_listen_socket();
 }
 
+// The rescue returns to the accept round when the victim accept was
+// interrupted or the queued peer aborted: neither says the backlog was empty.
+// Any other failure (notably EAGAIN) means nothing was waiting, so the round
+// should stop rather than spend its remaining budget.
+inline bool accept_salvage_retries(int victim_errno) noexcept {
+    return victim_errno == EINTR || victim_errno == ECONNABORTED;
+}
+
 // EMFILE and ENFILE, answered without giving up the accept round. progress
 // means a client was turned away or the round can retry immediately; backoff
 // means the table is full and nothing local can change that; stop means the
@@ -4105,7 +4186,7 @@ multi_reactor_server::salvage_descriptor_exhaustion(
     // progress, so the caller returns to epoll_wait instead of spending the
     // rest of this round's 64. EINTR and ECONNABORTED describe the attempt,
     // not an empty queue, so the round keeps its budget and retries.
-    if (victim < 0 && victim_errno != EINTR && victim_errno != ECONNABORTED)
+    if (victim < 0 && !accept_salvage_retries(victim_errno))
         return accept_salvage::stop;
     return accept_salvage::progress;
 }
