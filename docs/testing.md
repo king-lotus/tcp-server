@@ -1,6 +1,6 @@
 # Testing
 
-Nine suites, eleven runs, three configurations. `verify/run.sh` is the
+Eleven suites, thirteen runs, three configurations. `verify/run.sh` is the
 authority; `CMakeLists.txt` mirrors it for `ctest`. What follows is how a suite
 is written, and why the client half of every one of them now lives in a single
 file.
@@ -9,7 +9,7 @@ file.
 
 ```
 bash verify/run.sh                               # plain only
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 33 configurations
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 39 configurations
 ```
 
 Each run is a separate build: ASan and TSan cannot be linked into one binary, and
@@ -17,9 +17,14 @@ a suite that only passes under a sanitizer is a different claim from one that
 passes without. A hang is bounded by `timeout 180`; a failure is a non-zero exit,
 which is the only thing the runner reads.
 
-The suites live in `verify/`. The fifteen programs under
-`verify/evidence/` are not part of this: each settles one claim against a
-history that has since changed, and they are not wired into the runner.
+The suites live in `verify/`. Most probes under `verify/evidence/` are not part
+of this: each settles one claim against a history that has since changed. The
+EMFILE probe is the exception — `verify/evidence/run_emfile.sh` builds and runs
+it with assertions, CI calls that script in its own step, and
+`ENABLE_SLOW=1 bash verify/run.sh` adds it to a local run. It is deliberately
+outside the three-configuration matrix: the claim is about accept-queue
+behaviour under a low descriptor ceiling, not about sanitizers. A host that
+never reaches EMFILE prints `[SKIP]` instead of a pass.
 
 ## Writing a suite
 
@@ -108,7 +113,7 @@ after a reset has been reported once, `recv()` returns 0, which is
 indistinguishable from an orderly FIN, so a second `expect_close(fin)` relabelled a
 reset connection as a clean one. `peer` now remembers what it observed.
 
-running the full 33 configurations -- not only the suites that were touched --
+running the full 39 configurations -- not only the suites that were touched --
 caught the other: `port_is_listening` closed its probe descriptor twice when the
 connect succeeded, and the second close could land on a descriptor number the
 accept loop had just handed out. TSan reported it once, in a suite the change had

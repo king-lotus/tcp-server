@@ -15,8 +15,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 proj="$(dirname "$(dirname "$here")")"
 cd "$proj"
 
-out="/tmp/$(basename "$src" .cpp)"
-flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -O1)
+# Same output directory as run.sh: under the home cache by default, never /tmp
+# unless asked for. VERIFY_OUT_DIR overrides both.
+out_dir="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
+mkdir -p "$out_dir"
+out="$out_dir/$(basename "$src" .cpp)"
+flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -O1 -Iinclude)
 case "$src" in
     *fault_injection*) flags+=(-DINDUSTRIAL_TCP_TESTING) ;;
 esac

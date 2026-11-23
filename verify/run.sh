@@ -14,6 +14,9 @@
 #                   proven fixed rather than merely not observed.
 #   ENABLE_TSAN=1   rebuild under ThreadSanitizer, which is what every published
 #                   race in this file ultimately needed.
+#   ENABLE_SLOW=1   also run the EMFILE probe, a separate kernel-behaviour
+#                   assertion with its own timeout. CI calls its script
+#                   directly instead of rerunning the matrix here.
 #
 # Both are separate configurations rather than one combined build: ASan and TSan
 # cannot be linked into the same binary, and a run under either is slow enough
@@ -28,6 +31,13 @@ proj="$(dirname "$here")"
 cd "$proj"
 
 echo "== project: $proj =="
+
+# Build artifacts live under the home cache by default rather than /tmp, which
+# some sandboxes mount in a way that makes every compile ask for permission.
+# VERIFY_OUT_DIR overrides it.
+out="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
+mkdir -p "$out"
+echo "== build dir: $out =="
 
 # ---- toolchain ------------------------------------------------------------
 if ! command -v g++ >/dev/null 2>&1; then
@@ -48,16 +58,18 @@ base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
 build() {
     local label="$1"; shift
     echo "== building [$label] =="
-    g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o /tmp/close_semantics
-    g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o /tmp/idle_semantics
-    g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o /tmp/ping_pong
-    g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o /tmp/send_results
-    g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o /tmp/backpressure
+    g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o "$out/close_semantics"
+    g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o "$out/idle_semantics"
+    g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o "$out/ping_pong"
+    g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o "$out/send_results"
+    g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o "$out/backpressure"
     g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
-        -o /tmp/fault_injection
-    g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o /tmp/reactor_spread
-    g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o /tmp/config_budget
-    g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o /tmp/harness_selftest
+        -o "$out/fault_injection"
+    g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o "$out/reactor_spread"
+    g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o "$out/config_budget"
+    g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o "$out/harness_selftest"
+    g++ "${base_flags[@]}" "$@" verify/watermark.cpp -o "$out/watermark"
+    g++ "${base_flags[@]}" "$@" verify/hardening.cpp -o "$out/hardening"
 }
 
 run_all() {
@@ -75,17 +87,19 @@ run_all() {
     fi
     echo "---- running [$label] ----"
 
-    for attempt in "close_semantics, default reactors:/tmp/close_semantics" \
-                   "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 /tmp/close_semantics" \
-                   "idle_semantics:/tmp/idle_semantics" \
-                   "ping_pong:/tmp/ping_pong" \
-                   "send_results:/tmp/send_results" \
-                   "backpressure:/tmp/backpressure" \
-                   "fault_injection:/tmp/fault_injection" \
-                   "reactor_spread, default reactors:/tmp/reactor_spread" \
-                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread" \
-                   "config_budget:/tmp/config_budget" \
-                   "harness_selftest:/tmp/harness_selftest"; do
+    for attempt in "close_semantics, default reactors:$out/close_semantics" \
+                   "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 $out/close_semantics" \
+                   "idle_semantics:$out/idle_semantics" \
+                   "ping_pong:$out/ping_pong" \
+                   "send_results:$out/send_results" \
+                   "backpressure:$out/backpressure" \
+                   "fault_injection:$out/fault_injection" \
+                   "reactor_spread, default reactors:$out/reactor_spread" \
+                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 $out/reactor_spread" \
+                   "config_budget:$out/config_budget" \
+                   "harness_selftest:$out/harness_selftest" \
+                   "watermark:$out/watermark" \
+                   "hardening:$out/hardening"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
@@ -155,13 +169,25 @@ build "plain"
 run_all "plain" || overall=1
 
 if [ "${ENABLE_ASAN:-0}" = "1" ]; then
-    build "asan+ubsan" -g -fsanitize=address,undefined -fno-omit-frame-pointer
+    # -fno-sanitize=vptr: the vptr check false-positives on make_shared's
+    # in-place control blocks under ASan -- it reports at the release, the copy
+    # and the construction site, while Valgrind finds no invalid access, ASan's
+    # own use-after-free tracking is silent, and TSan is silent. Evidence and
+    # reproduction: docs/emfile-test-checklist.md,
+    # verify/evidence/repro_ubsan_vptr.sh.
+    build "asan+ubsan" -g -fsanitize=address,undefined -fno-sanitize=vptr \
+          -fno-omit-frame-pointer
     run_all "asan+ubsan" || overall=1
 fi
 
 if [ "${ENABLE_TSAN:-0}" = "1" ]; then
     build "tsan" -g -fsanitize=thread -fno-omit-frame-pointer
     run_all "tsan" || overall=1
+fi
+
+if [ "${ENABLE_SLOW:-0}" = "1" ]; then
+    bash verify/evidence/run_emfile.sh || overall=1
+    echo
 fi
 
 cat <<EOF
@@ -205,7 +231,9 @@ cat <<EOF
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as
     an ordinary FIN: EPOLLHUP|EPOLLERR is then never delivered, so the branch
-    cannot be reached from there.
+    cannot be reached from there. The EMFILE probe can do the same when the
+    accept queue never reaches the descriptor ceiling; it runs only with
+    ENABLE_SLOW=1 or as verify/evidence/run_emfile.sh in CI.
 
  If a case fails, paste the whole output back -- first without CS_REACTORS, then
  with it.

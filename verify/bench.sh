@@ -73,9 +73,13 @@ for line in open(sys.argv[1], encoding="utf-8"):
         if name in ("connections", "reactors", "clients", "payload"):
             continue
         try:
-            groups[key][name].append(float(value))
+            number = float(value)
         except ValueError:
-            pass
+            # e.g. mode=same: a grouping key, not a measurable. Converting
+            # before touching groups[key][name] keeps the failed name from
+            # leaving an empty list that median() later rejects.
+            continue
+        groups[key][name].append(number)
 
 print()
 print("%-10s %-26s %s" % ("measure", "config", "median"))

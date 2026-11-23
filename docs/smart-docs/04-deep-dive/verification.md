@@ -59,7 +59,9 @@ flowchart LR
 | `backpressure` | Reactor queue fan-out, close requests dropped when the queue is full |
 | `fault_injection` | Worker and accept exceptions, restart after failure, rejected configuration, message handler throws |
 | `reactor_spread` | Round-robin placement, and that it follows the configured reactor count |
-| `config_budget` | Default buffer budget and ring buffer commit behaviour |
+| `config_budget` | Default buffer budget, new admission/watermark validation, ring buffer commit behaviour |
+| `watermark` | Pausing at the high mark, resuming at the low mark, close overrides the pause, assembly-deadline and idle exemptions |
+| `hardening` | Unique ids under churn, close-callback containment, global byte budget, per-IP cap, opt-in `SO_REUSEPORT` |
 | `harness_selftest` | The harness itself: send, split, FIN, RST, timeout, raw sockets |
 
 Two suites run twice — `close_semantics` at one reactor and at the default, and

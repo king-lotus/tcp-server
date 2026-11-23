@@ -61,6 +61,16 @@ jobs:
           set -o pipefail
           bash verify/run.sh 2>&1 | tee /tmp/verify-run.log
 
+      # Separate from the matrix above: this is one kernel-behaviour assertion,
+      # not something that needs three sanitizer builds. It used to be possible
+      # for the spare-descriptor path to regress while all 39 runs stayed green,
+      # because the probe lived in verify/evidence/ and nothing called it. The
+      # probe lowers its own descriptor ceiling and fails if the victim waits,
+      # is not reset, or the listener does not recover; a kernel that never
+      # reaches EMFILE reports [SKIP] rather than a pass.
+      - name: EMFILE probe
+        run: bash verify/evidence/run_emfile.sh
+
       # Three reasons this exists, and the second one is why the first version
       # of it was not enough.
       #

@@ -1,6 +1,6 @@
 # close_fsm — extract the graceful-close protocol
 
-Status: **spec (draft)** · 2026-11-09 · not yet implemented.
+Status: **implemented** · 2026-11-09.
 
 ## Context
 
@@ -21,7 +21,8 @@ This spec defines `close_fsm`, a **pure state machine** that owns the close stat
 **Goals**
 
 - Concentrate the close invariants (the `fin_sent`-vs-`closing` split, the one-round
-  deferral, the `close_input_bytes` budget, the linger deadline) behind one small seam.
+  deferral, the `close_input_bytes` budget, the close timestamp the linger deadline
+  measures from) behind one small seam.
 - Make the close protocol unit-testable without a live socket.
 - Make the reactor's nine close methods thin callers of one state machine.
 
@@ -54,13 +55,15 @@ close fields and the decision logic in the nine methods.
 
 | field | type | replaces |
 |---|---|---|
-| `closing` | `bool` | `connection::closing` (reactor-thread-only half; the atomic stays readable) |
+| `closing` | `std::atomic<bool>` | `connection::closing` |
+| `close_requests` | `std::atomic<uint32_t>` | `connection::close_requests` |
+| `close_wanted` | `std::atomic<bool>` | queue-refused close, retried by `do_tick` |
 | `fin_sent` | `bool` | `connection::fin_sent` |
 | `deferred_round` | `enum { none, close, peer_closed }` | `connection::deferred_round` |
+| `draining_input` | `bool` | new: the close's serving window (suppresses the read high-water pause) |
 | `close_input_bytes` | `int64_t` | `connection::close_input_bytes` |
 | `close_started_at_ms` | `int64_t` | `connection::close_started_at_ms` |
-| `fin_sent_at_ms` | `int64_t` | `connection::fin_sent_at_ms` |
-| `state` | `enum { OPEN, DRAINING_INPUT, PARKED, FIN_SENT, CLOSED }` | *new* — the phase, made explicit |
+| `is_closed` | `std::atomic<bool>` | `connection::is_closed` |
 
 The cross-thread atomics `close_requests` and `is_closed` move into the FSM but keep
 their atomicity and memory orders; `pending_bytes` stays on `connection` (the FSM
@@ -85,30 +88,31 @@ enum class close_action {
     none,
     drain_input,         // serve buffered input (run handle_read)
     drain_wbuf,          // move wbuf into the kernel
+    drain_complete,      // wbuf drained empty: the close decision is next
     send_fin,            // shutdown(SHUT_WR)
     defer_drain_input,   // queue one more input-serving round
     defer_park,          // queue one park round (replies land first)
     defer_peer_closed,   // queue one peer-closed round
-    wait_peer_fin,       // FIN is out; keep reading for the peer's FIN
     close_graceful,      // teardown, orderly
     close_abort,         // teardown, RST
 };
 
 class close_fsm {
   public:
-    close_action on_request();                    // public close_connection / stop_gracefully
-    close_action on_graceful();                   // internal graceful close (idle timeout)
-    close_action on_input_drained(int served);    // a serving round finished
-    close_action on_drain_result(drain_outcome r);// a wbuf drain finished
-    close_action on_fin_shutdown(bool ok);        // shutdown(SHUT_WR) result
-    close_action on_peer_fin();                   // recv returned 0
-    close_action on_deadline();                   // close_linger expired
-    close_action on_abort();                      // protocol error / hup / resource / stop
-    // state getters for the atomics the reactor still publishes
+    close_action on_request();                              // public close / stop_gracefully
+    close_action on_graceful();                             // internal graceful close
+    close_action on_input_drained(int served, int64_t dealt);
+    close_action on_input_defer_failed();                   // after the input-defer hand-off failed
+    close_action on_drain_result(drain_outcome r);
+    close_action on_peer_fin();
 };
 ```
 
-`drain_outcome` (544) is reused unchanged: `drained / stalled / dead / error`.
+`drain_outcome` is reused unchanged: `drained / stalled / dead / error`. The
+shutdown result, the linger deadline, and the abort path do not have their own
+FSM events: `try_begin_write_shutdown` and `close_conn(..., graceful=false)` are
+reactor effects, not decisions, so they are called inline by the reactor rather
+than returned as an action.
 
 ## State machine
 
@@ -120,17 +124,14 @@ stateDiagram-v2
     DRAINING_INPUT --> DRAINING_INPUT : on_input_drained / defer_drain_input
     DRAINING_INPUT --> PARKED : on_input_drained / drain_wbuf (or defer_park)
     PARKED --> PARKED : on_drain_result(stalled) / none
-    PARKED --> FIN_SENT : on_drain_result(drained) + on_fin_shutdown(ok) / send_fin
+    PARKED --> FIN_SENT : on_drain_result(drained) / drain_complete, then shutdown
     PARKED --> CLOSED : on_drain_result(dead|error) / close_abort
-    FIN_SENT --> FIN_SENT : on_peer_fin / wait_peer_fin
     FIN_SENT --> CLOSED : on_peer_fin / close_graceful
     PARKED --> CLOSED : on_peer_fin / close_graceful (or defer_peer_closed)
-    DRAINING_INPUT --> CLOSED : on_abort / close_abort
-    PARKED --> CLOSED : on_abort / close_abort
-    FIN_SENT --> CLOSED : on_abort / close_abort
-    OPEN --> CLOSED : on_abort / close_abort
-    PARKED --> CLOSED : on_deadline / close_abort
-    FIN_SENT --> CLOSED : on_deadline / close_abort
+    DRAINING_INPUT --> CLOSED : close_conn(false) / close_abort
+    PARKED --> CLOSED : close_conn(false) / close_abort
+    FIN_SENT --> CLOSED : close_conn(false) / close_abort
+    OPEN --> CLOSED : close_conn(false) / close_abort
     CLOSED --> [*]
 ```
 
@@ -138,26 +139,27 @@ stateDiagram-v2
 
 | state | event | action | next state |
 |---|---|---|---|
-| OPEN | `on_request()` | `drain_input` (or `drain_wbuf` if rbuf empty) | DRAINING_INPUT (or PARKED) |
+| OPEN | `on_request()` | `drain_input` (even if rbuf is empty: the read still runs once) | DRAINING_INPUT |
 | OPEN | `on_graceful()` | `drain_wbuf` | PARKED |
 | DRAINING_INPUT | `on_input_drained(served>0, more buffered, budget left)` | `defer_drain_input` | DRAINING_INPUT |
-| DRAINING_INPUT | `on_input_drained(served==0, pending_bytes>0)` | `defer_park` | PARKED |
+| DRAINING_INPUT | `on_input_drained(served==0, pending_bytes>0, first time)` | `defer_park` | PARKED |
+| DRAINING_INPUT | `on_input_drained(served>0, nothing buffered, first time)` | `defer_park` (the queued park round drains) | PARKED |
 | DRAINING_INPUT | `on_input_drained(otherwise)` | `drain_wbuf` | PARKED |
 | PARKED | `on_drain_result(stalled)` | `none` (EPOLLOUT resumes) | PARKED |
-| PARKED | `on_drain_result(drained)` | `send_fin` | FIN_SENT if `shutdown` ok, else stay PARKED |
+| PARKED | `on_drain_result(drained)` | `drain_complete` (reactor then `shutdown`; on failure the linger deadline ends it) | FIN_SENT or PARKED |
 | PARKED | `on_drain_result(dead \| error)` | `close_abort` | CLOSED |
 | PARKED | `on_peer_fin()` with wbuf non-empty | `none` (drop read interest, handle_write resumes) | PARKED |
-| PARKED | `on_peer_fin()` with wbuf empty, `pending_bytes>0`, first time | `defer_peer_closed` | PARKED |
+| PARKED | `on_peer_fin()` with wbuf empty, `pending_bytes>0`, no round owed | `defer_peer_closed` | PARKED |
+| PARKED | `on_peer_fin()` with wbuf empty, `pending_bytes>0`, close round still owed | `defer_peer_closed` (the queued park task runs first; the round is taken over, not read as spent) | PARKED |
 | PARKED | `on_peer_fin()` with closing and nothing owed | `send_fin` | FIN_SENT |
 | PARKED | `on_peer_fin()` otherwise | `close_graceful` | CLOSED |
-| FIN_SENT | `on_peer_fin()` | `wait_peer_fin` then `close_graceful` | CLOSED |
-| any non-CLOSED | `on_deadline()` | `close_abort` | CLOSED |
-| any non-CLOSED | `on_abort()` | `close_abort` | CLOSED |
+| FIN_SENT | `on_peer_fin()` | `close_graceful` | CLOSED |
 
-The `on_peer_fin()` rows condense `finish_peer_closed` (1968–2035): the epoll
+The `on_peer_fin()` rows condense `finish_peer_closed`: the epoll
 interest-registration dance that parks a half-closed connection is a reactor effect,
-not an FSM decision — the FSM returns `none`/`wait_peer_fin`, and the reactor keeps
-the exact epoll handling (including the `ENOENT` recovery path).
+not an FSM decision — the FSM returns `none`, and the reactor keeps the exact epoll
+handling (including the `ENOENT` recovery path). The linger deadline and the abort
+path (`close_conn(..., graceful=false)`) are reactor effects too, not FSM events.
 
 ## Reactor contract
 
@@ -167,15 +169,27 @@ Each action maps to one reactor effect. The FSM decides **which**; the reactor d
 | action | reactor does |
 |---|---|
 | `none` | nothing; the next event comes from epoll/tick |
-| `drain_input` | run `handle_read` (with its read/frame budgets); feed `on_input_drained(served)` |
+| `drain_input` | run `handle_read` (with its read/frame budgets); feed `on_input_drained(served, dealt)` |
 | `drain_wbuf` | `drain_wbuf_to_socket`; feed `on_drain_result(...)`; arm EPOLLOUT on `stalled` |
-| `send_fin` | `shutdown(fd, SHUT_WR)`; feed `on_fin_shutdown(ok)`; `disarm_write` on success |
-| `defer_drain_input` | enqueue `drain_input_task{id}`; on queue-full, fall through to park |
+| `drain_complete` | wbuf is empty: `try_begin_write_shutdown` (park_close) or the peer_closed/closing decision (handle_write) |
+| `send_fin` | `shutdown(fd, SHUT_WR)`; `disarm_write` on success |
+| `defer_drain_input` | enqueue `drain_input_task{id}`; on queue-full, re-decide via `on_input_defer_failed` |
 | `defer_park` | enqueue `park_close_task{id}`; on queue-full, park now |
 | `defer_peer_closed` | enqueue `finish_peer_closed_task{id}`; on queue-full, teardown |
-| `wait_peer_fin` | keep read interest armed; the next `recv()==0` raises `on_peer_fin()` |
 | `close_graceful` | `teardown_closed(..., graceful=true)` |
 | `close_abort` | `teardown_closed(..., graceful=false)` (RST via `SO_LINGER{1,0}`) |
+
+**Request delivery.** `close_connection` counts the request first, then tries
+the reactor queue. If the queue refuses it, `close_wanted` records the request
+on the FSM and `do_tick` performs the same drain-then-close one tick later; the
+close is delayed, not lost. A connection that is already `closing` needs no
+retry. Read-side backpressure is overridden by a close: `drain_input_then_close`
+and `park_close` resume reading, the drain round sets `draining_input` so the
+high-water pause cannot reapply before the first buffered frame is served, and
+the existing `close_input_bytes` budget and `close_linger_ms` bound how much
+input the close may consume. Replies the drain produces still meet the normal
+`send_to` ceiling: a frame over it is refused as `overloaded` (counted), not
+silently lost to a teardown.
 
 **Where the side effects stay** (all in the reactor, none in the FSM):
 
@@ -192,9 +206,10 @@ as a plain struct holding the fields; behaviour moves into it one method at a ti
 1. **Introduce `close_fsm`** as a nested struct holding the ten fields (rename nothing
    yet; `connection` delegates to `fsm.closing`, etc.). Pure mechanical move.
 2. **Move the pure decisions** — `try_begin_write_shutdown`'s emptiness check, the
-   `deferred_round` bookkeeping, the `close_input_bytes` budget, the linger deadline
-   — into `on_*` methods that return the action enum. The nine methods become thin
-   callers that perform the returned action.
+   `deferred_round` bookkeeping, the `close_input_bytes` budget, and the
+   `close_started_at_ms` stamp the linger deadline measures from — into `on_*`
+   methods that return the action enum. The nine methods become thin callers that
+   perform the returned action. `do_tick` still computes the deadline itself.
 3. **Remove the scattered flags** once no reactor code reads them directly.
 4. **Add the unit tests** (below) alongside, and run `verify/run.sh` (plain + ASan +
    TSan) after each slice.
@@ -207,22 +222,27 @@ No step changes wire behaviour; `close_semantics`, `idle_semantics`, `ping_pong`
 **Surviving (integration, unchanged):** `close_semantics` (FIN-vs-RST, mid-close
 reads, counter closure), `idle_semantics`, `ping_pong`, `backpressure`, `fault_injection`.
 
-**New (unit, no socket):** drive `close_fsm` directly with a fake `wbuf`/`rbuf`/
-`pending_bytes` view and assert action + resulting state:
+**New (unit, no socket):** `run_close_fsm_unit_cases()` in `verify/close_semantics.cpp`
+drives `close_fsm` directly with a fake `wbuf`/`rbuf`/`pending_bytes` view and
+asserts the returned action:
 
-- `on_request` with empty rbuf → `drain_wbuf` (or straight to park), state PARKED.
-- `on_request` with buffered input → `drain_input`, state DRAINING_INPUT.
+- `on_request` → `drain_input`, and it measures `close_input_bytes` from rbuf.
 - `on_input_drained(served>0, more buffered, budget left)` → `defer_drain_input`.
-- `on_input_drained(served>0, no more buffered)` → `drain_wbuf`/park.
+- `on_input_drained(served>0, nothing buffered)` → `defer_park` (the queued park round drains).
 - `on_input_drained(served==0, pending_bytes>0)` → `defer_park` (one round only).
 - `on_input_drained` twice → the one-round rule: no second defer for the same round.
-- `on_drain_result(drained)` then `on_fin_shutdown(true)` → FIN_SENT.
-- `on_fin_shutdown(false)` → stays PARKED (deadline is the only way out).
+- `on_input_defer_failed` after a `defer_drain_input` enqueue failure → `defer_park`; with a `peer_closed` round already owned → `none`.
+- `on_drain_result(drained)` → `drain_complete`; `(stalled)` → `none`.
 - `on_drain_result(dead)` / `(error)` → `close_abort`.
-- `on_peer_fin` with wbuf non-empty → `none` (parked, write resumes).
+- `on_peer_fin` with wbuf non-empty → `none`.
 - `on_peer_fin` with wbuf empty + pending_bytes>0 → `defer_peer_closed` (first time only).
-- `on_deadline` from PARKED/FIN_SENT → `close_abort`.
-- `on_abort` from every non-CLOSED state → `close_abort`, idempotent thereafter.
+- `on_peer_fin` while the close's `defer_park` round is still owed → `defer_peer_closed` (the owed round is taken over, not treated as spent).
+- `on_peer_fin` with closing and nothing owed → `send_fin`.
+- `on_peer_fin` otherwise → `close_graceful`.
+
+**Integration:** `watermark` case B2 closes a read-paused connection with a
+backlog still in rbuf and asserts that every buffered request is answered before
+the FIN; case B alone only asserted the FIN.
 
 ## Out of scope / follow-ups
 

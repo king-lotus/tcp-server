@@ -183,15 +183,20 @@ int main() {
         harness::expect(refused > 0, "the queue cap actually refused frames");
 
         const uint64_t before = server.stats().close_requests_dropped.load();
-        // The returned bool is the same failure the caller can see; the counter
-        // is the one operations can see. Neither used to exist.
+        // The queue refused the task, but the request is honoured anyway: it is
+        // recorded in the connection and do_tick performs the same
+        // drain-then-close within one tick. True therefore means "accepted",
+        // not "queued", and the refusal stays visible in the counter for
+        // operations -- reporting failure here used to make callers retry a
+        // close that was already guaranteed.
         const bool queued = server.server().close_connection(
             conn_id.load(std::memory_order_acquire));
         std::printf("      close_requests_dropped +%llu, returned %s\n",
                     (unsigned long long)(server.stats().close_requests_dropped.load()
                                          - before),
                     queued ? "true" : "false");
-        harness::expect(!queued, "close_connection() reports that it did not get through");
+        harness::expect(queued,
+                        "close_connection() accepts a request the queue refused");
         harness::expect(server.stats().close_requests_dropped.load() > before,
                "a close the queue refused is counted, not swallowed");
 

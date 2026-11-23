@@ -80,6 +80,45 @@ int main() {
     std::snprintf(detail, sizeof detail, "max_connections=%d", cfg.max_connections);
     harness::expect(cfg.max_connections > 0, "max_connections admits something", detail);
 
+    // Read-side watermarks: the derived pair must be ordered and inside the
+    // output ceiling, or start() refuses.
+    const size_t high = cfg.resolved_read_high_watermark_bytes();
+    const size_t low  = cfg.resolved_read_low_watermark_bytes();
+    std::snprintf(detail, sizeof detail, "low=%zu high=%zu max_pending=%zu",
+                  low, high, cfg.max_pending_bytes);
+    harness::expect(low > 0 && low < high && high <= cfg.max_pending_bytes,
+                    "derived read watermarks are ordered and bounded", detail);
+
+    // The default budget is the bill max_connections already implies; the
+    // per-IP cap and SO_REUSEPORT are opt-in.
+    const size_t per_conn = cfg.per_connection_buffer_bytes();
+    std::snprintf(detail, sizeof detail, "budget=%zu per_conn=%zu",
+                  cfg.resolved_max_total_buffer_bytes(), per_conn);
+    harness::expect(cfg.resolved_max_total_buffer_bytes() ==
+                        static_cast<size_t>(cfg.max_connections) * per_conn,
+                    "the default buffer budget matches the count", detail);
+    std::snprintf(detail, sizeof detail, "per_ip=%d reuse_port=%d",
+                  cfg.max_connections_per_ip, (int)cfg.reuse_port);
+    harness::expect(cfg.max_connections_per_ip == 0 && !cfg.reuse_port,
+                    "per-IP limits and SO_REUSEPORT are opt-in", detail);
+
+    // Values that can never be honoured are refused rather than clamped into a
+    // server that admits nothing.
+    {
+        multi_reactor_server::config bad = cfg;
+        bad.port = 0;
+        bad.max_total_buffer_bytes = 1;
+        multi_reactor_server s(bad);
+        harness::expect(!s.start(), "a budget below one connection is refused");
+    }
+    {
+        multi_reactor_server::config bad = cfg;
+        bad.port = 0;
+        bad.max_connections_per_ip = -1;
+        multi_reactor_server s(bad);
+        harness::expect(!s.start(), "a negative per-IP cap is refused");
+    }
+
     // The in-place write API has one caller today, but a commit that trusted
     // its argument instead of the span it offered would mark bytes it never
     // wrote as readable -- stale data handed to parse_frames.
