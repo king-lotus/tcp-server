@@ -40,6 +40,9 @@
 //   I. fail_reactor_start_after_for_test -- a reactor refusing after earlier
 //      ones started must leave no partial set (epoll/eventfd/thread) behind,
 //      and the retry must succeed.
+//   J. reactor_stall_timeout_ms -- per-reactor stats sum to the lifetime
+//      aggregate, survive a restart, zero their connection counts on teardown,
+//      and expose a blocked reactor without stopping the server.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -532,6 +535,123 @@ int main() {
             harness::expect(count_open_fds() == before,
                             "destruction leaked no descriptors");
         }
+    }
+
+    // ---- J: per-reactor stats and the stall watchdog ------------------------
+    //
+    // The slots must sum to the lifetime aggregate, survive a restart with the
+    // counters intact, zero their connection counts on teardown, and expose a
+    // blocked reactor without making it fatal. A timeout at or below tick_ms
+    // is refused: an idle reactor's interval is already one tick.
+    {
+        std::printf("J. per-reactor stats and the stall watchdog\n");
+
+        {
+            multi_reactor_server::config bad = base;
+            bad.port = free_port();
+            bad.tick_ms = 500;
+            bad.reactor_stall_timeout_ms = 100;
+            multi_reactor_server s(bad);
+            harness::expect(!s.start(),
+                            "a stall timeout <= tick_ms is refused");
+            harness::expect(s.reactor_stats().empty(),
+                            "a refused start publishes no slots");
+        }
+
+        multi_reactor_server::config cfg = base;
+        cfg.port = free_port();
+        cfg.tick_ms = 20;
+        cfg.reactor_stall_timeout_ms = 100;
+        std::atomic<bool> in_handler{false};
+        std::atomic<bool> release{false};
+        multi_reactor_server server(cfg);
+        server.set_message_handler([&](uint64_t, const uint8_t*, size_t) {
+            in_handler.store(true, std::memory_order_release);
+            for (int i = 0; i < 3000 &&
+                            !release.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+        harness::expect(server.start(), "start() ok");
+        harness::expect(server.reactor_stats().size() == 2,
+                        "one stats slot per reactor");
+
+        harness::peer peer;
+        harness::expect(static_cast<bool>(peer.connect(server.port())),
+                        "client connected");
+        harness::expect(static_cast<bool>(
+                            peer.send(industrial::frame_type::DATA, "x", 1)),
+                        "frame sent");
+        harness::expect(wait_for(2000, [&] {
+                            return in_handler.load(std::memory_order_acquire);
+                        }), "the handler is blocking a reactor");
+        harness::expect(wait_for(2500, [&] {
+                            return server.stats().reactor_stalls.load() >= 1;
+                        }), "a stalled reactor was counted");
+        harness::expect(server.is_running(),
+                        "the watchdog is observational, not fatal");
+
+        release.store(true, std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        {
+            const auto v = server.reactor_stats();
+            uint64_t recv = 0, sent = 0, brecv = 0, bsent = 0;
+            size_t   conns = 0;
+            bool     progress = false, dead = false;
+            for (const auto& r : v) {
+                recv += r.frames_recv;
+                sent += r.frames_sent;
+                brecv += r.bytes_recv;
+                bsent += r.bytes_sent;
+                conns += r.connections;
+                if (r.last_progress_ms != 0) progress = true;
+                dead = dead || r.dead;
+            }
+            const auto& st = server.stats();
+            harness::expect(recv == st.frames_recv.load(),
+                            "per-reactor frames_recv sums to the aggregate");
+            harness::expect(sent == st.frames_sent.load(),
+                            "per-reactor frames_sent sums to the aggregate");
+            harness::expect(brecv == st.bytes_recv.load(),
+                            "per-reactor bytes_recv sums to the aggregate");
+            harness::expect(bsent == st.bytes_sent.load(),
+                            "per-reactor bytes_sent sums to the aggregate");
+            harness::expect(conns == server.connection_count(),
+                            "per-reactor connections sum to the count");
+            harness::expect(progress,
+                            "reactors publish a progress timestamp");
+            harness::expect(!dead, "a healthy reactor is not marked dead");
+        }
+
+        harness::expect(within(3000, "stop()", [&] { server.stop(); }),
+                        "stop() completes");
+        {
+            const auto v = server.reactor_stats();
+            uint64_t recv = 0;
+            size_t   conns = 0;
+            for (const auto& r : v) {
+                recv += r.frames_recv;
+                conns += r.connections;
+            }
+            harness::expect(conns == 0 && server.connection_count() == 0,
+                            "connections are zero after stop");
+            harness::expect(recv == server.stats().frames_recv.load(),
+                            "traffic counters remain cumulative across stop");
+        }
+
+        harness::expect(server.start(), "the restart starts");
+        {
+            const auto v = server.reactor_stats();
+            uint64_t recv = 0;
+            for (const auto& r : v) recv += r.frames_recv;
+            harness::expect(v.size() == 2, "the restart republishes both slots");
+            harness::expect(recv == server.stats().frames_recv.load(),
+                            "traffic counters stay cumulative across restart");
+        }
+        harness::expect(within(3000, "stop()", [&] { server.stop(); }),
+                        "the second stop completes");
+        peer.close();
     }
 
     return harness::finish();

@@ -402,6 +402,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `idle_timeout_ms` | `120000` | 空闲关闭阈值，必须 > 0 |
 | `frame_assembly_timeout_ms` | `0` | 0 = `5 × idle_timeout_ms`；正数为绝对毫秒；必须 >= 0 |
 | `tick_ms` | `500` | 定时器粒度，必须 > 0 |
+| `reactor_stall_timeout_ms` | `0` | reactor 停滞看门狗；0 关闭，否则必须 > `tick_ms`；只观察（`reactor_stalls` + 日志），不停服 |
 | `rbuf_capacity` | `MAX_FRAME_SIZE` (65544) | 读缓冲；必须 >= 65544 |
 | `wbuf_capacity` | `MAX_FRAME_SIZE` (65544) | 写缓冲；必须 >= 8 |
 | `max_pending_bytes` | `MAX_FRAME_SIZE` (65544) | 单连接待发软上限；启动时会被压到 `<= wbuf_capacity` |
@@ -422,6 +423,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 - `max_connections`、`tick_ms`、`idle_timeout_ms`、`close_linger_ms`、`backlog`
   任一 <= 0；
 - `frame_assembly_timeout_ms < 0`（0 合法，表示 `5 × idle_timeout_ms`）；
+- `reactor_stall_timeout_ms < 0`，或正值但不大于 `tick_ms`；
 - `write_budget_bytes == 0`；
 - `handler_threads < 0`、`> 64`，或 `handler_threads > 0 && handler_queue_limit == 0`；
 - `max_connections_per_ip < 0`；
@@ -458,6 +460,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `frame_assembly_timeouts` | 不完整帧超过 `frame_assembly_timeout_ms`（字节仍在到达） |
 | `epoll_ctl_errors` | `epoll_ctl` 失败 |
 | `reactor_failures` | reactor 线程异常退出 |
+| `reactor_stalls` | stall watchdog 发现某 reactor 超过 `reactor_stall_timeout_ms` 未完成一轮循环（仅观察，不停服） |
 | `accept_errors` | `accept4` 因 fd 耗尽失败（EMFILE/ENFILE） |
 | `pending_tasks_total` | 累计入队任务数 |
 | `pending_tasks_depth` | 当前队列深度（gauge） |

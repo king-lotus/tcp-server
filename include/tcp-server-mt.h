@@ -137,6 +137,23 @@ struct fd_guard {
     explicit operator bool() const noexcept { return fd >= 0; }
 };
 
+// Per-reactor counters and watchdog state: one writer (the reactor), many
+// readers (reactor_stats() and the accept thread's watchdog), so every field
+// is atomic. One cache line each: the counters are touched once per loop
+// iteration by their reactor, and adjacent reactors must not share the line.
+// The traffic counters are cumulative since construction, like server_stats;
+// only the per-run fields are reset by start().
+struct alignas(64) reactor_slot {
+    std::atomic<uint64_t> frames_recv{0};
+    std::atomic<uint64_t> frames_sent{0};
+    std::atomic<uint64_t> bytes_recv{0};
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<size_t>   connections{0};
+    std::atomic<int64_t>  last_progress_ms{0};
+    std::atomic<bool>     dead{false};
+    std::atomic<bool>     stall_reported{false};
+};
+
 // ==================== Ring buffer ====================
 class ring_buffer {
  public:
@@ -339,6 +356,10 @@ struct server_stats {
     std::atomic<uint64_t> epoll_ctl_errors{0};
     // reactor threads that crashed or exited abnormally
     std::atomic<uint64_t> reactor_failures{0};
+    // The accept thread's watchdog observed a live reactor whose last
+    // completed loop iteration is older than reactor_stall_timeout_ms.
+    // Observational: it logs and counts, it does not stop the server.
+    std::atomic<uint64_t> reactor_stalls{0};
     // accept4 failed for want of a file descriptor. The one accept failure
     // predictable at startup, and therefore the one that has to be countable:
     // without it the only symptom is that it stopped accepting connections and
@@ -1023,6 +1044,9 @@ class sub_reactor {
     int               wake_fd_  = -1;
     // Worker-owned: false means this reactor accepts no more submissions.
     std::atomic<bool> running_{false};
+    // The server's fixed counter slot for this reactor, set on start. The
+    // array is sized to the maximum reactor count, so idx_ is always in range.
+    reactor_slot*     slot_ = nullptr;
     std::thread       thread_;
 
     // Queue cap, and it is **per reactor** -- which is a different number from
@@ -1211,6 +1235,13 @@ class multi_reactor_server {
         // share. Must be > 0; start() warns when it is coarser than a deadline
         // it governs.
         int         tick_ms          = 500;
+        // Watchdog for a reactor that is alive but not making progress (for
+        // example a handler that never returns). 0 disables it. Must be 0 or
+        // greater than tick_ms: an idle reactor's progress interval is already
+        // one tick, so a smaller timeout reports healthy reactors. The accept
+        // thread checks at least every 500 ms, which also bounds detection
+        // latency. Observational only: it counts and logs, never stops.
+        int         reactor_stall_timeout_ms = 0;
         // A frame must complete within this deadline once its first byte
         // arrives; 0 means 5 x idle_timeout_ms. Unlike idle_timeout_ms this
         // measures progress, so a peer that keeps dribbling a partial frame
@@ -1510,6 +1541,26 @@ class multi_reactor_server {
     // iteration, so they can trail by an iteration under load.
     const server_stats& stats() const noexcept { return stats_; }
 
+    // Per-reactor snapshot. The vector has one entry per reactor for the
+    // current run, in reactor-index order, and is empty before the first
+    // start. The four traffic counters are cumulative since construction, the
+    // same as server_stats(); `connections` is the count the reactor last
+    // published (0 after its teardown); `last_progress_ms` is the steady-clock
+    // millisecond of its last completed loop iteration (0 until it runs); and
+    // `dead` is set when its loop failed. Reads are per-field atomics from a
+    // fixed slot array, so a snapshot can mix two adjacent iterations; it is
+    // not a transactional view.
+    struct reactor_stats_view {
+        uint64_t frames_recv = 0;
+        uint64_t frames_sent = 0;
+        uint64_t bytes_recv  = 0;
+        uint64_t bytes_sent  = 0;
+        size_t   connections = 0;
+        int64_t  last_progress_ms = 0;
+        bool     dead = false;
+    };
+    std::vector<reactor_stats_view> reactor_stats() const;
+
     // sub_reactor internal interface
     bool   on_connection_opened(uint64_t id,
                                 std::shared_ptr<connection> c) noexcept;
@@ -1586,7 +1637,7 @@ class multi_reactor_server {
     bool validate_start_config() noexcept;
     void warn_deadline_granularity() noexcept;
     void warn_fd_ceiling() noexcept;
-    bool start_reactors() noexcept;
+    bool start_reactors(int n_reactors) noexcept;
     bool start_accept_and_handlers() noexcept;
     void rollback_start() noexcept;
     struct start_rollback {
@@ -1621,6 +1672,13 @@ class multi_reactor_server {
         ~accept_cleanup() { server->close_accept_descriptors(); }
     };
     sub_reactor* pick_reactor() noexcept;
+    // Per-reactor slots: allocated once at the maximum reactor count so a
+    // changed resolved count between restarts can never index past them.
+    bool ensure_reactor_slots(size_t n) noexcept;
+    void check_reactor_stalls() noexcept;
+    std::unique_ptr<reactor_slot[]> reactor_slots_;
+    std::atomic<size_t>             reactor_slot_count_{0};
+    std::atomic<reactor_slot*>      published_slots_{nullptr};
 
     config cfg_;
     int listen_fd_ = -1;
@@ -1723,6 +1781,10 @@ inline bool sub_reactor::start() noexcept {
     }
     if (running_.exchange(true)) return true;
 
+    reactor_slot* slots =
+        server_->published_slots_.load(std::memory_order_acquire);
+    slot_ = slots ? &slots[idx_] : nullptr;
+
     epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd_ < 0) {
         running_.store(false); return false;
@@ -1819,6 +1881,9 @@ inline void sub_reactor::cleanup() noexcept {
     flush_close_callbacks();
     active_tasks_.clear();
     conns_.clear();
+    // The slot is read by operators after a stop/quarantine; leaving the last
+    // published count behind reports connections that no longer exist.
+    if (slot_) slot_->connections.store(0, std::memory_order_relaxed);
 }
 
 inline void sub_reactor::wakeup() noexcept {
@@ -3365,23 +3430,37 @@ inline void sub_reactor::publish_stats() noexcept {
     if (frames_recv_local_ != 0) {
         stats.frames_recv.fetch_add(
             frames_recv_local_, std::memory_order_relaxed);
+        if (slot_)
+            slot_->frames_recv.fetch_add(
+                frames_recv_local_, std::memory_order_relaxed);
         frames_recv_local_ = 0;
     }
     if (frames_sent_local_ != 0) {
         stats.frames_sent.fetch_add(
             frames_sent_local_, std::memory_order_relaxed);
+        if (slot_)
+            slot_->frames_sent.fetch_add(
+                frames_sent_local_, std::memory_order_relaxed);
         frames_sent_local_ = 0;
     }
     if (bytes_recv_local_ != 0) {
         stats.bytes_recv.fetch_add(
             bytes_recv_local_, std::memory_order_relaxed);
+        if (slot_)
+            slot_->bytes_recv.fetch_add(
+                bytes_recv_local_, std::memory_order_relaxed);
         bytes_recv_local_ = 0;
     }
     if (bytes_sent_local_ != 0) {
         stats.bytes_sent.fetch_add(
             bytes_sent_local_, std::memory_order_relaxed);
+        if (slot_)
+            slot_->bytes_sent.fetch_add(
+                bytes_sent_local_, std::memory_order_relaxed);
         bytes_sent_local_ = 0;
     }
+    if (slot_) slot_->connections.store(
+        conns_.size(), std::memory_order_relaxed);
 }
 
 inline void sub_reactor::loop() noexcept {
@@ -3394,6 +3473,12 @@ inline void sub_reactor::loop() noexcept {
 
         while (running_.load(std::memory_order_acquire) &&
                server_->is_running()) {
+            // Progress is a completed loop iteration. Stamped at the top so
+            // every path through the body, including an EINTR continue, counts;
+            // a handler that blocks stops the stamp advancing.
+            if (slot_)
+                slot_->last_progress_ms.store(
+                    now_ms(), std::memory_order_relaxed);
             if (server_->fail_worker_for_test.load(std::memory_order_relaxed)) {
                 server_->fail_worker_for_test.store(
                     false, std::memory_order_relaxed);
@@ -3415,6 +3500,7 @@ inline void sub_reactor::loop() noexcept {
                                  read_head_ ? 0 : tick_ms);
             if (n < 0) {
                 if (errno == EINTR) continue;
+                if (slot_) slot_->dead.store(true, std::memory_order_release);
                 server_->stats_ref().reactor_failures.fetch_add(
                     1, std::memory_order_relaxed);
                 server_->fail();
@@ -3493,6 +3579,7 @@ inline void sub_reactor::loop() noexcept {
         }
         publish_stats();
     } catch (...) {
+        if (slot_) slot_->dead.store(true, std::memory_order_release);
         server_->stats_ref().reactor_failures.fetch_add(
             1, std::memory_order_relaxed);
         // Raise the failure flag only; the lifecycle state stays untouched so a
@@ -3595,9 +3682,22 @@ inline bool multi_reactor_server::validate_start_config() noexcept {
         cfg_.idle_timeout_ms <= 0 || cfg_.write_budget_bytes == 0 ||
         cfg_.close_linger_ms <= 0 || cfg_.backlog <= 0 ||
         cfg_.frame_assembly_timeout_ms < 0 ||
+        cfg_.reactor_stall_timeout_ms < 0 ||
         cfg_.handler_threads < 0 ||
         cfg_.handler_threads > config::k_max_handler_threads ||
         (cfg_.handler_threads > 0 && cfg_.handler_queue_limit == 0)) {
+        return false;
+    }
+
+    // The watchdog's floor is the idle progress interval: a healthy reactor
+    // blocked in epoll_wait for tick_ms makes no progress for that long by
+    // design, so a smaller timeout reports every idle reactor.
+    if (cfg_.reactor_stall_timeout_ms > 0 &&
+        cfg_.reactor_stall_timeout_ms <= cfg_.tick_ms) {
+        std::fprintf(stderr,
+                     "[error] reactor_stall_timeout_ms=%d must exceed "
+                     "tick_ms=%d (0 disables the watchdog)\n",
+                     cfg_.reactor_stall_timeout_ms, cfg_.tick_ms);
         return false;
     }
 
@@ -3739,10 +3839,7 @@ inline void multi_reactor_server::warn_fd_ceiling() noexcept {
 // Starts every reactor. A partial set is left in place for the caller's
 // rollback guard, which is the single owner of teardown; a reactor that never
 // made it into the vector is cleaned by its own destructor.
-inline bool multi_reactor_server::start_reactors() noexcept {
-    // Same resolution as everywhere else; see config::resolved_reactor_count
-    // for why this is not computed here.
-    const int n_reactors = cfg_.resolved_reactor_count();
+inline bool multi_reactor_server::start_reactors(int n_reactors) noexcept {
     try {
         reactors_.reserve(static_cast<size_t>(n_reactors));
         for (int i = 0; i < n_reactors; ++i) {
@@ -3792,6 +3889,9 @@ inline void multi_reactor_server::rollback_start() noexcept {
     for (auto& r : reactors_) r->stop();
     reactors_.clear();
     close_accept_descriptors();
+    // A start that never returned true publishes no slots; the next ensure()
+    // repopulates them.
+    reactor_slot_count_.store(0, std::memory_order_release);
     failed_.store(false, std::memory_order_release);
     life_.store(life::stopped, std::memory_order_release);
 }
@@ -3808,6 +3908,13 @@ inline bool multi_reactor_server::start() noexcept {
     start_rollback rollback{this};
 
     if (!validate_start_config()) return false;
+    // Resolve the reactor count once for this run and use it for both the
+    // slot reset and the reactors themselves. hardware_concurrency() can
+    // change between restarts, and two independent resolutions could then
+    // disagree.
+    const int n_reactors = cfg_.resolved_reactor_count();
+    if (!ensure_reactor_slots(static_cast<size_t>(n_reactors)))
+        return false;
 
     warn_fd_ceiling();
 
@@ -3834,7 +3941,7 @@ inline bool multi_reactor_server::start() noexcept {
     // moment they come into existence. There is nothing left to wait for.
     life_.store(life::running, std::memory_order_release);
 
-    if (!start_reactors()) return false;
+    if (!start_reactors(n_reactors)) return false;
     if (!start_accept_and_handlers()) return false;
 
     rollback.dismiss();
@@ -4080,6 +4187,87 @@ inline sub_reactor* multi_reactor_server::pick_reactor() noexcept {
     return reactors_[i].get();
 }
 
+inline bool multi_reactor_server::ensure_reactor_slots(size_t n) noexcept {
+    // Allocate once at the maximum count: hardware_concurrency() can change
+    // between restarts, and a later run must not index past the array.
+    const size_t capacity = static_cast<size_t>(config::k_max_reactors);
+    if (!reactor_slots_) {
+        try {
+            reactor_slots_.reset(new reactor_slot[capacity]());
+        } catch (...) {
+            std::fprintf(stderr,
+                         "[error] could not allocate per-reactor stats\n");
+            return false;
+        }
+        reactor_slot_count_.store(n, std::memory_order_release);
+        published_slots_.store(reactor_slots_.get(),
+                               std::memory_order_release);
+    } else {
+        reactor_slot_count_.store(n, std::memory_order_release);
+    }
+    // Traffic counters are cumulative since construction, like server_stats;
+    // only per-run state is reset.
+    for (size_t i = 0; i < n; ++i) {
+        reactor_slot& s = reactor_slots_[i];
+        s.connections.store(0, std::memory_order_relaxed);
+        s.last_progress_ms.store(0, std::memory_order_relaxed);
+        s.dead.store(false, std::memory_order_relaxed);
+        s.stall_reported.store(false, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+inline std::vector<multi_reactor_server::reactor_stats_view>
+multi_reactor_server::reactor_stats() const {
+    std::vector<reactor_stats_view> out;
+    const reactor_slot* slots =
+        published_slots_.load(std::memory_order_acquire);
+    if (!slots) return out;
+    const size_t n = reactor_slot_count_.load(std::memory_order_acquire);
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const reactor_slot& s = slots[i];
+        reactor_stats_view v;
+        v.frames_recv = s.frames_recv.load(std::memory_order_relaxed);
+        v.frames_sent = s.frames_sent.load(std::memory_order_relaxed);
+        v.bytes_recv = s.bytes_recv.load(std::memory_order_relaxed);
+        v.bytes_sent = s.bytes_sent.load(std::memory_order_relaxed);
+        v.connections = s.connections.load(std::memory_order_relaxed);
+        v.last_progress_ms =
+            s.last_progress_ms.load(std::memory_order_relaxed);
+        v.dead = s.dead.load(std::memory_order_acquire);
+        out.push_back(v);
+    }
+    return out;
+}
+
+inline void multi_reactor_server::check_reactor_stalls() noexcept {
+    const int64_t timeout = cfg_.reactor_stall_timeout_ms;
+    if (timeout <= 0) return;
+    reactor_slot* slots = published_slots_.load(std::memory_order_acquire);
+    if (!slots) return;
+    const size_t n = reactor_slot_count_.load(std::memory_order_acquire);
+    const int64_t now = now_ms();
+    for (size_t i = 0; i < n; ++i) {
+        reactor_slot& s = slots[i];
+        if (s.dead.load(std::memory_order_relaxed)) continue;
+        const int64_t last =
+            s.last_progress_ms.load(std::memory_order_relaxed);
+        if (last == 0) continue;
+        if (now - last > timeout) {
+            if (!s.stall_reported.exchange(true, std::memory_order_relaxed)) {
+                stats_.reactor_stalls.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                    "[warn] reactor %zu made no progress for %" PRId64 " ms "
+                    "(reactor_stall_timeout_ms=%d)\n",
+                    i, now - last, cfg_.reactor_stall_timeout_ms);
+            }
+        } else {
+            s.stall_reported.store(false, std::memory_order_relaxed);
+        }
+    }
+}
+
 // Opens everything the accept thread owns. The caller's accept_cleanup closes
 // whatever was opened before a failure, so this may return early without
 // unwinding by hand.
@@ -4301,6 +4489,7 @@ inline void multi_reactor_server::accept_loop(
             fail();
             break;
         }
+        check_reactor_stalls();
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             if (fd == wake_fd_) {

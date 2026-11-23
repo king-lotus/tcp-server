@@ -126,6 +126,7 @@ validated by `start()`; nothing is checked at construction.
 | `max_connections_per_ip` | `0` | Most live connections one peer address may hold; `0` is unlimited. IPv6 is keyed by `/64`, because the low 64 bits are chosen by the peer. Rejections are counted in `ip_rejections`. |
 | `idle_timeout_ms` | `120000` | Close a connection after this long with **no activity**, where activity is bytes received *or* bytes drained to the peer: a connection paused by backpressure is not receiving by design, and a slow reader is not idle. Must be > 0. |
 | `tick_ms` | `500` | Granularity of every deadline. Must be > 0; a tick coarser than a deadline makes that deadline late by up to one tick, and `start()` warns. |
+| `reactor_stall_timeout_ms` | `0` | Watchdog for a reactor alive but not completing a loop iteration for this long. 0 disables it; otherwise it must exceed `tick_ms` (an idle reactor's interval is already one tick). The accept thread checks at least every 500 ms, which bounds detection latency. Observational only: it increments `reactor_stalls` and logs. |
 | `frame_assembly_timeout_ms` | `0` | Deadline for one frame, measured from its first byte. `0` means 5 × `idle_timeout_ms`. Must be ≥ 0. |
 | `allow_unknown_frame_types` | `false` | Deliver a type outside `1`/`2`/`3` to the message handler as DATA instead of closing the connection. See [wire protocol](#wire-protocol). |
 | `rbuf_capacity` | `65544` | Per-connection read buffer. Must be ≥ 65544: a smaller one cannot hold a legal maximum frame. |
@@ -215,7 +216,8 @@ started, when called from a callback, or when the configuration is rejected:
 `rbuf_capacity < 65544`, `wbuf_capacity < 8`, `max_pending_bytes < 8`,
 `max_connections <= 0`, `tick_ms <= 0`, `idle_timeout_ms <= 0`,
 `write_budget_bytes == 0`, `close_linger_ms <= 0`, `backlog <= 0`,
-`frame_assembly_timeout_ms < 0`, `handler_threads < 0`,
+`frame_assembly_timeout_ms < 0`, `reactor_stall_timeout_ms < 0` or a positive
+`reactor_stall_timeout_ms <= tick_ms`, `handler_threads < 0`,
 `handler_threads > 64`, `handler_threads > 0` with
 `handler_queue_limit == 0`, `max_connections_per_ip < 0`,
 `max_total_buffer_bytes` below one connection's buffers, or read watermarks that
@@ -316,8 +318,26 @@ uint16_t port() const noexcept;
 size_t connection_count() const noexcept;
 std::vector<uint64_t> connection_ids() const;
 const server_stats& stats() const noexcept;
+std::vector<reactor_stats_view> reactor_stats() const;
 bool is_running() const noexcept;
+
+struct reactor_stats_view {
+    uint64_t frames_recv, frames_sent, bytes_recv, bytes_sent;
+    size_t   connections;
+    int64_t  last_progress_ms;
+    bool     dead;
+};
 ```
+
+`reactor_stats()` returns one entry per reactor of the current run, in
+reactor-index order; the vector is empty before the first `start()`. The four
+traffic counters are cumulative since construction, the same as `server_stats`
+(and stay cumulative across restarts). `connections` is the count the reactor
+last published, reset to 0 by its teardown. `last_progress_ms` is the
+steady-clock millisecond of its last completed loop iteration, 0 until it runs.
+`dead` is set when the reactor's loop failed. Each field is read atomically
+from a fixed slot array, so a snapshot can mix adjacent iterations; it is not a
+transactional view.
 
 `port()` is the port actually bound: it equals `config::port` unless that was
 `0`. It returns `0` before `start()` has bound and after `stop()` has closed.
@@ -365,6 +385,7 @@ iteration: exact when idle, up to one iteration behind under load.
 | `frame_assembly_timeouts` | A partial frame did not complete within `frame_assembly_timeout_ms`, even though bytes were arriving. |
 | `epoll_ctl_errors` | An `epoll_ctl` registration failed. |
 | `reactor_failures` | A reactor thread crashed or exited abnormally. |
+| `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. Observational: the server is not stopped. |
 | `accept_errors` | `accept4` failed. `EMFILE` is answered with the reserved descriptor; `ENFILE` is not, and keeps the backoff. |
 | `fd_exhausted_drops` | A connection was reset because the process ran out of descriptors and the spare was spent on it. The peer learns immediately instead of waiting in the backlog. |
 | `fd_exhausted_system` | `accept4` failed with `ENFILE`: the system-wide descriptor table is full, which closing one's own spare cannot fix. |
