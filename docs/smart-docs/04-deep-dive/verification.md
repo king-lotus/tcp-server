@@ -57,7 +57,7 @@ flowchart LR
 | `ping_pong` | PING answered while healthy and while closing |
 | `send_results` | Every `send_result` value, descriptor exhaustion, EMFILE rescue retry policy, HUP/ERR delivery, offload ordering and limits |
 | `backpressure` | Reactor queue fan-out, reserved control slots, close queued under a reply flood |
-| `fault_injection` | Worker/accept exceptions, deterministic reactor quarantine and the `reactor failure` close reason, restart after failure, rejected configuration, handler throws, queue-refused close, failed-start rollback, partial reactor set, per-reactor stats and stall watchdog |
+| `fault_injection` | Worker/accept exceptions, deterministic reactor quarantine and the `reactor failure` close reason, restart after failure, rejected configuration, handler throws, queue-refused close, failed-start rollback, partial reactor set, per-reactor stats (including retired slots after a shrinking reactor count and a failed start), and the stall watchdog |
 | `reactor_spread` | Round-robin placement, and that it follows the configured reactor count |
 | `config_budget` | Default buffer budget, new admission/watermark validation, ring buffer commit behaviour |
 | `watermark` | Pausing at the high mark, resuming at the low mark, close overrides the pause, assembly-deadline and idle exemptions |

@@ -604,8 +604,11 @@ int main() {
     //
     // The slots must sum to the lifetime aggregate, survive a restart with the
     // counters intact, zero their connection counts on teardown, and expose a
-    // blocked reactor without making it fatal. A timeout at or below tick_ms
-    // is refused: an idle reactor's interval is already one tick.
+    // blocked reactor without making it fatal. A timeout below
+    // max(100, 2 * tick_ms) is refused: a healthy interval is one tick plus the
+    // loop body. A later run that resolves fewer reactors must keep the
+    // surplus slots visible, and a start that fails after allocation must keep
+    // them reconcilable with the lifetime aggregate.
     {
         std::printf("J. per-reactor stats and the stall watchdog\n");
 
@@ -616,9 +619,18 @@ int main() {
             bad.reactor_stall_timeout_ms = 100;
             multi_reactor_server s(bad);
             harness::expect(!s.start(),
-                            "a stall timeout <= tick_ms is refused");
+                            "a stall timeout below the floor is refused");
             harness::expect(s.reactor_stats().empty(),
                             "a refused start publishes no slots");
+
+            bad.port = free_port();
+            bad.tick_ms = 20;
+            bad.reactor_stall_timeout_ms = 21;
+            multi_reactor_server hair_trigger(bad);
+            harness::expect(!hair_trigger.start(),
+                            "tick_ms + 1 does not pass the watchdog floor");
+            harness::expect(hair_trigger.reactor_stats().empty(),
+                            "the second refusal publishes no slots either");
         }
 
         multi_reactor_server::config cfg = base;
@@ -715,6 +727,128 @@ int main() {
         harness::expect(within(3000, "stop()", [&] { server.stop(); }),
                         "the second stop completes");
         peer.close();
+
+        // A later run that resolves fewer reactors must not hide the traffic
+        // already published into the surplus slots: their counters are
+        // cumulative, and the per-reactor sums must keep matching
+        // server_stats().
+        {
+            multi_reactor_server::config cfg_small = base;
+            cfg_small.port = free_port();
+            cfg_small.tick_ms = 20;
+            cfg_small.reactor_stall_timeout_ms = 100;
+            cfg_small.num_reactors = 4;
+            multi_reactor_server shrinking(cfg_small);
+            shrinking.set_message_handler(
+                [](uint64_t, const uint8_t*, size_t) {});
+            harness::expect(shrinking.start(), "the four-reactor run starts");
+            harness::expect(shrinking.reactor_stats().size() == 4,
+                            "four slots are published");
+
+            // One connection per reactor's round-robin turn, so every slot
+            // receives a frame before the resolved count shrinks.
+            std::vector<harness::peer> peers;
+            peers.reserve(4);
+            const uint64_t recv_before = shrinking.stats().frames_recv.load();
+            for (int i = 0; i < 4; ++i) {
+                peers.emplace_back();
+                harness::expect(
+                    static_cast<bool>(
+                        peers.back().connect(shrinking.port())),
+                    "a client connected");
+                harness::expect(static_cast<bool>(peers.back().send(
+                                    industrial::frame_type::DATA, "x", 1)),
+                                "frame sent");
+            }
+            harness::expect(wait_for(2000, [&] {
+                                return shrinking.stats().frames_recv.load() >=
+                                       recv_before + 4;
+                            }),
+                            "all four reactors received a frame");
+
+            harness::expect(within(3000, "stop()",
+                                   [&] { shrinking.stop(); }),
+                            "the four-reactor run stops");
+
+            shrinking.resolved_reactor_count_for_test.store(2);
+            harness::expect(shrinking.start(), "the shrunken run starts");
+            {
+                const auto v = shrinking.reactor_stats();
+                harness::expect(v.size() == 4,
+                                "the surplus slots stay published");
+                if (v.size() == 4) {
+                    harness::expect(!v[0].retired && !v[1].retired,
+                                    "the two current slots are active");
+                    harness::expect(v[2].retired && v[3].retired,
+                                    "the surplus slots are retired");
+                    harness::expect(v[2].connections == 0 &&
+                                        v[3].connections == 0,
+                                    "retired slots report no connections");
+                    harness::expect(v[2].last_progress_ms == 0 &&
+                                        v[3].last_progress_ms == 0,
+                                    "retired slots report no progress stamp");
+                    harness::expect(v[2].frames_recv > 0 &&
+                                        v[3].frames_recv > 0,
+                                    "the retired slots keep their traffic");
+                }
+                uint64_t recv = 0, sent = 0, brecv = 0, bsent = 0;
+                size_t conns = 0;
+                for (const auto& r : v) {
+                    recv += r.frames_recv;
+                    sent += r.frames_sent;
+                    brecv += r.bytes_recv;
+                    bsent += r.bytes_sent;
+                    conns += r.connections;
+                }
+                const auto& st = shrinking.stats();
+                harness::expect(recv == st.frames_recv.load(),
+                                "the shrunken sums still match frames_recv");
+                harness::expect(sent == st.frames_sent.load(),
+                                "the shrunken sums still match frames_sent");
+                harness::expect(brecv == st.bytes_recv.load(),
+                                "the shrunken sums still match bytes_recv");
+                harness::expect(bsent == st.bytes_sent.load(),
+                                "the shrunken sums still match bytes_sent");
+                harness::expect(conns == shrinking.connection_count(),
+                                "the shrunken sums still match connections");
+            }
+            harness::expect(within(3000, "stop()",
+                                   [&] { shrinking.stop(); }),
+                            "the shrunken run stops");
+
+            // A start that fails after the slots exist must leave them
+            // published and retired, not empty: the lifetime counters are
+            // still in the aggregate and must remain reconcilable.
+            shrinking.fail_handler_pool_for_test.store(true);
+            bool failed = true;
+            harness::expect(
+                within(3000, "start() (handler pool refuses)",
+                       [&] { failed = shrinking.start(); }),
+                "the refused start returns");
+            harness::expect(!failed, "the start fails after allocation");
+            {
+                const auto v = shrinking.reactor_stats();
+                harness::expect(v.size() == 4,
+                                "a failed start keeps the slots published");
+                bool retired = v.size() == 4;
+                uint64_t recv = 0;
+                for (const auto& r : v) {
+                    retired = retired && r.retired;
+                    recv += r.frames_recv;
+                }
+                harness::expect(retired,
+                                "a failed start retires every slot");
+                harness::expect(recv == shrinking.stats().frames_recv.load(),
+                                "the failed start kept the sums reconcilable");
+            }
+
+            shrinking.resolved_reactor_count_for_test.store(-1);
+            harness::expect(shrinking.start(),
+                            "the server starts again after the refusal");
+            harness::expect(within(3000, "stop()",
+                                   [&] { shrinking.stop(); }),
+                            "the final stop completes");
+        }
     }
 
     // ---- K: quarantining a reactor resets its connections -------------------

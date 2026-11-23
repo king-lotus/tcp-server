@@ -126,7 +126,7 @@ validated by `start()`; nothing is checked at construction.
 | `max_connections_per_ip` | `0` | Most live connections one peer address may hold; `0` is unlimited. IPv6 is keyed by `/64`, because the low 64 bits are chosen by the peer. Rejections are counted in `ip_rejections`. |
 | `idle_timeout_ms` | `120000` | Close a connection after this long with **no activity**, where activity is bytes received *or* bytes drained to the peer: a connection paused by backpressure is not receiving by design, and a slow reader is not idle. Must be > 0. |
 | `tick_ms` | `500` | Granularity of every deadline. Must be > 0; a tick coarser than a deadline makes that deadline late by up to one tick, and `start()` warns. |
-| `reactor_stall_timeout_ms` | `0` | Watchdog for a reactor alive but not completing a loop iteration for this long. 0 disables it; otherwise it must exceed `tick_ms` (an idle reactor's interval is already one tick). The accept thread checks at least every 500 ms, which bounds detection latency. Observational only: it increments `reactor_stalls` and logs. |
+| `reactor_stall_timeout_ms` | `0` | Watchdog for a reactor alive but not completing a loop iteration for this long. 0 disables it; otherwise it must be at least `max(100, 2 × tick_ms)`. One iteration is `tick_ms` in `epoll_wait` plus the loop body (event batch, pending tasks, `do_tick`), so a timeout just over `tick_ms` reports healthy reactors; it must also exceed the longest expected body. With the watchdog on, the accept thread samples at least every `min(500 ms, timeout/2)`, so a stall shorter than the timeout plus one sample can fall between samples. Observational only: it increments `reactor_stalls` and logs. |
 | `frame_assembly_timeout_ms` | `0` | Deadline for one frame, measured from its first byte. `0` means 5 × `idle_timeout_ms`. Must be ≥ 0. |
 | `allow_unknown_frame_types` | `false` | Deliver a type outside `1`/`2`/`3` to the message handler as DATA instead of closing the connection. See [wire protocol](#wire-protocol). |
 | `rbuf_capacity` | `65544` | Per-connection read buffer. Must be ≥ 65544: a smaller one cannot hold a legal maximum frame. |
@@ -217,7 +217,7 @@ started, when called from a callback, or when the configuration is rejected:
 `max_connections <= 0`, `tick_ms <= 0`, `idle_timeout_ms <= 0`,
 `write_budget_bytes == 0`, `close_linger_ms <= 0`, `backlog <= 0`,
 `frame_assembly_timeout_ms < 0`, `reactor_stall_timeout_ms < 0` or a positive
-`reactor_stall_timeout_ms <= tick_ms`, `handler_threads < 0`,
+`reactor_stall_timeout_ms < max(100, 2 × tick_ms)`, `handler_threads < 0`,
 `handler_threads > 64`, `handler_threads > 0` with
 `handler_queue_limit == 0`, `max_connections_per_ip < 0`,
 `max_total_buffer_bytes` below one connection's buffers, or read watermarks that
@@ -328,27 +328,35 @@ struct reactor_stats_view {
     size_t   connections;
     int64_t  last_progress_ms;
     bool     dead;
+    bool     retired;
 };
 ```
 
-`reactor_stats()` returns one entry per reactor of the current run, in
-reactor-index order; the vector is empty before the first `start()`. The four
-traffic counters are cumulative since construction, the same as `server_stats`
-(and stay cumulative across restarts). `connections` is the count the reactor
-last published, reset to 0 by its teardown. `last_progress_ms` is the
-steady-clock millisecond of its last completed loop iteration, 0 until it runs.
-`dead` is set when the reactor's loop failed and the reactor was quarantined:
-the slot takes no new connections, its connections were reset with the
-`reactor failure` close reason, and the server keeps serving on the remaining
-reactors. Each field is read atomically from a fixed slot array, so a snapshot
-can mix adjacent iterations; it is not a transactional view.
+`reactor_stats()` returns one entry per slot used since construction, in
+reactor-index order; the vector is empty before the first `start()` allocates
+the slots. An entry is current while its index is below the reactor count of
+the latest successful start; surplus slots from an earlier, larger run stay in
+the vector with `retired` set. A retired slot reports no per-run state but
+keeps its cumulative traffic, so the four totals still add up to
+`server_stats()`; after a start that failed after allocation every slot is
+retired. The four traffic counters are cumulative since construction, the same
+as `server_stats` (and stay cumulative across restarts). `connections` is the
+count the reactor last published, reset to 0 by its teardown.
+`last_progress_ms` is the steady-clock millisecond of its last completed loop
+iteration, 0 until it runs and 0 for a retired slot. `dead` is set when the
+reactor's loop failed and the reactor was quarantined: the slot takes no new
+connections, its connections were reset with the `reactor failure` close
+reason, and the server keeps serving on the remaining reactors. Each field is
+read atomically from a fixed slot array, so a snapshot can mix adjacent
+iterations; it is not a transactional view. The result is a vector, so this
+call can throw `bad_alloc`.
 
 `port()` is the port actually bound: it equals `config::port` unless that was
 `0`. It returns `0` before `start()` has bound and after `stop()` has closed.
 
 `connection_count()` and `connection_ids()` take each shard's lock in turn and
-are O(shards) plus the result size; `connection_ids()` allocates. Neither is
-meant for a hot path.
+are O(shards) plus the result size; `connection_ids()` and `reactor_stats()`
+allocate. None of them is meant for a hot path.
 
 `is_running()` is true only when the lifecycle reached running **and** no fatal
 failure has been raised. A reactor failure is fatal only when no reactor is left
@@ -392,7 +400,7 @@ iteration: exact when idle, up to one iteration behind under load.
 | `frame_assembly_timeouts` | A partial frame did not complete within `frame_assembly_timeout_ms`, even though bytes were arriving. |
 | `epoll_ctl_errors` | An `epoll_ctl` registration failed. |
 | `reactor_failures` | A reactor thread crashed or exited abnormally. That reactor is quarantined: it accepts no new connections, its connections are reset (close reason `reactor failure`), and the server keeps serving while another reactor is alive. The increment that empties the pool — or any accept-thread failure — is fatal. |
-| `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. Observational: the server is not stopped. |
+| `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. Sampled at least every `min(500 ms, timeout/2)`; shorter transients can fall between samples, and a server that is no longer running is not sampled. Observational: the server is not stopped. |
 | `accept_errors` | `accept4` failed. `EMFILE` is answered with the reserved descriptor; `ENFILE` is not, and keeps the backoff. |
 | `fd_exhausted_drops` | A connection was reset because the process ran out of descriptors and the spare was spent on it. The peer learns immediately instead of waiting in the backlog. |
 | `fd_exhausted_system` | `accept4` failed with `ENFILE`: the system-wide descriptor table is full, which closing one's own spare cannot fix. |

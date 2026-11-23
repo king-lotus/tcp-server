@@ -1253,11 +1253,15 @@ class multi_reactor_server {
         // it governs.
         int         tick_ms          = 500;
         // Watchdog for a reactor that is alive but not making progress (for
-        // example a handler that never returns). 0 disables it. Must be 0 or
-        // greater than tick_ms: an idle reactor's progress interval is already
-        // one tick, so a smaller timeout reports healthy reactors. The accept
-        // thread checks at least every 500 ms, which also bounds detection
-        // latency. Observational only: it counts and logs, never stops.
+        // example a handler that never returns). 0 disables it. Otherwise it
+        // must be at least max(100, 2 * tick_ms): a healthy reactor stamps its
+        // progress once per iteration, and an iteration is one tick plus the
+        // loop body, so a small margin over tick_ms reports healthy reactors.
+        // The timeout must still exceed the longest expected iteration -- a
+        // large connection set or a slow inline handler stretches the body.
+        // The accept thread samples at least every min(500 ms, timeout / 2),
+        // so a stall shorter than timeout plus one sample can fall between
+        // samples. Observational only: it counts and logs, never stops.
         int         reactor_stall_timeout_ms = 0;
         // A frame must complete within this deadline once its first byte
         // arrives; 0 means 5 x idle_timeout_ms. Unlike idle_timeout_ms this
@@ -1516,6 +1520,12 @@ class multi_reactor_server {
     // that a refused close request still reaches the connection through the
     // tick sweep.
     std::atomic<bool> fail_close_enqueue_for_test{false};
+    // -1 = off. Otherwise the next start() uses this many reactors instead of
+    // config::resolved_reactor_count(), clamped to [1, k_max_reactors]. Lets
+    // the fault-injection suite shrink or grow the pool between runs without
+    // depending on hardware_concurrency() changing. Persistent until reset,
+    // because a test needs two consecutive starts to disagree.
+    std::atomic<int> resolved_reactor_count_for_test{-1};
     // Blocks while is_running() holds, polling every 200ms. That is not the
     // same as "until stop() was called": the accept thread's failure, or the
     // failure of the last live reactor, clears the same flag, so returning
@@ -1551,11 +1561,12 @@ class multi_reactor_server {
     bool offload(uint64_t conn_id, std::function<void()> fn) noexcept;
 
     size_t connection_count() const noexcept;
-    // Snapshot of every live connection id. The only public call that can
-    // throw: it allocates once per shard, so bad_alloc reaches the caller.
-    // stop_gracefully() calls it from a noexcept function on a 10ms loop, and
-    // catches the exception there so a bad_alloc falls through to stop() and a
-    // returned false rather than terminating the process.
+    // Snapshot of every live connection id. It allocates once per shard, so
+    // bad_alloc reaches the caller (reactor_stats() also allocates its result
+    // vector and can throw for the same reason). stop_gracefully() calls it
+    // from a noexcept function on a 10ms loop, and catches the exception there
+    // so a bad_alloc falls through to stop() and a returned false rather than
+    // terminating the process.
     std::vector<uint64_t> connection_ids() const;
 
     // Where the listening socket actually is. Equals config::port unless that
@@ -1572,17 +1583,22 @@ class multi_reactor_server {
     // iteration, so they can trail by an iteration under load.
     const server_stats& stats() const noexcept { return stats_; }
 
-    // Per-reactor snapshot. The vector has one entry per reactor for the
-    // current run, in reactor-index order, and is empty before the first
-    // start. The four traffic counters are cumulative since construction, the
-    // same as server_stats(); `connections` is the count the reactor last
-    // published (0 after its teardown); `last_progress_ms` is the steady-clock
-    // millisecond of its last completed loop iteration (0 until it runs); and
-    // `dead` is set when its loop failed and the reactor was quarantined --
-    // that slot takes no new connections and its connections are reset. Reads
-    // are per-field atomics from a
-    // fixed slot array, so a snapshot can mix two adjacent iterations; it is
-    // not a transactional view.
+    // Per-reactor snapshot. The vector has one entry per slot used since
+    // construction, in reactor-index order, and is empty before the first
+    // start allocates the slots. An entry is current while its index is below
+    // the reactor count of the latest successful start; surplus slots from an
+    // earlier, larger run stay in the vector with `retired` set. A retired
+    // slot reports no per-run state but keeps its cumulative traffic, so the
+    // four totals still add up to server_stats(). After a start that failed
+    // after allocation every slot is retired. The traffic counters are
+    // cumulative since construction; `connections` is the count the reactor
+    // last published (0 after its teardown); `last_progress_ms` is the
+    // steady-clock millisecond of its last completed loop iteration (0 until
+    // it runs); and `dead` is set when its loop failed and the reactor was
+    // quarantined -- that slot takes no new connections and its connections
+    // are reset. Reads are per-field atomics from a fixed slot array, so a
+    // snapshot can mix two adjacent iterations; it is not a transactional
+    // view. The result is a vector, so this call can throw bad_alloc.
     struct reactor_stats_view {
         uint64_t frames_recv = 0;
         uint64_t frames_sent = 0;
@@ -1591,6 +1607,9 @@ class multi_reactor_server {
         size_t   connections = 0;
         int64_t  last_progress_ms = 0;
         bool     dead = false;
+        // True when this slot is left over from a larger earlier run. Its
+        // per-run fields are zero; only its cumulative traffic is meaningful.
+        bool     retired = false;
     };
     std::vector<reactor_stats_view> reactor_stats() const;
 
@@ -1724,8 +1743,20 @@ class multi_reactor_server {
     // changed resolved count between restarts can never index past them.
     bool ensure_reactor_slots(size_t n) noexcept;
     void check_reactor_stalls() noexcept;
+    // How long the accept thread may park in epoll_wait. With the watchdog
+    // enabled it must sample faster than the timeout, or a stall that ends
+    // between two samples is never observed; 500 ms is the ceiling because
+    // this thread also reaps dead reactors and drains admissions.
+    int  accept_wait_ms() const noexcept;
     std::unique_ptr<reactor_slot[]> reactor_slots_;
+    // Slots [0, reactor_slot_count_) are exposed. It is the high-water mark
+    // of every resolved reactor count, never shrunk, so cumulative traffic in
+    // slots retired by a smaller run stays visible and reconciles with
+    // server_stats().
     std::atomic<size_t>             reactor_slot_count_{0};
+    // Slots [0, reactor_run_count_) belong to the current (or most recent
+    // successful) run; slots above it are retired. Zero after a failed start.
+    std::atomic<size_t>             reactor_run_count_{0};
     std::atomic<reactor_slot*>      published_slots_{nullptr};
 
     config cfg_;
@@ -3757,16 +3788,25 @@ inline bool multi_reactor_server::validate_start_config() noexcept {
         return false;
     }
 
-    // The watchdog's floor is the idle progress interval: a healthy reactor
-    // blocked in epoll_wait for tick_ms makes no progress for that long by
-    // design, so a smaller timeout reports every idle reactor.
-    if (cfg_.reactor_stall_timeout_ms > 0 &&
-        cfg_.reactor_stall_timeout_ms <= cfg_.tick_ms) {
-        std::fprintf(stderr,
-                     "[error] reactor_stall_timeout_ms=%d must exceed "
-                     "tick_ms=%d (0 disables the watchdog)\n",
-                     cfg_.reactor_stall_timeout_ms, cfg_.tick_ms);
-        return false;
+    // A healthy reactor's stamped interval is one tick plus the loop body:
+    // epoll_wait(tick_ms), then the event batch, pending tasks, the close
+    // callback flush and do_tick's scan of every connection. A timeout a hair
+    // above tick_ms therefore reports healthy iterations as stalls. The
+    // absolute floor keeps a tiny tick from making the watchdog hair-trigger;
+    // the operator still has to choose a timeout above the longest expected
+    // iteration, because a large connection set or a slow inline handler can
+    // make the body arbitrarily long.
+    if (cfg_.reactor_stall_timeout_ms > 0) {
+        const int64_t floor_ms = std::max<int64_t>(
+            100, static_cast<int64_t>(cfg_.tick_ms) * 2);
+        if (cfg_.reactor_stall_timeout_ms < floor_ms) {
+            std::fprintf(stderr,
+                         "[error] reactor_stall_timeout_ms=%d must be 0 or "
+                         "at least max(100, 2 * tick_ms=%d) = %" PRId64 "\n",
+                         cfg_.reactor_stall_timeout_ms, cfg_.tick_ms,
+                         floor_ms);
+            return false;
+        }
     }
 
     warn_deadline_granularity();
@@ -3972,9 +4012,23 @@ inline void multi_reactor_server::rollback_start() noexcept {
     for (auto& r : reactors_) r->stop();
     reactors_.clear();
     close_accept_descriptors();
-    // A start that never returned true publishes no slots; the next ensure()
-    // repopulates them.
-    reactor_slot_count_.store(0, std::memory_order_release);
+    // Keep the allocated slots published: their traffic counters are
+    // cumulative and must stay reconcilable with stats(). Mark them retired
+    // instead, and clear the per-run fields so a failed start leaves no
+    // half-run state behind. The next ensure() reactivates and resets the
+    // slots it uses.
+    if (reactor_slots_) {
+        const size_t exposed =
+            reactor_slot_count_.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < exposed; ++i) {
+            reactor_slot& s = reactor_slots_[i];
+            s.connections.store(0, std::memory_order_relaxed);
+            s.last_progress_ms.store(0, std::memory_order_relaxed);
+            s.dead.store(false, std::memory_order_relaxed);
+            s.stall_reported.store(false, std::memory_order_relaxed);
+        }
+    }
+    reactor_run_count_.store(0, std::memory_order_release);
     failed_.store(false, std::memory_order_release);
     life_.store(life::stopped, std::memory_order_release);
 }
@@ -3994,8 +4048,14 @@ inline bool multi_reactor_server::start() noexcept {
     // Resolve the reactor count once for this run and use it for both the
     // slot reset and the reactors themselves. hardware_concurrency() can
     // change between restarts, and two independent resolutions could then
-    // disagree.
-    const int n_reactors = cfg_.resolved_reactor_count();
+    // disagree. The test override is clamped to the same ceiling.
+    int n_reactors = cfg_.resolved_reactor_count();
+    const int count_override =
+        resolved_reactor_count_for_test.load(std::memory_order_relaxed);
+    if (count_override > 0) {
+        n_reactors = count_override > config::k_max_reactors
+                         ? config::k_max_reactors : count_override;
+    }
     if (!ensure_reactor_slots(static_cast<size_t>(n_reactors)))
         return false;
 
@@ -4319,15 +4379,20 @@ inline bool multi_reactor_server::ensure_reactor_slots(size_t n) noexcept {
                          "[error] could not allocate per-reactor stats\n");
             return false;
         }
-        reactor_slot_count_.store(n, std::memory_order_release);
         published_slots_.store(reactor_slots_.get(),
                                std::memory_order_release);
-    } else {
-        reactor_slot_count_.store(n, std::memory_order_release);
     }
-    // Traffic counters are cumulative since construction, like server_stats;
-    // only per-run state is reset.
-    for (size_t i = 0; i < n; ++i) {
+    // Publish every slot that has ever been used. When a later run resolves
+    // fewer reactors, the slots above the new count stay visible as retired:
+    // their traffic counters are cumulative and never reset, so hiding them
+    // would break the sum invariant against server_stats(). Traffic counters
+    // are cumulative since construction; only per-run state is reset, and it
+    // is reset for retired slots as well.
+    size_t exposed = reactor_slot_count_.load(std::memory_order_relaxed);
+    if (n > exposed) exposed = n;
+    reactor_slot_count_.store(exposed, std::memory_order_release);
+    reactor_run_count_.store(n, std::memory_order_release);
+    for (size_t i = 0; i < exposed; ++i) {
         reactor_slot& s = reactor_slots_[i];
         s.connections.store(0, std::memory_order_relaxed);
         s.last_progress_ms.store(0, std::memory_order_relaxed);
@@ -4344,6 +4409,8 @@ multi_reactor_server::reactor_stats() const {
         published_slots_.load(std::memory_order_acquire);
     if (!slots) return out;
     const size_t n = reactor_slot_count_.load(std::memory_order_acquire);
+    const size_t active =
+        reactor_run_count_.load(std::memory_order_acquire);
     out.reserve(n);
     for (size_t i = 0; i < n; ++i) {
         const reactor_slot& s = slots[i];
@@ -4356,19 +4423,26 @@ multi_reactor_server::reactor_stats() const {
         v.last_progress_ms =
             s.last_progress_ms.load(std::memory_order_relaxed);
         v.dead = s.dead.load(std::memory_order_acquire);
+        v.retired = i >= active;
         out.push_back(v);
     }
     return out;
 }
 
 inline void multi_reactor_server::check_reactor_stalls() noexcept {
+    // Only a running server has live reactors. During failure teardown the
+    // survivors leave through the normal is_running() check without a final
+    // stamp; evaluating their stale timestamps would report healthy reactors
+    // as stalled for the one pass the accept thread still makes.
+    if (!is_running()) return;
     const int64_t timeout = cfg_.reactor_stall_timeout_ms;
     if (timeout <= 0) return;
     reactor_slot* slots = published_slots_.load(std::memory_order_acquire);
     if (!slots) return;
-    const size_t n = reactor_slot_count_.load(std::memory_order_acquire);
+    const size_t active =
+        reactor_run_count_.load(std::memory_order_acquire);
     const int64_t now = now_ms();
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < active; ++i) {
         reactor_slot& s = slots[i];
         if (s.dead.load(std::memory_order_relaxed)) continue;
         const int64_t last =
@@ -4386,6 +4460,14 @@ inline void multi_reactor_server::check_reactor_stalls() noexcept {
             s.stall_reported.store(false, std::memory_order_relaxed);
         }
     }
+}
+
+inline int multi_reactor_server::accept_wait_ms() const noexcept {
+    const int timeout = cfg_.reactor_stall_timeout_ms;
+    if (timeout <= 0) return 500;
+    // Validation guarantees timeout >= 100, so half is at least 50 ms. The
+    // max() is belt and braces against a future change to that floor.
+    return std::max(10, std::min(500, timeout / 2));
 }
 
 // Opens everything the accept thread owns. The caller's accept_cleanup closes
@@ -4612,9 +4694,15 @@ inline void multi_reactor_server::accept_loop(
             throw 1;
         }
         int n = ::epoll_wait(epoll_fd_, events.data(),
-                             static_cast<int>(events.size()), 500);
+                             static_cast<int>(events.size()),
+                             accept_wait_ms());
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                // A signal must not skip the only watchdog sample. Without
+                // this, a steady signal stream starves it entirely.
+                check_reactor_stalls();
+                continue;
+            }
             stats_.reactor_failures.fetch_add(1, std::memory_order_relaxed);
             fail();
             break;
