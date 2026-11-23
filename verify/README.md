@@ -12,6 +12,7 @@ bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加�
 - **运行时行为**：关闭语义、背压、空闲判定、故障注入、`send_to` 的每一种回答
 - race 与内存错误：ASan + UBSan、TSan 各跑一整套
 - 头文件被多个翻译单元包含时的 ODR/重复定义问题
+- 连接状态轴的非法组合：debug 构建里的断言 + 一张合法/非法组合与决策效果表
 
 ## 不能验证什么
 

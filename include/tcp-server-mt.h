@@ -908,6 +908,71 @@ struct connection {
             ::close(fd); fd = -1;
         }
     }
+
+    // -------- debug state axes --------
+    // The connection's state is several independent axes, not one enum:
+    //   interest  -- write_armed, read_paused, read_pending
+    //   transport -- fd, peer_closed
+    //   close     -- fsm.closing, fsm.fin_sent, fsm.deferred_round
+    //   activity  -- fsm.draining_input
+    // Collapsing them into one state would multiply out the legal combos and
+    // make the table unreadable; what is needed is the *set* of combos that
+    // must never be observed. These are the ones that have caused bugs here:
+    // a paused read left on the continuation list (spin), a peer FIN mistaken
+    // for "no reply owed" (FIN over answers), a FIN sent over buffered output
+    // (truncated stream), and interest/continuations left on a detached fd
+    // (stale events on a recycled descriptor).
+    //
+    // Pure: reads the axes, changes nothing, always compiled so a suite can
+    // assert on an illegal combo without depending on a debug build. A null
+    // return means legal. Note what is deliberately NOT illegal: a detached
+    // fd with is_closed still false (the rejected-connection rollback closes
+    // the descriptor before it marks the connection), a paused connection
+    // being torn down, EPOLLOUT still armed just after our own FIN, a close
+    // drain running while `closing` is already set by a second request, and
+    // a drain whose handler tore the connection down -- the flag is cleared
+    // in the caller after handle_read returns, so it is still true while the
+    // descriptor is gone. All five are real intermediate states, not bugs.
+    const char* state_violation() const noexcept {
+        const bool closing = fsm.closing.load(std::memory_order_acquire);
+        if (fd < 0) {
+            if (write_armed) return "write interest survives the descriptor";
+            if (read_pending)
+                return "read continuation survives the descriptor";
+            if (closing) return "closing survives the descriptor";
+            return nullptr;
+        }
+        if (read_paused) {
+            if (peer_closed)
+                return "read paused after the peer's FIN";
+            if (read_pending)
+                return "paused connection left on the read continuation list";
+            if (fsm.draining_input)
+                return "close drain serving a read-paused connection";
+        }
+        if (fsm.deferred_round == close_fsm::deferred_kind::peer_closed &&
+            !peer_closed)
+            return "peer-closed round owed without a peer FIN";
+        if (fsm.fin_sent && !closing)
+            return "FIN sent without a closing connection";
+        if (fsm.fin_sent && !fsm.wbuf_empty())
+            return "bytes buffered after our FIN";
+        return nullptr;
+    }
+
+    // The aborting form; compiled out entirely under NDEBUG. Call sites use
+    // state_guard so every exit of a transition is covered.
+    void check_invariants() const noexcept {
+#ifndef NDEBUG
+        if (const char* why = state_violation()) {
+            std::fprintf(stderr,
+                         "connection state invariant violated (id=%" PRIu64
+                         "): %s\n",
+                         static_cast<uint64_t>(id), why);
+            std::abort();
+        }
+#endif
+    }
 };
 
 // One closed connection, held until its close callback has run. The conn is
@@ -1003,6 +1068,34 @@ class sub_reactor {
     void flush_close_callbacks() noexcept;
     void arm_write(connection* c) noexcept;
     void disarm_write(connection* c) noexcept;
+    // Debug state check at both ends of a transition. One line at the top of
+    // each function that moves an axis covers every return path, including
+    // the early ones; under NDEBUG both calls vanish. The guard is deliberately
+    // not applied to close_fsm's pure decisions -- those are checked by the
+    // transition table in verify/state_invariants.cpp instead.
+    struct state_guard {
+        explicit state_guard(connection* c) noexcept {
+#ifndef NDEBUG
+            c_ = c;
+            check();
+#else
+            (void)c;
+#endif
+        }
+        ~state_guard() noexcept {
+#ifndef NDEBUG
+            check();
+#endif
+        }
+        state_guard(const state_guard&) = delete;
+        state_guard& operator=(const state_guard&) = delete;
+#ifndef NDEBUG
+        void check() const noexcept {
+            if (c_) c_->check_invariants();
+        }
+        connection* c_ = nullptr;
+#endif
+    };
     // The one place that computes the epoll interest from
     // (read_paused, peer_closed, write_armed) and applies it.
     void apply_interest(connection* c, const char* fail_reason) noexcept;
@@ -2261,6 +2354,7 @@ inline void sub_reactor::handle_task(send_task& task) noexcept {
     auto it = conns_.find(id);
     if (it == conns_.end()) return;
     connection* c = it->second.get();
+    state_guard guard(c);
     // A parked close still accepts the reply queued before it: the close task
     // only marks the connection when it runs, and it runs after this one in the
     // same batch. Anything arriving after that point is refused here
@@ -2475,6 +2569,7 @@ inline void sub_reactor::apply_interest(connection* c,
 }
 
 inline void sub_reactor::arm_write(connection* c) noexcept {
+    state_guard guard(c);
     // Nothing asked for can ever leave a dead write side, and asking for it
     // each time bytes arrive would spin this reactor on level-triggered
     // EPOLLOUT for the rest of the connection's life.
@@ -2484,6 +2579,7 @@ inline void sub_reactor::arm_write(connection* c) noexcept {
 }
 
 inline void sub_reactor::disarm_write(connection* c) noexcept {
+    state_guard guard(c);
     // Target state, not a toggle: the flag says what the EPOLLOUT bit should
     // be, so the transition is skipped when the bit is already right and issued
     // when it is not. The two are not the same question -- after our FIN the
@@ -2504,6 +2600,7 @@ inline void sub_reactor::disarm_write(connection* c) noexcept {
 // to have in flight. Dropping EPOLLIN is what applies TCP backpressure; the
 // read side resumes from the drain or from the tick fallback.
 inline void sub_reactor::pause_read(connection* c) noexcept {
+    state_guard guard(c);
     if (c->read_paused || c->peer_closed || c->fd < 0 ||
         c->fsm.is_closed.load(std::memory_order_acquire))
         return;
@@ -2517,6 +2614,7 @@ inline void sub_reactor::pause_read(connection* c) noexcept {
 }
 
 inline void sub_reactor::resume_read(connection* c) noexcept {
+    state_guard guard(c);
     if (!c->read_paused) return;
     c->read_paused = false;
     // The assembly deadline measures peer dribbling, so the paused interval is
@@ -2620,6 +2718,7 @@ inline drain_outcome sub_reactor::drain_wbuf_to_socket(connection* c) noexcept {
 // own this reactor, and a full rbuf that still holds whole frames is never
 // mistaken for a peer that has gone quiet.
 inline int sub_reactor::handle_read(connection* c) noexcept {
+    state_guard guard(c);
     unschedule_read(c);
     // A paused connection may still be invoked: an event already in the batch,
     // or a continuation queued before the pause was applied. Do not read, and
@@ -2738,6 +2837,7 @@ inline int sub_reactor::handle_read(connection* c) noexcept {
 }
 
 inline void sub_reactor::handle_write(connection* c) noexcept {
+    state_guard guard(c);
     // Past our FIN there is nothing left to write, and the EPOLLOUT bit is kept
     // clear, so an event arriving here is stale: just make sure it is off.
     if (c->fsm.fin_sent) {
@@ -2821,6 +2921,7 @@ inline void sub_reactor::handle_write(connection* c) noexcept {
 // Sends FIN and records it. Reads stay armed: the connection is now waiting for
 // the peer's own FIN (or close_linger_ms, enforced by do_tick).
 inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
+    state_guard guard(c);
     if (c->fsm.fin_sent || c->fd < 0) return c->fsm.fin_sent;
     // Never FIN over bytes still in wbuf: they would be lost, and the peer
     // would see a clean end to a truncated stream.
@@ -2862,6 +2963,7 @@ inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
 // because a deadline is all it can be sure of. Every half-close initiated by
 // the peer paid for that with an RST it never earned (P0-5).
 inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
+    state_guard guard(c);
     if (c->fsm.is_closed.load(std::memory_order_acquire)) return;
     if (!c->fsm.wbuf_empty()) {
         // Parked with the write side still productive. Read interest is dropped
@@ -3120,6 +3222,7 @@ inline void sub_reactor::parse_frames(connection* c,
 // shutdown(SHUT_WR).
 inline void sub_reactor::unregister_conn(connection* c,
                                          bool graceful) noexcept {
+    state_guard guard(c);
     if (c->fd < 0) return;
     // An abort asks for the reset explicitly instead of relying on whatever the
     // close() picks: SO_LINGER{1,0} drops the send buffer and sends RST. It is
@@ -3162,6 +3265,7 @@ inline void sub_reactor::unregister_conn(connection* c,
 // step for good. It is the same single-exit reasoning, though -- one function,
 // so the two rollback paths cannot drift apart the way they did.
 inline void sub_reactor::discard_rejected_conn(connection* c) noexcept {
+    state_guard guard(c);
     unregister_conn(c);
     conns_.erase(c->id);
     server_->on_connection_closed(c->id);
@@ -3246,6 +3350,7 @@ inline void sub_reactor::close_conn(connection* c, const char* reason,
 // first FIN is still in flight) must not restart the drain or skip it.
 inline void sub_reactor::park_close(connection* c,
                                     const char* reason) noexcept {
+    state_guard guard(c);
     const close_action a = c->fsm.on_graceful();
     if (a == close_action::none) return;
     // A close overrides read backpressure. The FIN exchange needs read
@@ -3336,6 +3441,7 @@ inline void sub_reactor::park_close(connection* c,
 // local decision ("we are done with this peer") into a remote one, which is the
 // behaviour the budget exists to prevent.
 inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
+    state_guard guard(c);
     if (c->fsm.on_request() == close_action::none) return;
     // A close overrides read backpressure: the budget below (measured from
     // what was already buffered) bounds how much this may serve, and the peer
@@ -3421,6 +3527,7 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
 // complete.
 inline void sub_reactor::teardown_closed(connection* c, const char* reason,
                                        bool graceful) noexcept {
+    state_guard guard(c);
     bool expected = false;
     if (!c->fsm.is_closed.compare_exchange_strong(expected, true,
                                              std::memory_order_acq_rel))

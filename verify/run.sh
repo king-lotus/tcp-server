@@ -70,6 +70,8 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o "$out/harness_selftest"
     g++ "${base_flags[@]}" "$@" verify/watermark.cpp -o "$out/watermark"
     g++ "${base_flags[@]}" "$@" verify/hardening.cpp -o "$out/hardening"
+    g++ "${base_flags[@]}" "$@" verify/state_invariants.cpp \
+        -o "$out/state_invariants"
 }
 
 run_all() {
@@ -99,7 +101,8 @@ run_all() {
                    "config_budget:$out/config_budget" \
                    "harness_selftest:$out/harness_selftest" \
                    "watermark:$out/watermark" \
-                   "hardening:$out/hardening"; do
+                   "hardening:$out/hardening" \
+                   "state_invariants:$out/state_invariants"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0

@@ -1,6 +1,6 @@
 # Testing
 
-Eleven suites, thirteen runs, three configurations. `verify/run.sh` is the
+Twelve suites, fourteen runs, three configurations. `verify/run.sh` is the
 authority; `CMakeLists.txt` mirrors it for `ctest`. What follows is how a suite
 is written, and why the client half of every one of them now lives in a single
 file.
@@ -9,7 +9,7 @@ file.
 
 ```
 bash verify/run.sh                               # plain only
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 39 configurations
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 42 configurations
 ```
 
 Each run is a separate build: ASan and TSan cannot be linked into one binary, and
