@@ -1,6 +1,6 @@
 # Testing
 
-Twelve suites, fourteen runs, three configurations. `verify/run.sh` is the
+Thirteen suites, fifteen runs, three configurations. `verify/run.sh` is the
 authority; `CMakeLists.txt` mirrors it for `ctest`. What follows is how a suite
 is written, and why the client half of every one of them now lives in a single
 file.
@@ -9,7 +9,7 @@ file.
 
 ```
 bash verify/run.sh                               # plain only
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 42 configurations
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 45 configurations
 ```
 
 Each run is a separate build: ASan and TSan cannot be linked into one binary, and
@@ -25,6 +25,23 @@ it with assertions, CI calls that script in its own step, and
 outside the three-configuration matrix: the claim is about accept-queue
 behaviour under a low descriptor ceiling, not about sanitizers. A host that
 never reaches EMFILE prints `[SKIP]` instead of a pass.
+
+### The fuzz entry point
+
+`verify/frame_codec.cpp` defines `LLVMFuzzerTestOneInput` alongside the suite's
+own deterministic driver. Both call the same invariant checker, so the ordinary
+matrix exercises the fuzz entry point even on machines without clang's fuzzer.
+A real session is one command:
+
+```bash
+clang++ -std=c++17 -Iinclude -DTCP_FUZZING=1 -fsanitize=fuzzer,address verify/frame_codec.cpp -o decode_header_fuzz
+./decode_header_fuzz -dict=verify/fuzz/decode_header.dict -max_len=12 -max_total_time=60
+```
+
+The dictionary is not decoration: two specific magic bytes out of 65536 are a
+rare mutation to find from empty input, and a fuzzer without them spends its
+time in `need_more`. `TCP_FUZZING=1` drops the suite's `main()` and its
+`harness.h` dependency, leaving the pure header and the checker.
 
 ## Writing a suite
 

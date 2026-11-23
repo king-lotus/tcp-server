@@ -1,0 +1,18 @@
+# libFuzzer dictionary for decode_header(). The magic alone is two specific
+# bytes out of 65536; without these tokens a fuzzer starting from empty input
+# spends almost all of its time in the need_more branch and never reaches the
+# type/length decisions. Use with:
+#
+#   ./decode_header_fuzz -dict=verify/fuzz/decode_header.dict -max_len=12
+
+magic="\xeb\x90"
+type_data="\x00\x01"
+type_ping="\x00\x02"
+type_pong="\x00\x03"
+type_zero="\x00\x00"
+type_foreign="\xff\xff"
+len_zero="\x00\x00\x00\x00"
+len_one="\x00\x00\x00\x01"
+len_max="\x00\x01\x00\x00"
+len_over="\x00\x01\x00\x01"
+len_wrap="\xff\xff\xff\xff"

@@ -72,6 +72,7 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/hardening.cpp -o "$out/hardening"
     g++ "${base_flags[@]}" "$@" verify/state_invariants.cpp \
         -o "$out/state_invariants"
+    g++ "${base_flags[@]}" "$@" verify/frame_codec.cpp -o "$out/frame_codec"
 }
 
 run_all() {
@@ -102,7 +103,8 @@ run_all() {
                    "harness_selftest:$out/harness_selftest" \
                    "watermark:$out/watermark" \
                    "hardening:$out/hardening" \
-                   "state_invariants:$out/state_invariants"; do
+                   "state_invariants:$out/state_invariants" \
+                   "frame_codec:$out/frame_codec"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
@@ -230,6 +232,11 @@ cat <<EOF
     implementation that always returned the first reactor leaves every other
     suite green. It runs twice, at four reactors and at two, so the assertion is
     shown to follow the configuration rather than a constant in the test.
+  - frame_codec checks the eight header bytes without a socket: every status
+    at its boundary, equivalence against the byte order the reactor used
+    before the extraction, and 200000 deterministic inputs through the same
+    entry point clang's fuzzer calls. It fails if the length limit, the magic
+    check or the type-before-length order changes.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as

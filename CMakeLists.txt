@@ -44,7 +44,8 @@ if(TCP_BUILD_SUITES)
         harness_selftest
         watermark
         hardening
-        state_invariants)
+        state_invariants
+        frame_codec)
 
     foreach(suite IN LISTS TCP_SUITES)
         add_executable(${suite} verify/${suite}.cpp)
@@ -68,7 +69,7 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same fourteen runs run.sh performs: twelve suites, plus the two that
+    # The same fifteen runs run.sh performs: thirteen suites, plus the two that
     # run a second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)
@@ -102,6 +103,8 @@ if(TCP_BUILD_SUITES)
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:hardening>)
     add_test(NAME state_invariants
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:state_invariants>)
+    add_test(NAME frame_codec
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:frame_codec>)
 
     # run.sh gives each case 180s so a hang presents as a failure; the same
     # bound here keeps ctest from outliving the CI job.
@@ -110,7 +113,7 @@ if(TCP_BUILD_SUITES)
                          fault_injection reactor_spread
                          reactor_spread_2_reactors config_budget
                          harness_selftest watermark hardening
-                         state_invariants
+                         state_invariants frame_codec
                          PROPERTIES TIMEOUT 180)
 endif()
 

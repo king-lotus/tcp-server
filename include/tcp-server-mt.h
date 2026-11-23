@@ -92,6 +92,74 @@ inline void write_frame_header(uint8_t* out, frame_type type,
     out[7] =  len        & 0xFF;
 }
 
+// The eight header bytes are the only part of a frame whose meaning has to be
+// decided before the payload arrives. Decoding them is a pure function: same
+// bytes and same policy flag, same answer, no I/O, no counters, no allocation.
+// sub_reactor::parse_frames maps the result onto stats and close reasons; a
+// fuzz target can call this directly on arbitrary bytes without a socket, a
+// reactor, or a live connection.
+//
+// The order of the checks is part of the protocol. A bad magic rejects first;
+// an unknown type is decided before the length, because a foreign header's
+// length field is not ours to interpret and waiting for its payload would let
+// the peer hold a connection and a full frame of buffer until the assembly
+// deadline. Only then is the length checked against MAX_FRAME_PAYLOAD.
+enum class header_status : uint8_t {
+    need_more,        // fewer than FRAME_HEADER_SIZE bytes were supplied
+    ok,               // a complete, acceptable header
+    bad_magic,        // the first two bytes are not FRAME_MAGIC
+    unknown_type,     // type outside {DATA, PING, PONG} and not allowed
+    frame_too_large,  // declared payload exceeds MAX_FRAME_PAYLOAD
+};
+
+struct decoded_header {
+    header_status status = header_status::need_more;
+    // Both fields carry a value only when status == ok. On every error path
+    // they are zero/DATA so a caller cannot accidentally act on a length that
+    // was never validated.
+    frame_type type = frame_type::DATA;
+    uint32_t   len  = 0;
+};
+
+// `n` is the number of readable bytes, and may be smaller than the header:
+// that is need_more, not an error. `p` is not read in that case, so a fuzz
+// target may pass nullptr with n == 0. When allow_unknown_types is set, an
+// unrecognised type is reported as DATA -- the same delivery the reactor gave
+// it before this function existed.
+inline decoded_header decode_header(const uint8_t* p, size_t n,
+                                    bool allow_unknown_types) noexcept {
+    if (n < FRAME_HEADER_SIZE) return {};
+    const uint16_t magic = (static_cast<uint16_t>(p[0]) << 8) | p[1];
+    if (magic != FRAME_MAGIC) {
+        return {header_status::bad_magic, frame_type::DATA, 0};
+    }
+    const uint16_t raw_type = (static_cast<uint16_t>(p[2]) << 8) | p[3];
+    const bool known_type =
+        raw_type == static_cast<uint16_t>(frame_type::DATA) ||
+        raw_type == static_cast<uint16_t>(frame_type::PING) ||
+        raw_type == static_cast<uint16_t>(frame_type::PONG);
+    if (!known_type && !allow_unknown_types) {
+        return {header_status::unknown_type, frame_type::DATA, 0};
+    }
+    // Normalise an allowed unknown type to DATA: that is how the reactor has
+    // always delivered it, and it keeps status == ok's type field restricted
+    // to the three values the dispatch code knows about.
+    frame_type type = frame_type::DATA;
+    if (raw_type == static_cast<uint16_t>(frame_type::PING)) {
+        type = frame_type::PING;
+    } else if (raw_type == static_cast<uint16_t>(frame_type::PONG)) {
+        type = frame_type::PONG;
+    }
+    const uint32_t len = (static_cast<uint32_t>(p[4]) << 24)
+                       | (static_cast<uint32_t>(p[5]) << 16)
+                       | (static_cast<uint32_t>(p[6]) <<  8)
+                       |  static_cast<uint32_t>(p[7]);
+    if (len > MAX_FRAME_PAYLOAD) {
+        return {header_status::frame_too_large, frame_type::DATA, 0};
+    }
+    return {header_status::ok, type, len};
+}
+
 inline const std::array<uint8_t, FRAME_HEADER_SIZE>& pong_frame() noexcept {
     static const std::array<uint8_t, FRAME_HEADER_SIZE> k_pong = [] {
         std::array<uint8_t, FRAME_HEADER_SIZE> v{};
@@ -3039,38 +3107,40 @@ inline void sub_reactor::parse_frames(connection* c,
             return;
         }
         c->rbuf.peek(hdr, FRAME_HEADER_SIZE);
-        uint16_t magic = (static_cast<uint16_t>(hdr[0]) << 8) | hdr[1];
-        if (magic != FRAME_MAGIC) {
-            server_->stats_ref().parse_errors.fetch_add(
-                1, std::memory_order_relaxed);
-            close_conn(c, "bad magic", false); return;
-        }
-        frame_type type = static_cast<frame_type>(
-            (static_cast<uint16_t>(hdr[2]) << 8) | hdr[3]);
-        uint32_t len = (static_cast<uint32_t>(hdr[4]) << 24)
-                     | (static_cast<uint32_t>(hdr[5]) << 16)
-                     | (static_cast<uint32_t>(hdr[6]) <<  8)
-                     |  static_cast<uint32_t>(hdr[7]);
-        // The type is in the header, so an unknown one is settled here rather
-        // than after the payload arrives. It is checked before the length: an
-        // unknown type means the length field is not ours to interpret, so a
-        // foreign header with an arbitrary length is a protocol mismatch, not
-        // a framing error. Waiting would also let such a peer hold the
-        // connection -- and up to a full frame of rbuf -- until the assembly
-        // deadline. A connection paused by read backpressure is the exception:
-        // no frame, this header included, is looked at until it resumes.
-        if (type != frame_type::DATA && type != frame_type::PING &&
-            type != frame_type::PONG &&
-            !server_->cfg_.allow_unknown_frame_types) {
-            server_->stats_ref().unknown_frame_types.fetch_add(
-                1, std::memory_order_relaxed);
-            close_conn(c, "unknown frame type", false);
-            return;
-        }
-        if (len > MAX_FRAME_PAYLOAD) {
-            server_->stats_ref().parse_errors.fetch_add(
-                1, std::memory_order_relaxed);
-            close_conn(c, "frame too large", false); return;
+        // Deciding what the header means is decode_header()'s job. What is
+        // left here is what a pure function cannot do: count the failure and
+        // close this connection with the reason the peer can act on. The
+        // check order and the unknown-type policy live in that function, so
+        // there is one copy of them to test. A connection paused by read
+        // backpressure still never reaches this point: no header, partial or
+        // whole, is looked at until it resumes.
+        const decoded_header h = decode_header(
+            hdr, FRAME_HEADER_SIZE,
+            server_->cfg_.allow_unknown_frame_types);
+        const frame_type type = h.type;
+        const uint32_t len = h.len;
+        switch (h.status) {
+            case header_status::bad_magic:
+                server_->stats_ref().parse_errors.fetch_add(
+                    1, std::memory_order_relaxed);
+                close_conn(c, "bad magic", false); return;
+            case header_status::unknown_type:
+                // Kept apart from parse_errors: the stream was intact and
+                // the peer's protocol was not, so the remedies differ.
+                server_->stats_ref().unknown_frame_types.fetch_add(
+                    1, std::memory_order_relaxed);
+                close_conn(c, "unknown frame type", false); return;
+            case header_status::frame_too_large:
+                server_->stats_ref().parse_errors.fetch_add(
+                    1, std::memory_order_relaxed);
+                close_conn(c, "frame too large", false); return;
+            case header_status::need_more:
+                // Unreachable: the loop condition established that a whole
+                // header is readable. Returning rather than falling through
+                // keeps a future edit from acting on an unvalidated length.
+                return;
+            case header_status::ok:
+                break;
         }
         // Partial frame, wait for more. Start the assembly deadline on the
         // first byte of this frame; later bytes do not refresh it, or a peer

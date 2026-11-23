@@ -73,6 +73,15 @@ Every frame is an 8-byte big-endian header followed by up to 64 KiB of payload.
   hold the frame, or a received frame that cannot be answered (see [close
   reasons](#close-reasons)) ends the connection with a reset rather than a
   partial delivery.
+- The inline pure function `decode_header(const uint8_t*, size_t, bool
+  allow_unknown_types)` makes those header decisions without a socket, a
+  connection or a counter. It returns a `decoded_header` whose `status` is one
+  of `need_more`, `ok`, `bad_magic`, `unknown_type`, `frame_too_large`; `type`
+  and `len` carry a value only when the status is `ok`. The check order —
+  magic, then type, then length — is part of the protocol. `parse_frames`
+  maps the status onto a close reason and a statistic; `verify/frame_codec.cpp`
+  exercises the same function with a table, an equivalence check against the
+  old byte order, and a libFuzzer entry point.
 
 ## Quick start
 
