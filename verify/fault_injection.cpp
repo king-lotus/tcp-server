@@ -7,11 +7,14 @@
 // means for a thread that left its loop through an exception rather than a
 // request.
 //
-//   A. fail_worker_for_test -- a reactor throwing out of loop() must be visible
-//      (reactor_failures, is_running() false), must not take the process with it,
-//      and must leave a stoppable server behind.
-//   B. fail_accept_for_test -- same for accept_loop(), plus: the listening socket it
-//      owned must go away, or the port is held by a server that is not listening.
+//   A. fail_worker_for_test -- exactly one reactor throws out of loop(), and it
+//      must be quarantined rather than fatal: reactor_failures moves once,
+//      is_running() stays true, the survivor answers, reactor_stats() reports
+//      the dead slot, a second failure kills the last reactor, and the server
+//      still stops and restarts cleanly.
+//   B. fail_accept_for_test -- the accept loop's exception is still fatal,
+//      plus: the listening socket it owned must go away, or the port is held
+//      by a server that is not listening.
 //   C. Injecting across repeated restarts -- anything that claims a failed worker
 //      is recoverable has to survive being restarted after one died, because that
 //      is the only shape "recoverable" can take that anyone would rely on.
@@ -43,6 +46,9 @@
 //   J. reactor_stall_timeout_ms -- per-reactor stats sum to the lifetime
 //      aggregate, survive a restart, zero their connection counts on teardown,
 //      and expose a blocked reactor without stopping the server.
+//   K. fail_worker_reactor_for_test -- quarantining the reactor that owns a
+//      connection resets that peer with the close reason "reactor failure"
+//      while the surviving reactor keeps the server running.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -155,22 +161,79 @@ int main() {
     base.bind_addr = "127.0.0.1";
     base.num_reactors = 2;
 
-    // ---- A: a reactor throwing out of its loop ------------------------------
+    // ---- A: one reactor throwing out of its loop ----------------------------
+    //
+    // The failpoint is consumed by an exchange, so exactly one reactor throws
+    // even when both are due to run. That makes "one quarantined, one serving"
+    // an assertion about the design rather than about the scheduler.
     {
-        std::printf("A. a reactor leaves its loop through an exception\n");
+        std::printf("A. one reactor leaves its loop; the survivor serves\n");
         multi_reactor_server::config cfg = base;
         cfg.port = free_port();
+        cfg.num_reactors = 2;
+        cfg.tick_ms = 20;
         multi_reactor_server server(cfg);
         harness::expect(server.start(), "start() ok");
         const uint64_t before = server.stats().reactor_failures.load();
+        harness::expect(server.is_running(), "running before the fault");
+
+        auto dead_slots = [&](size_t* count, size_t* first) {
+            *count = 0;
+            *first = 0;
+            const auto v = server.reactor_stats();
+            for (size_t i = 0; i < v.size(); ++i) {
+                if (!v[i].dead) continue;
+                if (*count == 0) *first = i;
+                ++*count;
+            }
+        };
 
         server.fail_worker_for_test.store(true);
+        harness::expect(wait_for(3000, [&] {
+                            size_t n = 0, first = 0;
+                            dead_slots(&n, &first);
+                            return n == 1 &&
+                                   server.stats().reactor_failures.load() ==
+                                       before + 1;
+                        }),
+                        "exactly one reactor was quarantined");
+        harness::expect(server.is_running(),
+                        "the server keeps running while a reactor survives");
+
+        // The survivor is the only reactor pick_reactor() can hand the new
+        // connection to, so a PING answered here proves it is serving.
+        harness::peer p;
+        harness::expect(static_cast<bool>(p.connect(server.port())),
+                        "a client connects");
+        harness::expect(static_cast<bool>(
+                            p.send(industrial::frame_type::PING, nullptr, 0)),
+                        "PING sent");
+        harness::frame reply;
+        harness::expect(static_cast<bool>(p.expect_frame(&reply, 2000)),
+                        "the surviving reactor answered");
+        harness::expect(reply.type == industrial::frame_type::PONG,
+                        "the answer is a PONG");
+
+        // A second failure leaves no reactor alive, which is fatal.
+        server.fail_worker_for_test.store(true);
         harness::expect(wait_for(3000, [&] { return !server.is_running(); }),
-               "the server stops reporting itself as running");
-        harness::expect(server.stats().reactor_failures.load() > before,
-               "reactor_failures counted it");
+                        "the last reactor's failure stops the server");
+        harness::expect(server.stats().reactor_failures.load() == before + 2,
+                        "the second failure was counted exactly once");
+        {
+            size_t n = 0, first = 0;
+            dead_slots(&n, &first);
+            harness::expect(n == 2, "both reactor slots report dead");
+        }
         harness::expect(within(3000, "stop()", [&] { server.stop(); }),
-               "stop() still completes");
+                        "stop() still completes");
+
+        harness::expect(server.start(),
+                        "the server restarts after a quarantine");
+        harness::expect(server.is_running(), "the restarted server runs");
+        harness::expect(within(3000, "stop()", [&] { server.stop(); }),
+                        "the second stop completes");
+        p.close();
     }
 
     // ---- B: the accept loop throwing ----------------------------------------
@@ -652,6 +715,95 @@ int main() {
         harness::expect(within(3000, "stop()", [&] { server.stop(); }),
                         "the second stop completes");
         peer.close();
+    }
+
+    // ---- K: quarantining a reactor resets its connections -------------------
+    //
+    // The connection is placed first and its owning reactor is read from
+    // reactor_stats()[i].connections; the indexed failpoint then targets that
+    // reactor. The peer must see a reset (the reactor is gone, so a graceful
+    // FIN exchange cannot be completed) and the close callback must name
+    // "reactor failure". The other reactor keeps the server running.
+    {
+        std::printf("K. a quarantined reactor resets its connections\n");
+        multi_reactor_server::config cfg = base;
+        cfg.port = free_port();
+        cfg.num_reactors = 2;
+        cfg.tick_ms = 20;
+        cfg.idle_timeout_ms = 60000;
+        cfg.close_linger_ms = 1000;
+
+        std::atomic<uint64_t> id{0};
+        std::atomic<int> closed{0};
+        std::atomic<int> reason_ok{0};
+        multi_reactor_server server(cfg);
+        server.set_message_handler(
+            [&](uint64_t cid, const uint8_t*, size_t) {
+                id.store(cid, std::memory_order_release);
+            });
+        server.set_close_handler(
+            [&](uint64_t, const std::string&, const char* reason) {
+                if (reason != nullptr &&
+                    std::strcmp(reason, "reactor failure") == 0) {
+                    reason_ok.fetch_add(1, std::memory_order_relaxed);
+                }
+                closed.fetch_add(1, std::memory_order_relaxed);
+            });
+        harness::expect(server.start(), "start() ok");
+
+        harness::peer p;
+        harness::expect(static_cast<bool>(p.connect(server.port())),
+                        "client connected");
+        harness::expect(static_cast<bool>(
+                            p.send(industrial::frame_type::DATA, "x", 1)),
+                        "frame sent");
+        harness::expect(wait_for(2000, [&] { return id.load() != 0; }),
+                        "the connection is admitted");
+
+        // reactor_stats() is the only public way to learn which slot owns it.
+        int owner = -1;
+        harness::expect(wait_for(2000, [&] {
+                            const auto v = server.reactor_stats();
+                            for (size_t i = 0; i < v.size(); ++i) {
+                                if (v[i].connections == 1) {
+                                    owner = static_cast<int>(i);
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }),
+                        "the owning reactor is identified");
+
+        if (owner >= 0) {
+            const uint64_t failures_before =
+                server.stats().reactor_failures.load();
+            server.fail_worker_reactor_for_test.store(owner);
+            harness::expect(wait_for(3000, [&] {
+                                return server.stats().reactor_failures.load() >
+                                       failures_before;
+                            }),
+                            "the targeted reactor failed");
+            harness::expect(static_cast<bool>(
+                                p.expect_close(harness::close_kind::rst, 2000)),
+                            "its peer saw a reset, not a FIN");
+            harness::expect(wait_for(2000, [&] {
+                                return reason_ok.load() == 1 &&
+                                       closed.load() == 1;
+                            }),
+                            "the close callback reported \"reactor failure\"");
+            harness::expect(server.is_running(),
+                            "the surviving reactor keeps the server running");
+            {
+                const auto v = server.reactor_stats();
+                harness::expect(v.size() == 2 &&
+                                    static_cast<size_t>(owner) < v.size() &&
+                                    v[owner].dead,
+                                "the targeted slot is marked dead");
+            }
+        }
+        harness::expect(within(3000, "stop()", [&] { server.stop(); }),
+                        "stop() completes");
+        p.close();
     }
 
     return harness::finish();

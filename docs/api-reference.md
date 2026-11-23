@@ -256,8 +256,10 @@ up to `tick_ms` to notice; the controlling thread still has to call `stop()`,
 which wakes and joins them.
 
 **`wait()`** blocks while the server is running, polling every 200 ms. It
-returns once the server has stopped — including when a reactor failed, which
-sets `failed` and makes `is_running()` false.
+returns once the server has stopped — including when the accept thread failed,
+or when the last live reactor failed; either sets `failed` and makes
+`is_running()` false. A reactor that fails while another is still alive is
+quarantined and does **not** make `wait()` return.
 
 ### Sending
 
@@ -335,9 +337,11 @@ traffic counters are cumulative since construction, the same as `server_stats`
 (and stay cumulative across restarts). `connections` is the count the reactor
 last published, reset to 0 by its teardown. `last_progress_ms` is the
 steady-clock millisecond of its last completed loop iteration, 0 until it runs.
-`dead` is set when the reactor's loop failed. Each field is read atomically
-from a fixed slot array, so a snapshot can mix adjacent iterations; it is not a
-transactional view.
+`dead` is set when the reactor's loop failed and the reactor was quarantined:
+the slot takes no new connections, its connections were reset with the
+`reactor failure` close reason, and the server keeps serving on the remaining
+reactors. Each field is read atomically from a fixed slot array, so a snapshot
+can mix adjacent iterations; it is not a transactional view.
 
 `port()` is the port actually bound: it equals `config::port` unless that was
 `0`. It returns `0` before `start()` has bound and after `stop()` has closed.
@@ -346,10 +350,13 @@ transactional view.
 are O(shards) plus the result size; `connection_ids()` allocates. Neither is
 meant for a hot path.
 
-`is_running()` is true only when the lifecycle reached running **and** no
-component has failed. A failed reactor or accept thread clears it without
-rewriting the lifecycle state, so a `start()` verdict is never retroactively
-changed.
+`is_running()` is true only when the lifecycle reached running **and** no fatal
+failure has been raised. A reactor failure is fatal only when no reactor is left
+alive: the first failure quarantines that reactor, resets its connections and
+lets the server keep serving, so `is_running()` remains true while at least one
+reactor survives. The accept thread's failure, or the last live reactor's, is
+fatal and clears the flag. Neither rewrites the lifecycle state, so a `start()`
+verdict is never retroactively changed.
 
 ## `send_result`
 
@@ -368,7 +375,7 @@ iteration: exact when idle, up to one iteration behind under load.
 | Field | Counted when |
 |---|---|
 | `accepted` | A reactor takes ownership of an accepted connection. |
-| `rejected` | A socket is turned away before a reactor owns it: the admission ceiling was reached, the byte budget or the per-IP cap refused it, or registration failed (`epoll_ctl`, a map insert, a declining `conn_state_handler`, an allocation failure). Not a capacity gauge on its own — pair it with `buffer_budget_rejections`, `ip_rejections`, `epoll_ctl_errors` and `accept_errors`. |
+| `rejected` | A socket is turned away before a reactor owns it: the admission ceiling was reached, the byte budget or the per-IP cap refused it, registration failed (`epoll_ctl`, a map insert, a declining `conn_state_handler`, an allocation failure), or every reactor was quarantined so none could take it. Not a capacity gauge on its own — pair it with `buffer_budget_rejections`, `ip_rejections`, `epoll_ctl_errors` and `accept_errors`. |
 | `buffer_budget_rejections` | A connection was refused because `max_total_buffer_bytes` had no room for its buffers. |
 | `ip_rejections` | A connection was refused because its peer address already holds `max_connections_per_ip` connections. |
 | `closed` | A connection is fully torn down, whatever the reason. |
@@ -384,7 +391,7 @@ iteration: exact when idle, up to one iteration behind under load.
 | `idle_timeouts` | No activity within `idle_timeout_ms`, where activity is bytes received or bytes drained to the peer. |
 | `frame_assembly_timeouts` | A partial frame did not complete within `frame_assembly_timeout_ms`, even though bytes were arriving. |
 | `epoll_ctl_errors` | An `epoll_ctl` registration failed. |
-| `reactor_failures` | A reactor thread crashed or exited abnormally. |
+| `reactor_failures` | A reactor thread crashed or exited abnormally. That reactor is quarantined: it accepts no new connections, its connections are reset (close reason `reactor failure`), and the server keeps serving while another reactor is alive. The increment that empties the pool — or any accept-thread failure — is fatal. |
 | `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. Observational: the server is not stopped. |
 | `accept_errors` | `accept4` failed. `EMFILE` is answered with the reserved descriptor; `ENFILE` is not, and keeps the backoff. |
 | `fd_exhausted_drops` | A connection was reset because the process ran out of descriptors and the spare was spent on it. The peer learns immediately instead of waiting in the backlog. |
@@ -410,6 +417,7 @@ The `reason` passed to `close_handler`, and why each one appears.
 | `close linger expired` | The graceful close did not finish within `close_linger_ms`: either the FIN went unanswered, or the output ahead of it never drained. |
 | `requested` | `close_connection` asked for a graceful close. |
 | `server shutdown` | `stop()` tore the connection down. |
+| `reactor failure` | The reactor that owned the connection failed and was quarantined; its connections are reset rather than drained. The server keeps serving if another reactor is alive. |
 | `bad magic` | Frame header did not start with `0xEB90`. |
 | `frame too large` | Declared length exceeded 65536. |
 | `unknown frame type` | Type was not `1`/`2`/`3`, and `allow_unknown_frame_types` was false. |

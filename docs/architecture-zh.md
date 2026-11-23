@@ -333,8 +333,8 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 
 ### 6.2 中止（内部路径）
 
-协议错误、`hup/err`、linger 到期、帧装配超时、PONG 发不出去，以及未排空的
-`stop()` 等走
+协议错误、`hup/err`、linger 到期、帧装配超时、PONG 发不出去、reactor 被隔离
+（关闭原因 `reactor failure`），以及未排空的 `stop()` 等走
 `close_conn(..., graceful=false)`：设置 `SO_LINGER{1,0}`，丢弃待发数据并让内核
 发 RST。对端看到的是重置，不是有序 FIN。
 
@@ -443,7 +443,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | 计数器 | 何时增加 |
 |---|---|
 | `accepted` | 连接在 reactor 中完成注册（不是 accept 返回时） |
-| `rejected` | 超过 `max_connections` / `max_total_buffer_bytes` / `max_connections_per_ip`，或注册失败 |
+| `rejected` | 超过 `max_connections` / `max_total_buffer_bytes` / `max_connections_per_ip`、注册失败，或所有 reactor 都已隔离、无人可接收 |
 | `buffer_budget_rejections` | 因 `max_total_buffer_bytes` 无空余被拒 |
 | `ip_rejections` | 因同一 IP 达到 `max_connections_per_ip` 被拒 |
 | `buffer_bytes` | 当前被准入连接预占的缓冲字节（gauge） |
@@ -459,7 +459,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `idle_timeouts` | 空闲超时触发 |
 | `frame_assembly_timeouts` | 不完整帧超过 `frame_assembly_timeout_ms`（字节仍在到达） |
 | `epoll_ctl_errors` | `epoll_ctl` 失败 |
-| `reactor_failures` | reactor 线程异常退出 |
+| `reactor_failures` | reactor 线程异常退出。该 reactor 被隔离：不再接新连接、其连接全部重置（关闭原因 `reactor failure`）；只要还有别的 reactor 存活，服务器继续服务 |
 | `reactor_stalls` | stall watchdog 发现某 reactor 超过 `reactor_stall_timeout_ms` 未完成一轮循环（仅观察，不停服） |
 | `accept_errors` | `accept4` 因 fd 耗尽失败（EMFILE/ENFILE） |
 | `pending_tasks_total` | 累计入队任务数 |
@@ -481,6 +481,20 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 `server_stats` 的热计数器按 64 字节隔离，避免不同 reactor 更新不同计数器时的
 false sharing；同一个计数器（例如 `frames_sent`）仍由多个 reactor 更新，但频率
 从每帧降到每轮一次。
+
+### 9.1 reactor 隔离（quarantine）
+
+单个 reactor 的循环因异常或 `epoll_wait` 失败退出时，它把自己标记为 dead，
+`reactor_failures` 加一，但**不会**立即让服务器失效。`live_reactors_` 是一个
+原子计数，在任何 reactor 线程启动前就被设为整组 reactor 的数量（某个
+`start()` 拒绝则减一）；只要它还大于零，`is_running()` 保持为真：
+accept 线程每轮调用
+`reap_dead_reactors()` 把这个 reactor `join` 掉、关闭它的 epoll/eventfd，
+`pick_reactor()` 跳过它，因此它不再接新连接；它原有的连接在退出前的
+`cleanup("reactor failure")` 中全部以 RST 重置。最后一个存活 reactor 失败
+（`live_reactors_` 的递减返回 1）或 accept 线程失败时，才会调用 `fail()`，
+`is_running()` 转假。判断“最后一个”只使用这一个原子计数的返回值，不通过扫描
+各 reactor 的标志位——后者在弱内存模型下是可与“标记 dead”重排的 Dekker 竞争。
 
 ---
 

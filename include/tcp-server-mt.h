@@ -354,7 +354,11 @@ struct server_stats {
     // idle_timeouts, this fires while bytes are still arriving.
     std::atomic<uint64_t> frame_assembly_timeouts{0};
     std::atomic<uint64_t> epoll_ctl_errors{0};
-    // reactor threads that crashed or exited abnormally
+    // A reactor thread crashed or exited abnormally. The reactor is
+    // quarantined -- it takes no new connections and its connections are
+    // reset -- and the server keeps serving while at least one other reactor
+    // is alive. The count that makes the pool empty (or an accept-thread
+    // failure) is fatal.
     std::atomic<uint64_t> reactor_failures{0};
     // The accept thread's watchdog observed a live reactor whose last
     // completed loop iteration is older than reactor_stall_timeout_ms.
@@ -1014,7 +1018,10 @@ class sub_reactor {
     // Defined after the class: GCC will not instantiate this member-function
     // template from an in-class initializer.
     static const dispatch_table k_task_dispatch;
-    void cleanup() noexcept;
+    // Tears down every connection this reactor still owns. reason names the
+    // cause in the close callback; a quarantined reactor passes
+    // "reactor failure", a normal shutdown keeps "server shutdown".
+    void cleanup(const char* reason = "server shutdown") noexcept;
     // Publish the per-reactor traffic counters to the shared stats, then reset
     // them. Called once per loop iteration and once on loop exit, so each
     // counter is exact at idle and can lag one iteration while traffic flows.
@@ -1044,6 +1051,16 @@ class sub_reactor {
     int               wake_fd_  = -1;
     // Worker-owned: false means this reactor accepts no more submissions.
     std::atomic<bool> running_{false};
+    // Set once when this reactor's loop died (a throw, or epoll_wait failing).
+    // It is the quarantine flag: pick_reactor() skips it, the reactor's own
+    // connections are reset by cleanup(), and the accept thread joins it
+    // through stop(). Read with acquire so the slot/counters published before
+    // the store are visible to whoever observes the quarantine.
+    std::atomic<bool> dead_{false};
+    // Set once by the accept thread's reaper immediately before it calls
+    // stop() on a dead reactor, so the join happens exactly once. CAS'd rather
+    // than stored: two reaping passes must not both enter stop().
+    std::atomic<bool> reaped_{false};
     // The server's fixed counter slot for this reactor, set on start. The
     // array is sized to the maximum reactor count, so idx_ is always in range.
     reactor_slot*     slot_ = nullptr;
@@ -1468,8 +1485,20 @@ class multi_reactor_server {
     // The checks are a relaxed load on an owned cache line in production; the
     // macro remains the build guard fault_injection.cpp uses to prove it was
     // not accidentally compiled without its switches.
+    // One-shot: the next loop iteration of exactly one reactor throws. The
+    // switch is consumed with a load followed by an exchange, so two reactors
+    // cannot both observe true (the old load/store pair let every reactor
+    // scheduled in the same window throw, which made "one deterministic death"
+    // untestable). The loop reads it with a relaxed load and only pays for the
+    // exchange when it is set.
     std::atomic<bool> fail_worker_for_test{false};
     std::atomic<bool> fail_accept_for_test{false};
+    // One-shot, -1 = off. Otherwise the reactor whose index matches throws on
+    // its next loop iteration; the switch resets itself to -1 when it fires.
+    // The fault-injection suite uses it to quarantine a chosen reactor -- in
+    // particular the one owning a connection, found through
+    // reactor_stats()[i].connections.
+    std::atomic<int> fail_worker_reactor_for_test{-1};
     // One-shot: the next accept setup's first epoll registration fails, after
     // the spare descriptor has been opened. Used to prove a failed start
     // releases the spare as well as the descriptors start() knows about.
@@ -1488,9 +1517,11 @@ class multi_reactor_server {
     // tick sweep.
     std::atomic<bool> fail_close_enqueue_for_test{false};
     // Blocks while is_running() holds, polling every 200ms. That is not the
-    // same as "until stop() was called": a reactor or accept failure clears the
-    // same flag, so returning means the server is down, not that it was asked
-    // to stop. Never call it from a callback -- that thread would be waiting
+    // same as "until stop() was called": the accept thread's failure, or the
+    // failure of the last live reactor, clears the same flag, so returning
+    // means the server is down, not that it was asked to stop. A reactor that
+    // fails while another is alive is quarantined and does not make this
+    // return. Never call it from a callback -- that thread would be waiting
     // for a condition only its own exit can satisfy, while stop() waits to join
     // it.
     void wait()  noexcept;
@@ -1547,7 +1578,9 @@ class multi_reactor_server {
     // same as server_stats(); `connections` is the count the reactor last
     // published (0 after its teardown); `last_progress_ms` is the steady-clock
     // millisecond of its last completed loop iteration (0 until it runs); and
-    // `dead` is set when its loop failed. Reads are per-field atomics from a
+    // `dead` is set when its loop failed and the reactor was quarantined --
+    // that slot takes no new connections and its connections are reset. Reads
+    // are per-field atomics from a
     // fixed slot array, so a snapshot can mix two adjacent iterations; it is
     // not a transactional view.
     struct reactor_stats_view {
@@ -1565,9 +1598,12 @@ class multi_reactor_server {
     bool   on_connection_opened(uint64_t id,
                                 std::shared_ptr<connection> c) noexcept;
     void   on_connection_closed(uint64_t id) noexcept;
-    // running means: lifecycle reached running AND no component has failed.
-    // A reactor/accept thread failure only raises failed_; it never rewrites
-    // the lifecycle state, so start()'s success/failure verdict stays
+    // running means: lifecycle reached running AND no fatal failure has been
+    // raised. A reactor failure is not fatal while another reactor is alive:
+    // the dead reactor is quarantined (no new connections, its connections
+    // reset) and true keeps being returned. The last live reactor's failure,
+    // or the accept thread's, raises failed_ and makes this false. Neither
+    // rewrites the lifecycle state, so start()'s success/failure verdict stays
     // unambiguous.
     bool   is_running() const noexcept {
         return life_.load(std::memory_order_acquire) == life::running &&
@@ -1594,8 +1630,9 @@ class multi_reactor_server {
         stopped = 0, starting = 1, running = 2, stopping = 3
     };
 
-    // Single upward-only failure flag shared by the accept loop and all
-    // reactors.
+    // Single upward-only failure flag, raised by the accept loop and by the
+    // last live reactor. A reactor failing while another is alive does not
+    // touch it: that reactor is quarantined, not a server failure.
     // Independent of the lifecycle state so it can be raised concurrently.
     void fail() noexcept { failed_.store(true, std::memory_order_release); }
     // Step down from running and wake everyone; no-op unless running.
@@ -1672,6 +1709,17 @@ class multi_reactor_server {
         ~accept_cleanup() { server->close_accept_descriptors(); }
     };
     sub_reactor* pick_reactor() noexcept;
+    // Called by a reactor whose loop is leaving through a failure. Marks the
+    // reactor quarantined, counts it, and stops the server only when it was the
+    // last live one. The accept thread is woken so it reaps the dead reactor
+    // promptly. Exactly one call per failed reactor: the loop has one catch and
+    // one non-EINTR epoll_wait exit, and both break out.
+    void on_reactor_failed(sub_reactor* r) noexcept;
+    // Accept-thread-only reaper: joins each dead reactor once, closing its
+    // epoll fd and eventfd. reactors_ is stable while the accept thread runs,
+    // and stop()/stop_gracefully() join that thread before touching the vector,
+    // so the join below never races another join.
+    void reap_dead_reactors() noexcept;
     // Per-reactor slots: allocated once at the maximum reactor count so a
     // changed resolved count between restarts can never index past them.
     bool ensure_reactor_slots(size_t n) noexcept;
@@ -1706,6 +1754,12 @@ class multi_reactor_server {
     std::atomic<bool>     accepting_{false};
     std::atomic<uint64_t> next_conn_id_{1};
     std::atomic<size_t>   next_reactor_{0};
+    // How many reactors are still alive. start_reactors() sets it to the full
+    // set before any reactor thread exists; on_reactor_failed() decrements it,
+    // and the decrement that takes it to 0 is what fails the server. This
+    // single atomic is the last-live decision: scanning per-reactor flags after
+    // a store would be a Dekker race that weak memory models are free to lose.
+    std::atomic<size_t>   live_reactors_{0};
     // Serializes start() and stop(); stop_gracefully() only takes it through
     // its final stop(), so it assumes the same controlling thread as those two
     // and must not run concurrently with them. Submissions hold their barrier
@@ -1851,7 +1905,7 @@ inline void sub_reactor::stop() noexcept {
     }
 }
 
-inline void sub_reactor::cleanup() noexcept {
+inline void sub_reactor::cleanup(const char* reason) noexcept {
     multi_reactor_server::callback_scope callbacks(server_);
     // Discard waiting tasks. A new_conn_task's fd_guard closes an unclaimed
     // socket; a send_task's frame vector is freed with the task.
@@ -1876,7 +1930,7 @@ inline void sub_reactor::cleanup() noexcept {
         // last bytes. Abort explicitly, and account the undelivered bytes as
         // drops rather than pretending they went out.
         std::shared_ptr<connection> c = conns_.begin()->second;
-        close_conn(c.get(), "server shutdown", false);
+        close_conn(c.get(), reason, false);
     }
     flush_close_callbacks();
     active_tasks_.clear();
@@ -3479,9 +3533,22 @@ inline void sub_reactor::loop() noexcept {
             if (slot_)
                 slot_->last_progress_ms.store(
                     now_ms(), std::memory_order_relaxed);
-            if (server_->fail_worker_for_test.load(std::memory_order_relaxed)) {
-                server_->fail_worker_for_test.store(
-                    false, std::memory_order_relaxed);
+            // Load first and exchange only when it is set: one reactor wins
+            // the exchange and throws, so injection produces exactly one
+            // quarantine rather than every reactor scheduled in the same
+            // window.
+            if (server_->fail_worker_for_test.load(std::memory_order_relaxed) &&
+                server_->fail_worker_for_test.exchange(
+                    false, std::memory_order_relaxed)) {
+                throw 1;
+            }
+            // The indexed form targets one reactor deterministically; the
+            // exchange resets it so the injection is one-shot.
+            const int who = server_->fail_worker_reactor_for_test.load(
+                std::memory_order_relaxed);
+            if (who == idx_ &&
+                server_->fail_worker_reactor_for_test.exchange(
+                    -1, std::memory_order_relaxed) == idx_) {
                 throw 1;
             }
             // Only visit queued continuations. A fixed batch bounds work even
@@ -3500,10 +3567,7 @@ inline void sub_reactor::loop() noexcept {
                                  read_head_ ? 0 : tick_ms);
             if (n < 0) {
                 if (errno == EINTR) continue;
-                if (slot_) slot_->dead.store(true, std::memory_order_release);
-                server_->stats_ref().reactor_failures.fetch_add(
-                    1, std::memory_order_relaxed);
-                server_->fail();
+                server_->on_reactor_failed(this);
                 break;
             }
             for (int i = 0; i < n; ++i) {
@@ -3579,19 +3643,23 @@ inline void sub_reactor::loop() noexcept {
         }
         publish_stats();
     } catch (...) {
-        if (slot_) slot_->dead.store(true, std::memory_order_release);
-        server_->stats_ref().reactor_failures.fetch_add(
-            1, std::memory_order_relaxed);
-        // Raise the failure flag only; the lifecycle state stays untouched so a
-        // concurrent start() verdict is not overwritten by a worker crash.
-        server_->fail();
+        // Quarantine this reactor. If it was the last live one, this raises the
+        // failure flag; otherwise the server keeps serving on the survivors.
+        // The lifecycle state stays untouched so a concurrent start() verdict
+        // is not overwritten by a worker crash.
+        server_->on_reactor_failed(this);
     }
     // Reject submissions even when the loop failed rather than being stopped.
     {
         std::lock_guard<std::mutex> lk(pending_mutex_);
         running_.store(false, std::memory_order_release);
     }
-    cleanup();
+    // A failed reactor's connections are reset under "reactor failure"; a
+    // reactor leaving on request keeps the shutdown reason. The accept thread
+    // reaps the failed one afterwards, and its stop() runs cleanup() again on
+    // an empty set.
+    cleanup(dead_.load(std::memory_order_acquire)
+                ? "reactor failure" : "server shutdown");
     current_ = nullptr;
 }
 
@@ -3839,18 +3907,33 @@ inline void multi_reactor_server::warn_fd_ceiling() noexcept {
 // Starts every reactor. A partial set is left in place for the caller's
 // rollback guard, which is the single owner of teardown; a reactor that never
 // made it into the vector is cleaned by its own destructor.
+//
+// The whole set is built before any thread starts. The accept thread reaps and
+// pick_reactor() scans reactors_, and neither takes a lock; growing the vector
+// while they run would be a data race. After this function returns, the vector
+// is immutable until stop() has joined the accept thread.
 inline bool multi_reactor_server::start_reactors(int n_reactors) noexcept {
     try {
         reactors_.reserve(static_cast<size_t>(n_reactors));
-        for (int i = 0; i < n_reactors; ++i) {
-            auto r = std::make_unique<sub_reactor>(i, this);
-            if (!r->start()) return false;
-            reactors_.push_back(std::move(r));
-        }
-        return true;
+        for (int i = 0; i < n_reactors; ++i)
+            reactors_.push_back(std::make_unique<sub_reactor>(i, this));
     } catch (...) {
-        return false;
+        return false;   // rollback_start() stops and clears the partial set
     }
+    // Count the whole set before any thread exists. A reactor that dies during
+    // bring-up must not be mistaken for "the last live one" while its
+    // successors are merely not started yet: with per-start increments, a
+    // reactor failing before the next was counted would drive the count to 0
+    // and fail a start that would have had survivors. A refused start() is
+    // subtracted back so the count still means "alive, or about to be".
+    live_reactors_.store(reactors_.size(), std::memory_order_release);
+    for (auto& r : reactors_) {
+        if (!r->start()) {
+            live_reactors_.fetch_sub(1, std::memory_order_acq_rel);
+            return false;
+        }
+    }
+    return true;
 }
 
 // Startup handshake: returns once the accept thread reports in. Success means
@@ -3971,14 +4054,11 @@ inline void multi_reactor_server::stop() noexcept {
     // already did this)
     stop_accepting();
 
-    // The accept thread is gone; the fds it owned are safe to close now
-    if (wake_fd_   >= 0) {
-        ::close(wake_fd_);   wake_fd_   = -1;
-    }
-    if (epoll_fd_  >= 0) {
-        ::close(epoll_fd_);  epoll_fd_  = -1;
-    }
-    close_listen_socket();
+    // Close the accept thread's descriptors under the mutex that
+    // wake_accept_loop() holds. Reactors are still running here: one that
+    // fails during shutdown calls wake_accept_loop(), and closing these
+    // descriptor numbers around that write would be a race on a recycled fd.
+    close_accept_descriptors();
 
     // Stop every reactor; is_running() already refuses new send_to /
     // close_connection
@@ -4180,11 +4260,51 @@ inline bool multi_reactor_server::offload(uint64_t conn_id,
     }
 }
 
+inline void multi_reactor_server::on_reactor_failed(
+        sub_reactor* r) noexcept {
+    // Order matters: publish the quarantine flag, then count the failure, then
+    // decide whether this was the last live reactor. The decrement's return
+    // value is the whole decision -- resetting a flag and scanning the others
+    // would be a store-then-scan over separate atomics, which a weak memory
+    // model is free to reorder into "nobody was last".
+    r->dead_.store(true, std::memory_order_release);
+    if (r->slot_)
+        r->slot_->dead.store(true, std::memory_order_release);
+    stats_.reactor_failures.fetch_add(1, std::memory_order_relaxed);
+    if (live_reactors_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        fail();
+    // The accept thread owns the reaper, and its own epoll does not see a
+    // reactor's death; wake it so the dead reactor is joined promptly instead
+    // of after its 500 ms wait.
+    wake_accept_loop();
+}
+
+inline void multi_reactor_server::reap_dead_reactors() noexcept {
+    for (auto& r : reactors_) {
+        if (!r->dead_.load(std::memory_order_acquire)) continue;
+        // The CAS is the claim on the join. stop() runs the teardown and
+        // closes this reactor's epoll fd and eventfd; the reactor's own loop
+        // already ran cleanup() before exiting, so no close callback is
+        // delivered from the accept thread.
+        if (r->reaped_.exchange(true, std::memory_order_acq_rel)) continue;
+        r->stop();
+    }
+}
+
 inline sub_reactor* multi_reactor_server::pick_reactor() noexcept {
-    if (reactors_.empty()) return nullptr;
-    size_t i = next_reactor_.fetch_add(1, std::memory_order_relaxed) %
-               reactors_.size();
-    return reactors_[i].get();
+    const size_t n = reactors_.size();
+    if (n == 0) return nullptr;
+    // Step past quarantined reactors. A dead reactor keeps its slot in the
+    // vector until stop() clears it, so scanning at most n entries is what
+    // distinguishes "every reactor is dead" (null) from a live one behind the
+    // cursor. This is not the last-live decision -- that is live_reactors_.
+    for (size_t tries = 0; tries < n; ++tries) {
+        const size_t i =
+            next_reactor_.fetch_add(1, std::memory_order_relaxed) % n;
+        sub_reactor* r = reactors_[i].get();
+        if (!r->dead_.load(std::memory_order_acquire)) return r;
+    }
+    return nullptr;
 }
 
 inline bool multi_reactor_server::ensure_reactor_slots(size_t n) noexcept {
@@ -4421,7 +4541,13 @@ inline void multi_reactor_server::admit_accept(
         peer_strings_from_sockaddr(ss, slen, &peer, &ip_key);
 
         sub_reactor* r = pick_reactor();
-        if (!r) return;   // cfd_guard closes it
+        if (!r) {
+            // Every reactor is quarantined. The fd guard closes the socket;
+            // count the refusal so a dead pool is visible in rejected instead
+            // of looking like an accept that silently vanished.
+            stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+            return;   // cfd_guard closes it
+        }
 
         uint64_t id = next_conn_id_.fetch_add(
             1, std::memory_order_relaxed);
@@ -4477,6 +4603,10 @@ inline void multi_reactor_server::accept_loop(
 
     std::array<struct epoll_event, 64> events{};
     while (accepting_.load(std::memory_order_acquire) && is_running()) {
+        // Reap before parking in epoll_wait. A failed reactor wakes this thread
+        // through wake_accept_loop(), so at most one iteration passes between
+        // its death and its join.
+        reap_dead_reactors();
         if (fail_accept_for_test.load(std::memory_order_relaxed)) {
             fail_accept_for_test.store(false, std::memory_order_relaxed);
             throw 1;

@@ -141,12 +141,24 @@ running underneath it.
 
 ### Failure handling inside the loop
 
-A throw from anywhere in the iteration is caught at loop scope: the reactor
-counts `reactor_failures`, raises the server's failed flag, stops accepting
-submissions, runs `cleanup()`, and exits. The lifecycle state is deliberately
-left alone, so a concurrent `start()` verdict is never rewritten by a worker
-crash. Close-side callbacks are narrower: each invocation is caught separately,
-counted in `callback_exceptions`, and does not suppress the other notification.
+A throw from anywhere in the iteration is caught at loop scope, and a
+non-`EINTR` `epoll_wait` failure takes the same path: the reactor marks itself
+dead, counts `reactor_failures`, stops accepting submissions, and exits after
+`cleanup("reactor failure")` resets every connection it still owned. That
+cleanup is the quarantine: the reactor is no longer picked for new connections,
+and the accept thread joins it (closing its epoll fd and eventfd) on its next
+pass.
+
+The failure is not fatal by itself. `live_reactors_` is an atomic count set to
+the full reactor-set size before any reactor thread starts (a refused `start()`
+is subtracted back); `on_reactor_failed()` decrements it and only the decrement
+that returns 1 raises the server's failed flag. Until then
+`is_running()` stays true and the surviving reactors keep serving. The accept
+thread's own failure is still fatal, as is the last live reactor's. The
+lifecycle state is deliberately left alone, so a concurrent `start()` verdict is
+never rewritten by a worker crash. Close-side callbacks are narrower: each
+invocation is caught separately, counted in `callback_exceptions`, and does not
+suppress the other notification.
 
 ## Dependencies
 

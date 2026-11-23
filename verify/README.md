@@ -59,7 +59,8 @@ worker 上的故障会被平均掉** —— 两个 reactor 时表现为"每隔�
 
 ## `fault_injection.cpp` —— 让 `INDUSTRIAL_TCP_TESTING` 有消费者
 
-`fail_worker_for_test` / `fail_accept_for_test` 是为"worker 从异常里退出以后该怎么办"准备的，
+`fail_worker_for_test` / `fail_accept_for_test`（以及按索引精确定位某个 reactor 的
+`fail_worker_reactor_for_test`）是为"worker 从异常里退出以后该怎么办"准备的，
 但在补这个文件之前，**没有任何代码翻动它们**：两个开关，零个消费者。
 没人去扳的开关，和被注释掉的断言一样，都不是测试。
 
@@ -72,8 +73,8 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 | 用例 | 断言 |
 |------|------|
-| A | reactor 异常退出 → `is_running()` 转假、`reactor_failures` 计数、`stop()` 仍能正常返回 |
-| B | accept 线程异常退出 → 同上，且它把持的监听套接字被真正释放 |
+| A | reactor 异常退出 → 只死一个（failpoint 用 exchange 消费）、`reactor_failures` 恰好加一、`is_running()` 仍为真、幸存 reactor 应答 PING、`reactor_stats()` 标出 dead 槽位；再注入一次 → 最后一个 reactor 失败才停服；`stop()` 与重启均正常 |
+| B | accept 线程异常退出 → `is_running()` 转假、`reactor_failures` 计数，且它把持的监听套接字被真正释放 |
 | C | 12 轮「启动 → 注入故障 → stop → 再启动」→ 每次都留下一个还能重新起来的服务器 |
 | D | `close_linger_ms` / `backlog <= 0` 在 `start()` 被拒绝（否则 fd/准入泄漏或零长度 accept 队列） |
 | E | message handler 抛异常 → 被吞掉（与 R8-2 的 open state handler 同处理），连接继续分发 |
@@ -82,6 +83,7 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 | H | handler pool 启动失败（listen、reactor、accept 线程均已存在）→ 完整回滚、端口释放、重试成功 |
 | I | 第二个 reactor 启动失败 → 已启动的子集被停止、无 fd 泄漏、重试成功 |
 | J | 每 reactor 统计之和等于生命周期聚合值；重启后仍累计；stop 后连接数归零；handler 卡住 → `reactor_stalls` 计数但不停服 |
+| K | 按 `reactor_stats()[i].connections` 定位连接所属 reactor，用索引 failpoint 精确隔离它 → close_handler 收到 `reactor failure`、对端看到 RST、另一个 reactor 继续服务 |
 
 `stop()` 一律包在带超时的 `within()` 里跑：恢复路径死锁时的表现只是"测试跑得久"，
 而退出码分不清那和一台慢机器有什么区别。
