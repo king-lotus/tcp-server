@@ -52,10 +52,13 @@ namespace industrial {
 // ==================== Syscall seam ====================
 // The five syscalls whose failure paths used to need a live socket, a fork or
 // a lowered rlimit are called through this type rather than directly. The
-// production policy is a set of static inline forwarders: one direct call, no
-// virtual, no pointer, no branch, no per-server state. Test builds replace the
-// whole type before including this header (see verify/syscall_seam_policy.h),
-// which lets a suite decide the errno and return value of any single call.
+// eventfd wake write joins them not because it needs a failure injection, but
+// because counting it is how a test proves wakeup coalescing without adding a
+// production counter to every reactor. The production policy is a set of
+// static inline forwarders: one direct call, no virtual, no pointer, no branch,
+// no per-server state. Test builds replace the whole type before including
+// this header (see verify/syscall_seam_policy.h), which lets a suite decide the
+// errno and return value of any single call.
 //
 // Replacement is compile-time, so every translation unit in one binary must
 // see the same policy -- the alias is the ODR boundary, exactly as the
@@ -78,6 +81,9 @@ struct default_syscall_policy {
     static int accept4(int fd, struct sockaddr* addr, socklen_t* len,
                        int flags) noexcept {
         return ::accept4(fd, addr, len, flags);
+    }
+    static ssize_t wake_write(int fd, const uint64_t* value) noexcept {
+        return ::write(fd, value, sizeof(*value));
     }
 };
 
@@ -2298,7 +2304,7 @@ inline void sub_reactor::cleanup(const char* reason) noexcept {
 inline void sub_reactor::wakeup() noexcept {
     if (wake_fd_ < 0) return;
     uint64_t v = 1;
-    ssize_t r = ::write(wake_fd_, &v, sizeof(v));
+    ssize_t r = syscall_policy::wake_write(wake_fd_, &v);
     (void)r;
 }
 
@@ -2347,6 +2353,12 @@ inline bool sub_reactor::enqueue(queue_task task) noexcept {
                 1, std::memory_order_relaxed);
             return false;
         }
+        // One notification is enough for a whole batch: process_pending()
+        // swaps the entire queue under this mutex, so a producer that sees a
+        // non-empty queue is already covered by the wake that made the first
+        // task of that batch visible. Writing once per task turned broadcast
+        // load into one eventfd syscall per frame.
+        const bool was_empty = pending_tasks_.empty();
         pending_tasks_.emplace_back(std::move(task));
         server_->stats_ref().pending_tasks_total.fetch_add(
             1, std::memory_order_relaxed);
@@ -2354,7 +2366,7 @@ inline bool sub_reactor::enqueue(queue_task task) noexcept {
             1, std::memory_order_relaxed);
         // Serialize notification with stop's descriptor cleanup. No producer
         // touches wake_fd_ after releasing this lock.
-        wakeup();
+        if (was_empty) wakeup();
     }
     return true;
 }

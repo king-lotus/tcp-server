@@ -46,9 +46,12 @@ time in `need_more`. `TCP_FUZZING=1` drops the suite's `main()` and its
 ### The syscall seam
 
 Five syscalls — `recv`, `sendmsg`, `shutdown`, `epoll_ctl` and `accept4` — are
-called through `syscall_policy::` rather than `::` directly. The production
-policy is five static inline forwarders, so this is one direct call at `-O0` and
-less at `-O2`: no virtual, no pointer, no branch, no per-server state.
+called through `syscall_policy::` rather than `::` directly. The reactor's
+eventfd wake write joins them in the same policy, not for fault injection but
+so a test can count notifications without adding a production counter to every
+reactor. The production policy is static inline forwarders, so this is one
+direct call at `-O0` and less at `-O2`: no virtual, no pointer, no branch, no
+per-server state.
 
 A test binary may replace the whole policy by defining
 `TCP_SERVER_SYSCALL_POLICY` before any include of `tcp-server-mt.h`.
@@ -65,6 +68,8 @@ lowered `RLIMIT_NOFILE` and no attempt to manufacture a real EPIPE window:
 - `epoll_ctl(MOD)` failure → `epoll_ctl_errors` moves and the connection aborts;
 - `accept4` EMFILE → the reserved descriptor takes the queued victim, EMFILE is
   counted, and the accept loop still serves the next client.
+- 512 queued sends while the reactor is blocked → at most one eventfd wake,
+  with all frames drained afterward. This tests coalescing rather than timing.
 
 The macro is a per-binary choice, not a per-file one. Every translation unit
 linked into a binary must see the same `syscall_policy` alias; `run.sh` and

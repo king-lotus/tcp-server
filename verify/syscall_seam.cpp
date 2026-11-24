@@ -15,8 +15,10 @@
 #include "harness.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -175,6 +177,91 @@ void case_epoll_ctl_mod_failure() {
                     "the MOD fault was consumed once");
 }
 
+void case_wakeup_coalescing() {
+    std::printf("G. a queued batch gets one reactor wake, not one per task\n");
+    seam_policy::reset();
+
+    // Block the only reactor inside the handler. Every send_to() below then
+    // enters a queue that cannot drain, which is the only deterministic way
+    // to observe coalescing instead of a race against the event loop.
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    uint64_t conn_id = 0;
+    auto cfg = base_config();
+    cfg.num_reactors = 1;
+    harness::fixture f(cfg, [&](uint64_t id, const uint8_t*, size_t) {
+        std::unique_lock<std::mutex> lk(m);
+        conn_id = id;
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return release; });
+    });
+    harness::expect(f.started(), "server started");
+
+    harness::peer p;
+    harness::expect(!!p.connect(f.port()), "peer connected");
+    const uint8_t byte = 0x51;
+    (void)p.send(frame_type::DATA, &byte, 1);
+
+    const auto got_handler = wait_for(2000, [&] {
+        std::lock_guard<std::mutex> lk(m);
+        return entered;
+    });
+    if (!got_handler) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            release = true;
+        }
+        cv.notify_all();
+        harness::expect(false, "handler reached the blocking checkpoint");
+        return;
+    }
+
+    const uint64_t before_wakes = counter(seam_policy::wake_writes);
+    constexpr int kTasks = 512;
+    int accepted = 0;
+    for (int i = 0; i < kTasks; ++i) {
+        if (f.server().send_to(conn_id, &byte, 1) ==
+            industrial::send_result::ok) {
+            ++accepted;
+        }
+    }
+    const uint64_t batch_wakes =
+        counter(seam_policy::wake_writes) - before_wakes;
+
+    {
+        std::lock_guard<std::mutex> lk(m);
+        release = true;
+    }
+    cv.notify_all();
+
+    harness::expect(accepted == kTasks, "every queued send was accepted");
+    harness::expect(batch_wakes <= 1,
+                    "512 queued tasks caused at most one eventfd write",
+                    "observed " + std::to_string(batch_wakes));
+    harness::expect(batch_wakes >= 1,
+                    "the empty-to-nonempty transition still woke the reactor");
+
+    int received = 0;
+    for (int i = 0; i < kTasks; ++i) {
+        harness::frame out;
+        if (!p.expect_frame(&out, 2000)) break;
+        if (out.type == frame_type::DATA && out.payload.size() == 1 &&
+            out.payload[0] == byte) {
+            ++received;
+        }
+    }
+    harness::expect(received == kTasks,
+                    "all coalesced tasks were drained in order",
+                    "received " + std::to_string(received) +
+                        ", frames_sent " +
+                        std::to_string(counter(f.stats().frames_sent)) +
+                        ", queue_drops " +
+                        std::to_string(counter(f.stats().queue_drops)));
+}
+
 void case_accept_emfile() {
     std::printf("F. accept4 EMFILE is counted without a lowered rlimit\n");
     seam_policy::reset();
@@ -217,6 +304,7 @@ int main() {
     case_shutdown_failure();
     case_epoll_ctl_mod_failure();
     case_accept_emfile();
+    case_wakeup_coalescing();
     std::printf("== syscall seam end ==\n");
     return harness::finish();
 }

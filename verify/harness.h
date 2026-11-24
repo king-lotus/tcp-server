@@ -298,7 +298,7 @@ public:
         if (fd_ < 0) return failed("expect_frame: not connected");
         if (out == nullptr) return failed("expect_frame: null out");
 
-        std::vector<uint8_t> buf;
+        std::vector<uint8_t>& buf = rx_buf_;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(timeout_ms);
         for (;;) {
@@ -307,12 +307,17 @@ public:
                                    | (static_cast<uint32_t>(buf[5]) << 16)
                                    | (static_cast<uint32_t>(buf[6]) <<  8)
                                    |  static_cast<uint32_t>(buf[7]);
-                if (buf.size() >= industrial::FRAME_HEADER_SIZE + len) {
+                const size_t frame_bytes =
+                    industrial::FRAME_HEADER_SIZE + len;
+                if (buf.size() >= frame_bytes) {
                     out->type = static_cast<industrial::frame_type>(
                         (static_cast<uint16_t>(buf[2]) << 8) | buf[3]);
                     out->payload.assign(
                         buf.begin() + industrial::FRAME_HEADER_SIZE,
-                        buf.begin() + industrial::FRAME_HEADER_SIZE + len);
+                        buf.begin() + frame_bytes);
+                    // A second expect_frame() on the same peer must see the
+                    // next frame, not parse this one again from byte zero.
+                    buf.erase(buf.begin(), buf.begin() + frame_bytes);
                     return ok();
                 }
             }
@@ -417,6 +422,7 @@ public:
             ::close(fd_);
             fd_ = -1;
         }
+        rx_buf_.clear();
     }
 
 private:
@@ -443,6 +449,10 @@ private:
     int   fd_        = -1;
     bool  close_seen_ = false;
     close_kind close_kind_ = close_kind::any;
+    // Frames read by expect_frame() but not yet consumed by the caller. It is
+    // a member because one peer can legitimately receive several frames in a
+    // single recv(), and a local buffer silently replays the first one.
+    std::vector<uint8_t> rx_buf_;
 };
 
 // ---------------------------------------------------------------------------

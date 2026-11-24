@@ -43,6 +43,7 @@ struct seam_policy {
     static std::atomic<uint64_t> shutdown_calls;
     static std::atomic<uint64_t> epoll_ctl_calls;
     static std::atomic<uint64_t> accept4_calls;
+    static std::atomic<uint64_t> wake_writes;
 
     static void reset() noexcept {
         recv_errno.store(0);
@@ -57,6 +58,7 @@ struct seam_policy {
         shutdown_calls.store(0);
         epoll_ctl_calls.store(0);
         accept4_calls.store(0);
+        wake_writes.store(0);
     }
 
     static ssize_t recv(int fd, void* buf, size_t len, int flags) noexcept {
@@ -132,6 +134,14 @@ struct seam_policy {
         }
         return ::accept4(fd, addr, len, flags);
     }
+
+    // Count only reactor wakeups. The accept loop's own eventfd is not part of
+    // the task-queue claim, and leaving it direct keeps this counter's meaning
+    // narrow enough to assert on.
+    static ssize_t wake_write(int fd, const uint64_t* value) noexcept {
+        wake_writes.fetch_add(1, std::memory_order_relaxed);
+        return ::write(fd, value, sizeof(*value));
+    }
 };
 
 inline std::atomic<int> seam_policy::recv_errno{0};
@@ -146,5 +156,6 @@ inline std::atomic<uint64_t> seam_policy::sendmsg_calls{0};
 inline std::atomic<uint64_t> seam_policy::shutdown_calls{0};
 inline std::atomic<uint64_t> seam_policy::epoll_ctl_calls{0};
 inline std::atomic<uint64_t> seam_policy::accept4_calls{0};
+inline std::atomic<uint64_t> seam_policy::wake_writes{0};
 
 }  // namespace industrial
