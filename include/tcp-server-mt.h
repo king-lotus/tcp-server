@@ -227,11 +227,12 @@ struct alignas(64) reactor_slot {
     // come back at all; a stalled one still owns its connections and still
     // accepts queued work for them, so it is skipped, not torn down.
     //
-    // Set and cleared only by the watchdog, which samples at least every
-    // min(500 ms, timeout / 2). Clearing is the hysteresis half: one healthy
-    // sample is not enough, because a reactor that oscillates around the
-    // timeout would otherwise be re-admitted and dropped again on every
-    // sample. See check_reactor_stalls().
+    // Set by the watchdog, which samples at least every min(500 ms, timeout/2).
+    // It clears on hysteresis -- one healthy sample is not enough, because a
+    // reactor that oscillates around the timeout would otherwise be re-admitted
+    // and dropped again on every sample -- or when on_reactor_failed() sets the
+    // stronger `dead` state and withdraws this one. See
+    // check_reactor_stalls().
     std::atomic<bool>     stalled{false};
     // When `stalled` was raised, for the recovery dwell. Only meaningful while
     // `stalled` is true.
@@ -1912,6 +1913,19 @@ class multi_reactor_server {
     // depending on hardware_concurrency() changing. Persistent until reset,
     // because a test needs two consecutive starts to disagree.
     std::atomic<int> resolved_reactor_count_for_test_{-1};
+    // Watchdog/quarantine interleaving seam. -1 = off. When
+    // check_reactor_stalls() has decided slot `index` is stalled but has not
+    // published the flag, it sets entered and spins until the index changes;
+    // finished advances after every check call, so a test can wait for the
+    // parked call to return. All three are private like the other switches;
+    // see test_access.
+    std::atomic<int>      stall_pause_index_for_test_{-1};
+    std::atomic<bool>     stall_check_entered_for_test_{false};
+    std::atomic<uint64_t> stall_check_finished_for_test_{0};
+    // Run the real reactor-failure path for one reactor from the calling
+    // thread. Guarded against a second notification for the same reactor,
+    // which would decrement live_reactors_ twice.
+    void fail_reactor_for_test_(int index) noexcept;
 
     // Lifecycle states. Only the thread holding lifecycle_mutex_ moves the
     // state out of/into stopped; threads that merely observe a fatal error use
@@ -4649,9 +4663,14 @@ inline void multi_reactor_server::on_reactor_failed(
         // reactor_stats() as "stalled but not routed to" on a reactor that
         // cannot be routed to at all. dead is the stronger state; drop the
         // weaker one with it.
-        r->slot_->stalled.store(false, std::memory_order_relaxed);
-        r->slot_->stalled_at_ms.store(0, std::memory_order_relaxed);
+        //
+        // Publish dead first, then withdraw stalled. The watchdog can be
+        // between its own dead check and its stalled publish; the release
+        // store here and the acquire re-check there are the two halves that
+        // stop a later publish from resurrecting the flag.
         r->slot_->dead.store(true, std::memory_order_release);
+        r->slot_->stalled.store(false, std::memory_order_release);
+        r->slot_->stalled_at_ms.store(0, std::memory_order_relaxed);
     }
     stats_.reactor_failures.fetch_add(1, std::memory_order_relaxed);
     if (live_reactors_.fetch_sub(1, std::memory_order_acq_rel) == 1)
@@ -4660,6 +4679,18 @@ inline void multi_reactor_server::on_reactor_failed(
     // reactor's death; wake it so the dead reactor is joined promptly instead
     // of after its 500 ms wait.
     wake_accept_loop();
+}
+
+inline void multi_reactor_server::fail_reactor_for_test_(int index) noexcept {
+    if (index < 0) return;
+    const size_t i = static_cast<size_t>(index);
+    if (i >= reactors_.size()) return;
+    sub_reactor* r = reactors_[i].get();
+    // The real loop can fail concurrently in a test only if the test made it
+    // do so; the check keeps a second notification from double-decrementing
+    // live_reactors_.
+    if (r->dead_.load(std::memory_order_acquire)) return;
+    on_reactor_failed(r);
 }
 
 inline void multi_reactor_server::reap_dead_reactors() noexcept {
@@ -4796,6 +4827,9 @@ inline void multi_reactor_server::check_reactor_stalls() noexcept {
     const size_t active =
         reactor_run_count_.load(std::memory_order_acquire);
     const int64_t now = now_ms();
+    // Read once: the test changes this while the check is parked.
+    const int pause_index =
+        stall_pause_index_for_test_.load(std::memory_order_relaxed);
     for (size_t i = 0; i < active; ++i) {
         reactor_slot& s = slots[i];
         if (s.dead.load(std::memory_order_relaxed)) continue;
@@ -4804,8 +4838,32 @@ inline void multi_reactor_server::check_reactor_stalls() noexcept {
         if (last == 0) continue;
         const bool stalled = s.stalled.load(std::memory_order_relaxed);
         if (now - last > timeout) {
-            if (s.stalled.exchange(true, std::memory_order_relaxed))
+            if (pause_index >= 0 &&
+                static_cast<size_t>(pause_index) == i) {
+                // Test hook: park after the dead check and the timeout
+                // decision, before publishing. A test can then quarantine
+                // this slot and release the park.
+                stall_check_entered_for_test_.store(
+                    true, std::memory_order_release);
+                while (stall_pause_index_for_test_.load(
+                           std::memory_order_acquire) == pause_index) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(1));
+                }
+            }
+            if (s.stalled.exchange(true, std::memory_order_acq_rel))
                 continue;   // still the same episode: already counted, logged
+            // The reactor can fail between the dead check above and this
+            // publish. on_reactor_failed() publishes dead before withdrawing
+            // stalled, and the exchange above carries that release, so this
+            // re-check is the other half of the closure: a publish that loses
+            // the race withdraws itself instead of leaving a dead slot
+            // "stalled" until the next start.
+            if (s.dead.load(std::memory_order_acquire)) {
+                s.stalled.store(false, std::memory_order_relaxed);
+                s.stalled_at_ms.store(0, std::memory_order_relaxed);
+                continue;
+            }
             s.stalled_at_ms.store(now, std::memory_order_relaxed);
             stats_.reactor_stalls.fetch_add(1, std::memory_order_relaxed);
             std::fprintf(stderr,
@@ -4835,6 +4893,7 @@ inline void multi_reactor_server::check_reactor_stalls() noexcept {
             }
         }
     }
+    stall_check_finished_for_test_.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline int multi_reactor_server::accept_wait_ms() const noexcept {

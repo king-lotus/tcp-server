@@ -90,6 +90,27 @@ struct test_access {
         s.resolved_reactor_count_for_test_.store(
             count, std::memory_order_relaxed);
     }
+    static void pause_stall_check(multi_reactor_server& s,
+                                  int index) noexcept {
+        s.stall_check_entered_for_test_.store(
+            false, std::memory_order_relaxed);
+        s.stall_pause_index_for_test_.store(
+            index, std::memory_order_relaxed);
+    }
+    static bool stall_check_entered(
+            const multi_reactor_server& s) noexcept {
+        return s.stall_check_entered_for_test_.load(
+            std::memory_order_acquire);
+    }
+    static uint64_t stall_check_finished(
+            const multi_reactor_server& s) noexcept {
+        return s.stall_check_finished_for_test_.load(
+            std::memory_order_acquire);
+    }
+    static void fail_reactor_now(multi_reactor_server& s,
+                                 int index) noexcept {
+        s.fail_reactor_for_test_(index);
+    }
 };
 
 }  // namespace industrial

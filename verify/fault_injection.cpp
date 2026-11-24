@@ -779,6 +779,95 @@ int main() {
                         "the second stop completes");
         peer.close();
 
+        // A quarantine can land between the watchdog's dead check and its
+        // publish. The stronger state must win: the watchdog must withdraw the
+        // stall flag and must not count a reactor that died before the flag
+        // was published.
+        {
+            multi_reactor_server::config cfg_race = base;
+            cfg_race.port = free_port();
+            cfg_race.tick_ms = 20;
+            cfg_race.reactor_stall_timeout_ms = 100;
+            cfg_race.num_reactors = 2;
+            std::atomic<bool> race_handler{false};
+            std::atomic<bool> race_release{false};
+            multi_reactor_server race(cfg_race);
+            race.set_message_handler(
+                [&](uint64_t, const uint8_t*, size_t) {
+                    race_handler.store(true, std::memory_order_release);
+                    for (int i = 0; i < 3000 &&
+                                    !race_release.load(
+                                        std::memory_order_acquire); ++i) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    }
+                });
+            harness::expect(race.start(),
+                            "the watchdog-race server starts");
+
+            harness::peer rp;
+            harness::expect(static_cast<bool>(rp.connect(race.port())),
+                            "the watchdog-race client connected");
+            int owner = -1;
+            harness::expect(wait_for(2000, [&] {
+                const auto v = race.reactor_stats();
+                for (size_t i = 0; i < v.size(); ++i) {
+                    if (!v[i].retired && v[i].connections == 1) {
+                        owner = static_cast<int>(i);
+                        return true;
+                    }
+                }
+                return false;
+            }), "the race connection has an owner");
+
+            if (owner >= 0) {
+                industrial::test_access::pause_stall_check(race, owner);
+                harness::expect(static_cast<bool>(rp.send(
+                                    industrial::frame_type::DATA, "x", 1)),
+                                "the blocking frame is sent");
+                harness::expect(wait_for(2000, [&] {
+                                    return race_handler.load(
+                                        std::memory_order_acquire);
+                                }), "the handler is blocking the owner");
+                harness::expect(wait_for(3000, [&] {
+                                    return industrial::test_access::
+                                        stall_check_entered(race);
+                                }), "the watchdog is parked before publishing");
+
+                const uint64_t stalls_before =
+                    race.stats().reactor_stalls.load();
+                industrial::test_access::fail_reactor_now(race, owner);
+                harness::expect(wait_for(2000, [&] {
+                    const auto v = race.reactor_stats();
+                    return static_cast<size_t>(owner) < v.size() &&
+                           v[owner].dead && !v[owner].stalled;
+                }), "the interleaved quarantine wins over the stall");
+
+                const uint64_t finished =
+                    industrial::test_access::stall_check_finished(race);
+                industrial::test_access::pause_stall_check(race, -1);
+                harness::expect(wait_for(2000, [&] {
+                    return industrial::test_access::stall_check_finished(race) >
+                           finished;
+                }), "the parked watchdog call returns");
+                {
+                    const auto v = race.reactor_stats();
+                    harness::expect(
+                        static_cast<size_t>(owner) < v.size() &&
+                            v[owner].dead && !v[owner].stalled,
+                        "a dead slot is not left flagged stalled");
+                    harness::expect(
+                        race.stats().reactor_stalls.load() == stalls_before,
+                        "the interleaved quarantine is not a stall");
+                }
+            }
+
+            race_release.store(true, std::memory_order_release);
+            rp.close();
+            harness::expect(within(3000, "stop()", [&] { race.stop(); }),
+                            "the watchdog-race server stops");
+        }
+
         // A later run that resolves fewer reactors must not hide the traffic
         // already published into the surplus slots: their counters are
         // cumulative, and the per-reactor sums must keep matching

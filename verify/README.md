@@ -88,7 +88,7 @@ g++ -std=c++17 -Wall -Wextra -pthread \
 | G | accept setup 在 spare fd 打开后失败 → 全部描述符（含 spare）释放；重试与析构均无泄漏 |
 | H | handler pool 启动失败（listen、reactor、accept 线程均已存在）→ 完整回滚、端口释放、重试成功 |
 | I | 第二个 reactor 启动失败 → 已启动的子集被停止、无 fd 泄漏、重试成功 |
-| J | 每 reactor 统计之和等于生命周期聚合值；重启后仍累计；resolved reactor 数收缩后多余槽位标记 `retired`、流量仍计入总和；失败启动保留已分配槽位；stop 后连接数归零；handler 卡住 → `reactor_stalls` 计数但不停服；timeout < `max(100, 2×tick_ms)` 被拒绝 |
+| J | 每 reactor 统计之和等于生命周期聚合值；重启后仍累计；resolved reactor 数收缩后多余槽位标记 `retired`、流量仍计入总和；失败启动保留已分配槽位；stop 后连接数归零；handler 卡住 → `reactor_stalls` 计数但不停服；timeout < `max(100, 2×tick_ms)` 被拒绝；watchdog 在发布 stalled 前被隔离抢占时，dead 槽位不残留 stalled、不误计 `reactor_stalls` |
 | K | 按 `reactor_stats()[i].connections` 定位连接所属 reactor，用索引 failpoint 精确隔离它 → close_handler 收到 `reactor failure`、对端看到 RST、另一个 reactor 继续服务 |
 
 `stop()` 一律包在带超时的 `within()` 里跑：恢复路径死锁时的表现只是"测试跑得久"，
