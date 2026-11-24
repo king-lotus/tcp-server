@@ -45,11 +45,11 @@ time in `need_more`. `TCP_FUZZING=1` drops the suite's `main()` and its
 
 ### The syscall seam
 
-Five syscalls — `recv`, `sendmsg`, `shutdown`, `epoll_ctl` and `accept4` — are
-called through `syscall_policy::` rather than `::` directly. The reactor's
-eventfd wake write joins them in the same policy, not for fault injection but
-so a test can count notifications without adding a production counter to every
-reactor. The production policy is static inline forwarders, so this is one
+Six calls — `recv`, `sendmsg`, `shutdown`, `epoll_ctl`, `accept4` and the
+reactor's eventfd wake write — go through `syscall_policy::` rather than `::`
+directly. Five exist to inject failures; the wake write exists so a test can
+count notifications without adding a production counter to every reactor. The
+production policy is static inline forwarders, so this is one
 direct call at `-O0` and less at `-O2`: no virtual, no pointer, no branch, no
 per-server state.
 
@@ -73,9 +73,9 @@ lowered `RLIMIT_NOFILE` and no attempt to manufacture a real EPIPE window:
 
 The macro is a per-binary choice, not a per-file one. Every translation unit
 linked into a binary must see the same `syscall_policy` alias; `run.sh` and
-CMake compile this suite as its own target for that reason. Removing the seam
-from a header copy makes 15 of these assertions fail, so they test the
-injection path rather than the loopback socket.
+CMake compile this suite as its own target for that reason. Each case asserts
+both that its policy knob was consumed and that the observable result changed,
+so the suite tests the injection path rather than the loopback socket.
 
 ## Writing a suite
 

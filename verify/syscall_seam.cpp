@@ -50,6 +50,61 @@ uint64_t counter(const std::atomic<uint64_t>& a) {
     return a.load(std::memory_order_relaxed);
 }
 
+// A reactor parked in the message handler cannot drain its task queue, which
+// is what makes the wake count deterministic. The gate publishes the incoming
+// message's connection id under the mutex the handler waits on.
+struct blocked_handler {
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    uint64_t conn_id = 0;
+
+    bool wait_for_entry(int timeout_ms) {
+        std::unique_lock<std::mutex> lk(m);
+        return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                           [this] { return entered; });
+    }
+
+    void release_once() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            release = true;
+        }
+        cv.notify_all();
+    }
+};
+
+struct batch_result {
+    int accepted;
+    uint64_t wakes;
+};
+
+batch_result queue_batch(harness::fixture& f, uint64_t id, uint8_t byte,
+                         int count) {
+    const uint64_t before = counter(seam_policy::wake_writes);
+    int accepted = 0;
+    for (int i = 0; i < count; ++i) {
+        if (f.server().send_to(id, &byte, 1) == industrial::send_result::ok) {
+            ++accepted;
+        }
+    }
+    return {accepted, counter(seam_policy::wake_writes) - before};
+}
+
+int count_frames(harness::peer& p, uint8_t byte, int count) {
+    int received = 0;
+    for (int i = 0; i < count; ++i) {
+        harness::frame out;
+        if (!p.expect_frame(&out, 2000)) break;
+        if (out.type == frame_type::DATA && out.payload.size() == 1 &&
+            out.payload[0] == byte) {
+            ++received;
+        }
+    }
+    return received;
+}
+
 void case_recv_error() {
     std::printf("A. recv error aborts the connection deterministically\n");
     seam_policy::reset();
@@ -181,22 +236,16 @@ void case_wakeup_coalescing() {
     std::printf("G. a queued batch gets one reactor wake, not one per task\n");
     seam_policy::reset();
 
-    // Block the only reactor inside the handler. Every send_to() below then
-    // enters a queue that cannot drain, which is the only deterministic way
-    // to observe coalescing instead of a race against the event loop.
-    std::mutex m;
-    std::condition_variable cv;
-    bool entered = false;
-    bool release = false;
-    uint64_t conn_id = 0;
+    // Block the only reactor in its handler so the queue cannot drain.
+    blocked_handler gate;
     auto cfg = base_config();
     cfg.num_reactors = 1;
     harness::fixture f(cfg, [&](uint64_t id, const uint8_t*, size_t) {
-        std::unique_lock<std::mutex> lk(m);
-        conn_id = id;
-        entered = true;
-        cv.notify_all();
-        cv.wait(lk, [&] { return release; });
+        std::unique_lock<std::mutex> lk(gate.m);
+        gate.conn_id = id;
+        gate.entered = true;
+        gate.cv.notify_all();
+        gate.cv.wait(lk, [&] { return gate.release; });
     });
     harness::expect(f.started(), "server started");
 
@@ -205,54 +254,24 @@ void case_wakeup_coalescing() {
     const uint8_t byte = 0x51;
     (void)p.send(frame_type::DATA, &byte, 1);
 
-    const auto got_handler = wait_for(2000, [&] {
-        std::lock_guard<std::mutex> lk(m);
-        return entered;
-    });
-    if (!got_handler) {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            release = true;
-        }
-        cv.notify_all();
+    if (!gate.wait_for_entry(2000)) {
+        gate.release_once();
         harness::expect(false, "handler reached the blocking checkpoint");
         return;
     }
 
-    const uint64_t before_wakes = counter(seam_policy::wake_writes);
     constexpr int kTasks = 512;
-    int accepted = 0;
-    for (int i = 0; i < kTasks; ++i) {
-        if (f.server().send_to(conn_id, &byte, 1) ==
-            industrial::send_result::ok) {
-            ++accepted;
-        }
-    }
-    const uint64_t batch_wakes =
-        counter(seam_policy::wake_writes) - before_wakes;
+    const batch_result batch = queue_batch(f, gate.conn_id, byte, kTasks);
+    gate.release_once();
 
-    {
-        std::lock_guard<std::mutex> lk(m);
-        release = true;
-    }
-    cv.notify_all();
-
-    harness::expect(accepted == kTasks, "every queued send was accepted");
-    harness::expect(batch_wakes <= 1,
+    harness::expect(batch.accepted == kTasks, "every queued send was accepted");
+    harness::expect(batch.wakes <= 1,
                     "512 queued tasks caused at most one eventfd write",
-                    "observed " + std::to_string(batch_wakes));
-    harness::expect(batch_wakes >= 1,
+                    "observed " + std::to_string(batch.wakes));
+    harness::expect(batch.wakes >= 1,
                     "the empty-to-nonempty transition still woke the reactor");
 
-    int received = 0;
-    for (int i = 0; i < kTasks; ++i) {
-        harness::frame out;
-        if (!p.expect_frame(&out, 2000)) break;
-        if (out.type == frame_type::DATA && out.payload.size() == 1 &&
-            out.payload[0] == byte) {
-            ++received;
-        }
-    }
+    const int received = count_frames(p, byte, kTasks);
     harness::expect(received == kTasks,
                     "all coalesced tasks were drained in order",
                     "received " + std::to_string(received) +

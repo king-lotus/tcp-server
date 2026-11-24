@@ -492,17 +492,20 @@ The `reason` passed to `close_handler`, and why each one appears.
 
 ## Syscall policy seam
 
-`recv`, `sendmsg`, `shutdown`, `epoll_ctl` and `accept4` are called through
-`industrial::syscall_policy` rather than directly. In a normal build that alias
-names `default_syscall_policy`, five `static inline` forwarders — one direct
-call per site, no virtual dispatch, no state. There is nothing to configure and
-no runtime cost.
+Six calls — `recv`, `sendmsg`, `shutdown`, `epoll_ctl`, `accept4` and the
+reactor's eventfd `wake_write` — go through `industrial::syscall_policy` rather
+than directly. In a normal build that alias names `default_syscall_policy`, six
+`static inline` forwarders — one direct call per site, no virtual dispatch, no
+state. `wake_write` exists so a test can count notifications, not to inject a
+fault. There is nothing to configure and no runtime cost.
 
 A test binary can replace the alias at compile time by defining
-`TCP_SERVER_SYSCALL_POLICY` to a type with the same five static signatures
-**before** any include of the header. Since the alias is part of the class
-definition's inline bodies, every translation unit in one binary must see the
-same policy; the verify runner compiles the injecting suite as its own target.
+`TCP_SERVER_SYSCALL_POLICY` to a type with the same six static signatures
+(`recv`, `sendmsg`, `shutdown`, `epoll_ctl`, `accept4`, `wake_write`) **before**
+any include of the header. Omitting `wake_write` is a compile error, not a
+runtime fallback. Since the alias is part of the class definition's inline
+bodies, every translation unit in one binary must see the same policy; the
+verify runner compiles the injecting suite as its own target.
 `verify/syscall_seam_policy.h` is the reference implementation and
 `verify/syscall_seam.cpp` uses it to make EPIPE, short writes, a failed
 `shutdown`, a failed `epoll_ctl(MOD)` and `accept4` EMFILE deterministic tests.
