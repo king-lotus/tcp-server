@@ -411,6 +411,64 @@ class ring_buffer {
     size_t size_ = 0;
 };
 
+// ==================== Latency histograms (opt-in) ====================
+// A fixed 12-bucket power-of-two histogram. Readers may sample while workers
+// add; there is no allocation and no floating point on the hot path.
+class latency_histogram {
+ public:
+    static constexpr size_t kBuckets = 12;
+
+    // 0 -> bucket 0, 1 -> bucket 1, [2^(b-1), 2^b) -> bucket b for b=2..10,
+    // and >= 1024 us -> bucket 11.
+    void add(uint64_t us) noexcept {
+        size_t b = 0;
+        if (us > 0) {
+            b = 1;
+            while (b < kBuckets - 1 && us >= (uint64_t{1} << b)) {
+                ++b;
+            }
+        }
+        buckets_[b].fetch_add(1, std::memory_order_relaxed);
+        samples_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t samples() const noexcept {
+        return samples_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t bucket(size_t i) const noexcept {
+        if (i >= kBuckets) return 0;
+        return buckets_[i].load(std::memory_order_relaxed);
+    }
+
+    void reset() noexcept {
+        for (size_t i = 0; i < kBuckets; ++i) {
+            buckets_[i].store(0, std::memory_order_relaxed);
+        }
+        samples_.store(0, std::memory_order_relaxed);
+    }
+
+ private:
+    std::array<std::atomic<uint64_t>, kBuckets> buckets_{};
+    std::atomic<uint64_t> samples_{0};
+};
+
+// All three sample points need the same conversion and the same lower clamp;
+// keeping it in one place stops the histograms disagreeing at zero.
+inline uint64_t elapsed_us(std::chrono::steady_clock::time_point from,
+                           std::chrono::steady_clock::time_point to) noexcept {
+    const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           to - from).count();
+    return us > 0 ? static_cast<uint64_t>(us) : 0;
+}
+
+inline uint64_t overdue_us(std::chrono::steady_clock::time_point from,
+                           std::chrono::steady_clock::time_point to,
+                           uint64_t expected_us) noexcept {
+    const uint64_t us = elapsed_us(from, to);
+    return us > expected_us ? us - expected_us : 0;
+}
+
 // ==================== Statistics ====================
 struct server_stats {
     // Connections fully registered with a reactor: in both maps, counted by
@@ -567,6 +625,11 @@ struct server_stats {
     // call if it ignores the result, and never learns why the old one is still
     // the one running.
     std::atomic<uint64_t> handler_installs_refused{0};
+    // Opt-in latency histograms. Each stays empty (no samples) unless the
+    // config::latency_histograms flag is on for this run.
+    alignas(64) latency_histogram loop_lag_us;
+    alignas(64) latency_histogram handler_duration_us;
+    alignas(64) latency_histogram queue_wait_us;
 };
 
 // ==================== Send results ====================
@@ -1237,6 +1300,12 @@ class sub_reactor {
     using queue_task = std::variant<std::unique_ptr<new_conn_task>, send_task,
                                     close_task, finish_peer_closed_task,
                                     drain_input_task, park_close_task>;
+    // Queue work paired with its enqueue stamp. The stamp is left at its
+    // default value when the opt-in histograms are disabled.
+    struct timed_task {
+        queue_task task;
+        std::chrono::steady_clock::time_point enqueued_at{};
+    };
     bool enqueue(queue_task task) noexcept;
     void handle_task(std::unique_ptr<new_conn_task>& task) noexcept;
     void handle_task(send_task& task) noexcept;
@@ -1337,8 +1406,8 @@ class sub_reactor {
     size_t pending_task_cap_ = k_min_pending_tasks;
     size_t data_task_cap_ = k_min_pending_tasks - k_control_task_reserve;
     std::mutex              pending_mutex_;
-    std::vector<queue_task> pending_tasks_;
-    std::vector<queue_task> active_tasks_;
+    std::vector<timed_task> pending_tasks_;
+    std::vector<timed_task> active_tasks_;
 
     // Deferred close notifications, one entry per closed connection. The four
     // fields used to be four parallel vectors "cleared together so their
@@ -1595,6 +1664,9 @@ class multi_reactor_server {
         int         handler_threads = 0;
         // Bound on queued offload tasks; offload() returns false when full.
         size_t      handler_queue_limit = 8192;
+        // Opt-in latency histograms: adds clock reads and atomic increments to
+        // the reactor hot path. Off by default.
+        bool        latency_histograms = false;
 
         // Ceiling on reactors. Beyond a handful past the core count the only
         // thing extra workers buy is more cross-thread hand-off.
@@ -1860,6 +1932,10 @@ class multi_reactor_server {
     int    close_linger_ms() const noexcept { return cfg_.close_linger_ms; }
     size_t rbuf_capacity() const noexcept { return cfg_.rbuf_capacity; }
     size_t wbuf_capacity() const noexcept { return cfg_.wbuf_capacity; }
+    // Immutable for a run: frozen in start() before any worker exists.
+    bool latency_histograms_enabled() const noexcept {
+        return latency_histograms_;
+    }
     server_stats&       stats_ref() noexcept { return stats_; }
     message_handler&    msg_handler_ref() noexcept { return msg_handler_; }
     conn_state_handler& state_handler_ref() noexcept {
@@ -2089,6 +2165,10 @@ class multi_reactor_server {
     std::atomic<reactor_slot*>      published_slots_{nullptr};
 
     config cfg_;
+    // Snapshot of cfg_.latency_histograms, written in start() before any
+    // worker thread exists and immutable for the whole run, so workers read
+    // it without synchronization.
+    bool latency_histograms_ = false;
     int listen_fd_ = -1;
     int epoll_fd_  = -1;
     int wake_fd_   = -1;
@@ -2330,7 +2410,12 @@ inline void sub_reactor::process_pending() noexcept {
         // explains why that cannot leak and is not counted).
         if (!running_.load() || !server_->is_running()) break;
         // One indirect call through the table, indexed by the alternative.
-        k_task_dispatch[t.index()](this, t);
+        k_task_dispatch[t.task.index()](this, t.task);
+        if (server_->latency_histograms_enabled()) {
+            const auto done = std::chrono::steady_clock::now();
+            server_->stats_ref().queue_wait_us.add(
+                elapsed_us(t.enqueued_at, done));
+        }
         flush_close_callbacks();
     }
     active_tasks_.clear();
@@ -2359,7 +2444,10 @@ inline bool sub_reactor::enqueue(queue_task task) noexcept {
         // task of that batch visible. Writing once per task turned broadcast
         // load into one eventfd syscall per frame.
         const bool was_empty = pending_tasks_.empty();
-        pending_tasks_.emplace_back(std::move(task));
+        const auto stamp = server_->latency_histograms_enabled()
+                               ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+        pending_tasks_.emplace_back(timed_task{std::move(task), stamp});
         server_->stats_ref().pending_tasks_total.fetch_add(
             1, std::memory_order_relaxed);
         server_->stats_ref().pending_tasks_depth.fetch_add(
@@ -3325,6 +3413,11 @@ inline void sub_reactor::parse_frames(connection* c,
             c->rbuf.consume(len);
             auto& mh = server_->msg_handler_ref();
             if (mh) {
+                const bool measure = server_->latency_histograms_enabled();
+                std::chrono::steady_clock::time_point handler_start{};
+                if (measure) {
+                    handler_start = std::chrono::steady_clock::now();
+                }
                 try {
                     mh(c->id, frame_scratch_.data(), len);
                 } catch (...) {
@@ -3334,6 +3427,11 @@ inline void sub_reactor::parse_frames(connection* c,
                     // to count. Letting it cross parse_frames() -- noexcept --
                     // would call std::terminate() and take every connection
                     // with it, not just the one whose message it was.
+                }
+                if (measure) {
+                    const auto done = std::chrono::steady_clock::now();
+                    server_->stats_ref().handler_duration_us.add(
+                        elapsed_us(handler_start, done));
                 }
             }
         }
@@ -3976,9 +4074,19 @@ inline void sub_reactor::loop() noexcept {
                 handle_read(c.get());
             }
             publish_stats();
+            const int wait_ms = read_head_ ? 0 : tick_ms;
+            const bool measure_lag = server_->latency_histograms_enabled();
+            std::chrono::steady_clock::time_point wait_start{};
+            if (measure_lag) {
+                wait_start = std::chrono::steady_clock::now();
+            }
             int n = ::epoll_wait(epoll_fd_, events.data(),
-                                 static_cast<int>(events.size()),
-                                 read_head_ ? 0 : tick_ms);
+                                 static_cast<int>(events.size()), wait_ms);
+            if (n == 0 && wait_ms > 0 && measure_lag) {
+                const auto done = std::chrono::steady_clock::now();
+                server_->stats_ref().loop_lag_us.add(overdue_us(
+                    wait_start, done, static_cast<uint64_t>(wait_ms) * 1000));
+            }
             if (n < 0) {
                 if (errno == EINTR) continue;
                 server_->on_reactor_failed(this);
@@ -4429,6 +4537,9 @@ inline bool multi_reactor_server::start() noexcept {
     start_rollback rollback{this};
 
     if (!validate_start_config()) return false;
+    // Freeze the opt-in before any worker thread is created; workers read it
+    // unsynchronized for the whole run.
+    latency_histograms_ = cfg_.latency_histograms;
     // Resolve the reactor count once for this run and use it for both the
     // slot reset and the reactors themselves. hardware_concurrency() can
     // change between restarts, and two independent resolutions could then

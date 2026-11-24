@@ -73,6 +73,8 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/state_invariants.cpp \
         -o "$out/state_invariants"
     g++ "${base_flags[@]}" "$@" verify/frame_codec.cpp -o "$out/frame_codec"
+    g++ "${base_flags[@]}" "$@" verify/latency_histograms.cpp \
+        -o "$out/latency_histograms"
     # The syscall seam test needs its own policy type and an extra include path.
     # Both must be present in this TU only: a second TU compiled with a
     # different syscall_policy would be an ODR violation in the same binary.
@@ -111,6 +113,7 @@ run_all() {
                    "hardening:$out/hardening" \
                    "state_invariants:$out/state_invariants" \
                    "frame_codec:$out/frame_codec" \
+                   "latency_histograms:$out/latency_histograms" \
                    "syscall_seam:$out/syscall_seam"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
@@ -244,6 +247,9 @@ cat <<EOF
     before the extraction, and 200000 deterministic inputs through the same
     entry point clang's fuzzer calls. It fails if the length limit, the magic
     check or the type-before-length order changes.
+  - latency_histograms checks the opt-in latency histograms for loop-lag,
+    handler-duration and queue-wait, including that they stay empty when the
+    config flag is off.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as

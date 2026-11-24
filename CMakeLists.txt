@@ -45,7 +45,8 @@ if(TCP_BUILD_SUITES)
         watermark
         hardening
         state_invariants
-        frame_codec)
+        frame_codec
+        latency_histograms)
 
     # The seam suite selects a policy type at compile time. It is a separate
     # target because that macro must not leak into the other suites: one
@@ -78,7 +79,7 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same sixteen runs run.sh performs: fourteen suites, plus the two that
+    # The same seventeen runs run.sh performs: fifteen suites, plus the two that
     # run a second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)
@@ -116,6 +117,8 @@ if(TCP_BUILD_SUITES)
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:frame_codec>)
     add_test(NAME syscall_seam
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:syscall_seam>)
+    add_test(NAME latency_histograms
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:latency_histograms>)
 
     # run.sh gives each case 180s so a hang presents as a failure; the same
     # bound here keeps ctest from outliving the CI job.
@@ -125,6 +128,7 @@ if(TCP_BUILD_SUITES)
                          reactor_spread_2_reactors config_budget
                          harness_selftest watermark hardening
                          state_invariants frame_codec syscall_seam
+                         latency_histograms
                          PROPERTIES TIMEOUT 180)
 endif()
 

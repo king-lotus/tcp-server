@@ -138,6 +138,7 @@ validated by `start()`; nothing is checked at construction.
 | `reactor_stall_timeout_ms` | `0` | Watchdog for a reactor alive but not completing a loop iteration for this long. 0 disables it; otherwise it must be at least `max(100, 2 × tick_ms)`. One iteration is `tick_ms` in `epoll_wait` plus the loop body (event batch, pending tasks, `do_tick`), so a timeout just over `tick_ms` reports healthy reactors; it must also exceed the longest expected body. With the watchdog on, the accept thread samples at least every `min(500 ms, timeout/2)`, so a stall shorter than the timeout plus one sample can fall between samples. A stall has two effects, both on the accept side: the episode is counted once (`reactor_stalls`) and logged, and the reactor stops receiving **new** connections (`reactor_stall_skips`) until it has made progress for a full timeout window again. Its existing connections are not touched, and the server is never stopped. |
 | `frame_assembly_timeout_ms` | `0` | Deadline for one frame, measured from its first byte. `0` means 5 × `idle_timeout_ms`. Must be ≥ 0. |
 | `allow_unknown_frame_types` | `false` | Deliver a type outside `1`/`2`/`3` to the message handler as DATA instead of closing the connection. See [wire protocol](#wire-protocol). |
+| `latency_histograms` | `false` | Opt in to the three `server_stats` latency histograms below. Off by default: when enabled, the reactor takes clock readings around handler calls, queued-task dispatch and timer expiries, and increments atomic buckets. The flag is read once in `start()` and is fixed for the run. |
 | `rbuf_capacity` | `65544` | Per-connection read buffer. Must be ≥ 65544: a smaller one cannot hold a legal maximum frame. |
 | `wbuf_capacity` | `65544` | Per-connection write buffer. Must be ≥ 8. |
 | `max_pending_bytes` | `65544` | Ceiling on bytes accepted for one connection but not yet written. Clamped down to `wbuf_capacity` by `start()`. |
@@ -424,7 +425,9 @@ enum class send_result : int {
 
 Read through `stats()`; every field is atomic and may be read at any time. The
 four traffic counters are batched per reactor and published once per loop
-iteration: exact when idle, up to one iteration behind under load.
+iteration: exact when idle, up to one iteration behind under load. The opt-in
+histograms below are written directly by the reactor thread; read their buckets
+after `stop()` when a stable snapshot matters.
 
 | Field | Counted when |
 |---|---|
@@ -454,6 +457,7 @@ iteration: exact when idle, up to one iteration behind under load.
 | `fd_exhausted_system` | `accept4` failed with `ENFILE`: the system-wide descriptor table is full, which closing one's own spare cannot fix. |
 | `read_pauses` | The reactor stopped reading a connection because its pending output passed the high watermark. |
 | `pending_tasks_total` / `pending_tasks_depth` | Tasks submitted through the cross-thread queue, and the current queue depth. The owner-thread fast path touches neither. |
+| `loop_lag_us` / `handler_duration_us` / `queue_wait_us` | Opt-in histograms (`config::latency_histograms`), in microseconds. `loop_lag_us` records each `epoll_wait` timeout, with 0 meaning the timer fired on time and larger values meaning it returned late; `handler_duration_us` records each message-handler call, including one that threw; `queue_wait_us` records the time from enqueue to dispatch for each cross-thread task. Each has `samples()`, `bucket(i)` (0-based; bucket 0 is 0 µs, buckets 1–10 cover powers of two up to 1024 µs, bucket 11 is ≥1024 µs) and `reset()`. All three stay empty when the flag is off. |
 | `eof_reads` | `recv` returned 0. A parked half-close makes this repeat under level-triggered epoll, so a fast-moving value means the reactor is spinning on one FIN. |
 | `close_requests_dropped` | The owning reactor refused the close hand-off. The close still happens — `do_tick` performs it — so this counter is a queue-pressure signal, not a lost close. |
 | `epipe_writes` | `sendmsg` returned `EPIPE`. Expected to stay 0 — every path that could reach it is guarded first. |
