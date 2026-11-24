@@ -1,6 +1,6 @@
 # Testing
 
-Eleven suites, thirteen runs, three configurations. `verify/run.sh` is the
+Twelve suites, fourteen runs, three configurations. `verify/run.sh` is the
 authority; `CMakeLists.txt` mirrors it for `ctest`. What follows is how a suite
 is written, and why the client half of every one of them now lives in a single
 file.
@@ -9,7 +9,7 @@ file.
 
 ```
 bash verify/run.sh                               # plain only
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 39 configurations
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 42 configurations
 ```
 
 Each run is a separate build: ASan and TSan cannot be linked into one binary, and
@@ -25,6 +25,17 @@ it with assertions, CI calls that script in its own step, and
 outside the three-configuration matrix: the claim is about accept-queue
 behaviour under a low descriptor ceiling, not about sanitizers. A host that
 never reaches EMFILE prints `[SKIP]` instead of a pass.
+
+`verify/tcp_server_fsm_test.cpp` is the exception to the socket-based pattern.
+It includes two headers under different paths and namespaces: the working-tree
+`tcp-server-mt.h` (the `conn_machine`) and the checked-in
+`verify/tcp-server-mt.prev.h`, a copy at the branch point where `close_fsm`
+still existed. That gives it an exhaustive closure check over every state the
+new machine admits, a decision-by-decision differential against the old one,
+and 40x20000 random walks. One difference is intentional and pinned as test D:
+the drained input budget is clamped at zero, so a second close request cannot
+re-measure it from the receive buffer. `--table` prints the transition table;
+[`docs/conn-fsm.md`](conn-fsm.md) is that output, not a hand-written summary.
 
 ## Writing a suite
 
@@ -113,7 +124,7 @@ after a reset has been reported once, `recv()` returns 0, which is
 indistinguishable from an orderly FIN, so a second `expect_close(fin)` relabelled a
 reset connection as a clean one. `peer` now remembers what it observed.
 
-running the full 39 configurations -- not only the suites that were touched --
+running the full 42 configurations -- not only the suites that were touched --
 caught the other: `port_is_listening` closed its probe descriptor twice when the
 connect succeeded, and the second close could land on a descriptor number the
 accept loop had just handed out. TSan reported it once, in a suite the change had

@@ -60,7 +60,7 @@
 #include "tcp-server-mt.h"
 
 using industrial::close_action;
-using industrial::close_fsm;
+using industrial::conn_machine;
 using industrial::drain_outcome;
 using industrial::frame_type;
 using industrial::multi_reactor_server;
@@ -230,18 +230,20 @@ void dump_stats(multi_reactor_server& server, const char* phase) {
                 (unsigned long long)st.eof_reads.load());
 }
 
-// ---- close_fsm unit transitions (no socket) --------------------------------
-// The FSM is the decision layer, so its branches can be driven directly with
-// fake buffers. The deferral rules are the point: they need a queue round to
-// land between two calls, which a live socket cannot schedule on demand.
+// ---- conn_machine unit transitions (no socket) -----------------------------
+// The machine is the decision layer, so its branches can be driven directly
+// with fake buffers. The deferral rules are the point: they need a queue round
+// to land between two calls, which a live socket cannot schedule on demand.
+// tcp_server_fsm_test.cpp covers the whole state space; these are the concrete
+// scenarios that found each deferral bug, carried over from close_fsm.
 
 struct fsm_fixture {
     ring_buffer          wbuf{4096};
     ring_buffer          rbuf{4096};
     std::atomic<size_t>  pending{0};
-    close_fsm            fsm;
+    conn_machine         sm;
 
-    fsm_fixture() { fsm.attach(&wbuf, &rbuf, &pending); }
+    fsm_fixture() { sm.attach(&wbuf, &rbuf, &pending); }
 
     void buffered(size_t n) {
         uint8_t junk[256] = {};
@@ -251,87 +253,103 @@ struct fsm_fixture {
             n -= chunk;
         }
     }
+    // handle_read records recv() == 0 in the machine before asking it what to
+    // do; on_peer_fin requires that read side to be eof.
+    void peer_fin() { sm.on_eof(); }
 };
 
-void run_close_fsm_unit_cases() {
-    std::printf("== close_fsm unit transitions ==\n");
+void run_conn_machine_unit_cases() {
+    constexpr int64_t kNow = 1000;
+    std::printf("== conn_machine unit transitions ==\n");
     {
         fsm_fixture x;
         x.buffered(100);
-        expect(x.fsm.on_request() == close_action::drain_input,
+        expect(x.sm.on_request(kNow).action == close_action::drain_input,
                "on_request -> drain_input");
-        expect(x.fsm.close_input_bytes == 100,
+        expect(x.sm.state().close_input_bytes == 100,
                "on_request measures the close input budget");
     }
     {
         fsm_fixture x;
         x.buffered(100);
-        x.fsm.on_request();
-        expect(x.fsm.on_input_drained(1, 10) ==
+        x.sm.on_request(kNow);
+        expect(x.sm.on_input_drained(1, 10) ==
                    close_action::defer_drain_input,
                "on_input_drained(served, more buffered) -> defer_drain_input");
     }
     {
         fsm_fixture x;
-        x.fsm.on_request();
-        expect(x.fsm.on_input_drained(1, 0) == close_action::defer_park,
+        x.sm.on_request(kNow);
+        expect(x.sm.on_input_drained(1, 0) == close_action::defer_park,
                "on_input_drained(served, nothing buffered) -> defer_park");
     }
     {
         fsm_fixture x;
         x.pending = 1;
-        x.fsm.on_request();
-        expect(x.fsm.on_input_drained(0, 0) == close_action::defer_park,
+        x.sm.on_request(kNow);
+        expect(x.sm.on_input_drained(0, 0) == close_action::defer_park,
                "on_input_drained(nothing served, replies queued)"
                " -> defer_park");
-        expect(x.fsm.on_input_drained(0, 0) == close_action::drain_wbuf,
+        expect(x.sm.on_input_drained(0, 0) == close_action::drain_wbuf,
                "the close deferral is one round only");
     }
     {
         fsm_fixture x;
         x.buffered(100);
-        x.fsm.on_request();
-        expect(x.fsm.on_input_drained(1, 10) ==
+        x.sm.on_request(kNow);
+        expect(x.sm.on_input_drained(1, 10) ==
                    close_action::defer_drain_input,
                "input defer hands off");
-        expect(x.fsm.on_input_defer_failed() == close_action::defer_park,
+        expect(x.sm.on_input_defer_failed() == close_action::defer_park,
                "on_input_defer_failed -> defer_park");
     }
     {
+        // An input defer hand-off whose retry loses to the peer's FIN: the
+        // peer-owned round wins, so there is nothing left to park when the
+        // retry reports failure. The budget has to be measured first -- a
+        // defer can only exist under a requested close.
         fsm_fixture x;
+        x.buffered(100);
         x.pending = 1;
-        x.fsm.on_peer_fin();
-        expect(x.fsm.on_input_defer_failed() == close_action::none,
+        x.sm.on_request(kNow);
+        expect(x.sm.on_input_drained(1, 10) ==
+                   close_action::defer_drain_input,
+               "input defer hands off before the FIN");
+        x.peer_fin();
+        expect(x.sm.on_peer_fin() == close_action::defer_peer_closed,
+               "a FIN with replies queued -> defer_peer_closed");
+        expect(x.sm.on_input_defer_failed() == close_action::none,
                "on_input_defer_failed under peer_closed -> none");
     }
     {
-        fsm_fixture x;
-        expect(x.fsm.on_drain_result(drain_outcome::drained) ==
-                   close_action::drain_complete,
+        expect(industrial::conn_sm::on_drain_result(
+                   drain_outcome::drained) == close_action::drain_complete,
                "on_drain_result(drained) -> drain_complete");
-        expect(x.fsm.on_drain_result(drain_outcome::stalled) ==
-                   close_action::none,
+        expect(industrial::conn_sm::on_drain_result(
+                   drain_outcome::stalled) == close_action::none,
                "on_drain_result(stalled) -> none");
-        expect(x.fsm.on_drain_result(drain_outcome::dead) ==
-                   close_action::close_abort,
+        expect(industrial::conn_sm::on_drain_result(
+                   drain_outcome::dead) == close_action::close_abort,
                "on_drain_result(dead) -> close_abort");
-        expect(x.fsm.on_drain_result(drain_outcome::error) ==
-                   close_action::close_abort,
+        expect(industrial::conn_sm::on_drain_result(
+                   drain_outcome::error) == close_action::close_abort,
                "on_drain_result(error) -> close_abort");
     }
     {
         fsm_fixture x;
         uint8_t one = 0;
         x.wbuf.write(&one, 1);
-        expect(x.fsm.on_peer_fin() == close_action::none,
+        x.peer_fin();
+        expect(x.sm.on_peer_fin() == close_action::none,
                "on_peer_fin with wbuf non-empty -> none");
     }
     {
         fsm_fixture x;
         x.pending = 1;
-        expect(x.fsm.on_peer_fin() == close_action::defer_peer_closed,
+        x.peer_fin();
+        expect(x.sm.on_peer_fin() == close_action::defer_peer_closed,
                "on_peer_fin with replies queued -> defer_peer_closed");
-        expect(x.fsm.on_peer_fin() == close_action::close_graceful,
+        expect(x.sm.on_peer_fin() == close_action::close_graceful,
                "the peer_closed deferral is one round only");
     }
     {
@@ -341,23 +359,26 @@ void run_close_fsm_unit_cases() {
         // close_graceful and tore down over them.
         fsm_fixture x;
         x.pending = 1;
-        x.fsm.on_request();
-        expect(x.fsm.on_input_drained(1, 0) == close_action::defer_park,
+        x.sm.on_request(kNow);
+        expect(x.sm.on_input_drained(1, 0) == close_action::defer_park,
                "on_input_drained(served, nothing buffered) -> defer_park");
-        expect(x.fsm.on_peer_fin() == close_action::defer_peer_closed,
+        x.peer_fin();
+        expect(x.sm.on_peer_fin() == close_action::defer_peer_closed,
                "a FIN while the close park round is owed ->"
                " defer_peer_closed");
     }
     {
         fsm_fixture x;
-        expect(x.fsm.on_graceful() == close_action::drain_wbuf,
+        expect(x.sm.on_graceful(kNow).action == close_action::drain_wbuf,
                "on_graceful -> drain_wbuf");
-        expect(x.fsm.on_peer_fin() == close_action::send_fin,
+        x.peer_fin();
+        expect(x.sm.on_peer_fin() == close_action::send_fin,
                "on_peer_fin while closing, nothing owed -> send_fin");
     }
     {
         fsm_fixture x;
-        expect(x.fsm.on_peer_fin() == close_action::close_graceful,
+        x.peer_fin();
+        expect(x.sm.on_peer_fin() == close_action::close_graceful,
                "on_peer_fin otherwise -> close_graceful");
     }
 }
@@ -370,7 +391,7 @@ int main() {
     // interleaved failure log is worse than none.
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    run_close_fsm_unit_cases();
+    run_conn_machine_unit_cases();
 
     g_zero_linger = kernel_honours_zero_linger();
     std::printf("== kernel turns SO_LINGER{on,0} into an observable RST: %s ==\n",

@@ -1081,8 +1081,8 @@ class conn_machine {
             std::fprintf(stderr,
                 "[fatal] conn_machine invariant broken: %s "
                 "(phase=%d read=%d write_armed=%d in_round=%d round=%d "
-                "close_input_bytes=%lld close_started_at_ms=%lld "
-                "paused_at_ms=%lld)\n",
+                "close_input_bytes=%" PRId64 " close_started_at_ms=%" PRId64
+                " paused_at_ms=%" PRId64 ")\n",
                 why, static_cast<int>(st_.phase), static_cast<int>(st_.read),
                 static_cast<int>(st_.write_armed),
                 static_cast<int>(st_.in_round), static_cast<int>(st_.round),

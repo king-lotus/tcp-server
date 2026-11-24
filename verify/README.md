@@ -13,6 +13,12 @@ bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加�
 - race 与内存错误：ASan + UBSan、TSan 各跑一整套
 - 头文件被多个翻译单元包含时的 ODR/重复定义问题
 
+`tcp_server_fsm_test.cpp` is the one suite that opens no sockets. It compiles
+the working-tree `conn_machine` and the checked-in `tcp-server-mt.prev.h`
+(the `close_fsm` at the branch point) into different namespaces, then checks
+every admitted state, compares every close decision against the old machine,
+and runs 40x20000 random walks. `--table` regenerates `docs/conn-fsm.md`.
+
 ## 不能验证什么
 
 - **这台内核造不出的状态**：内核不投递 `EPOLLHUP|EPOLLERR`、或把 `SO_LINGER{on,0}` 变成干净 FIN 时，

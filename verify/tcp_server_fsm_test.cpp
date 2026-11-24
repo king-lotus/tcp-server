@@ -14,8 +14,9 @@
 //   E. the owning class: published phase, send gating, the cross-thread
 //      request channel.
 //
-// Build: g++ -std=c++17 -O1 -g -fsanitize=address,undefined -pthread \
-//            -DNEWH='"tcp-server-mt.h"' -DOLDH='"tcp-server-mt.prev.h"' tcp_server_fsm_test.cpp
+// Build: g++ -std=c++17 -O1 -g -fsanitize=address,undefined -pthread
+//            -DNEWH='"tcp-server-mt.h"'
+//            -DOLDH='"tcp-server-mt.prev.h"' tcp_server_fsm_test.cpp
 // (tcp-server-mt.prev.h is your previous header, kept for the differential tests)
 // Pass --table to print the transition table instead of testing.
 #include NEWH
@@ -167,8 +168,12 @@ struct LegacyWorld {
         paused = s.read == read_mode::paused; peer = s.read == read_mode::eof; armed = s.write_armed;
     }
     // the reactor's caller guards, as they were
-    bool pause() { if (f.closing.load() || f.draining_input) return false;
-                   if (paused || peer || f.is_closed.load()) return false; paused = true; return true; }
+    bool pause() {
+        if (f.closing.load() || f.draining_input) return false;
+        if (paused || peer || f.is_closed.load()) return false;
+        paused = true;
+        return true;
+    }
     bool resume() { if (!paused) return false; paused = false; return true; }
     bool set_write(bool a) { if (f.is_closed.load() || armed == a) return false; armed = a; return true; }
 };
@@ -229,12 +234,18 @@ static void test_differential() {
         { conn_state s = s0; LegacyWorld lw; lw.load(s0);
           const bool nr = conn_sm::on_pause(s, NOW), lr = lw.pause();
           CHECK(nr == lr);
-          if (s0.phase != conn_phase::closed) CHECK((s.read == read_mode::paused) == lw.paused); ++compared; }
+          if (s0.phase != conn_phase::closed)
+              CHECK((s.read == read_mode::paused) == lw.paused);
+          ++compared;
+        }
         { conn_state s = s0; LegacyWorld lw; lw.load(s0);
           const bool nr = conn_sm::on_resume(s, NOW).resumed, lr = lw.resume(); CHECK(nr == lr); ++compared; }
         { conn_state s = s0; LegacyWorld lw; lw.load(s0);
           for (bool a : {true, false, true}) { CHECK(conn_sm::on_set_write(s, a) == lw.set_write(a)); CHECK(s.write_armed == lw.armed); } ++compared; }
-        { uint32_t legacy_interest = (!(s0.read == read_mode::paused) && !(s0.read == read_mode::eof) ? EPOLLIN : 0) | (s0.write_armed ? EPOLLOUT : 0);
+        { uint32_t legacy_interest =
+              (!(s0.read == read_mode::paused) && !(s0.read == read_mode::eof)
+                   ? static_cast<uint32_t>(EPOLLIN) : 0u) |
+              (s0.write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u);
           CHECK(conn_sm::interest(s0) == legacy_interest); }
     }
     std::printf("  %zu decisions compared, all agree (modulo test D)\n", compared);

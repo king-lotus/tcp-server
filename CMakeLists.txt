@@ -56,6 +56,16 @@ if(TCP_BUILD_SUITES)
     add_executable(fault_injection verify/fault_injection.cpp)
     target_link_libraries(fault_injection PRIVATE tcp_server_mt)
 
+    # Differential FSM suite: the working-tree header and the close_fsm it
+    # replaced (checked in as verify/tcp-server-mt.prev.h at the branch point)
+    # are included under different paths, hence into different namespaces.
+    add_executable(tcp_server_fsm_test verify/tcp_server_fsm_test.cpp)
+    target_link_libraries(tcp_server_fsm_test PRIVATE tcp_server_mt)
+    target_include_directories(tcp_server_fsm_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/verify")
+    target_compile_definitions(tcp_server_fsm_test PRIVATE
+        NEWH='"tcp-server-mt.h"' OLDH='"tcp-server-mt.prev.h"')
+
     # TSan reserves a fixed shadow region and dies on kernels that hand out
     # high vm.mmap_rnd_bits. verify/run.sh wraps those runs in `setarch -R`,
     # and ctest needs the same wrap or every tsan test fails before main().
@@ -67,7 +77,7 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same thirteen runs run.sh performs: eleven suites, plus the two that
+    # The same fourteen runs run.sh performs: twelve suites, plus the two that
     # run a second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)
@@ -99,6 +109,8 @@ if(TCP_BUILD_SUITES)
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:watermark>)
     add_test(NAME hardening
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:hardening>)
+    add_test(NAME tcp_server_fsm_test
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:tcp_server_fsm_test>)
 
     # run.sh gives each case 180s so a hang presents as a failure; the same
     # bound here keeps ctest from outliving the CI job.
@@ -107,6 +119,7 @@ if(TCP_BUILD_SUITES)
                          fault_injection reactor_spread
                          reactor_spread_2_reactors config_budget
                          harness_selftest watermark hardening
+                         tcp_server_fsm_test
                          PROPERTIES TIMEOUT 180)
 endif()
 

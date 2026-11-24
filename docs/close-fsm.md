@@ -1,6 +1,9 @@
 # close_fsm — extract the graceful-close protocol
 
-Status: **implemented** · 2026-11-09.
+Status: **superseded** · 2026-11-09. The design below was implemented and later
+replaced by `conn_machine`; see [`conn-fsm.md`](conn-fsm.md) for the current
+state machine and its generated transition table. This document is kept as the
+record of why the close protocol was extracted in the first place.
 
 ## Context
 

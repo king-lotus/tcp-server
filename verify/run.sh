@@ -51,6 +51,12 @@ g++ --version | head -1
 # it. Sources include the header by bare name; the ../.. arithmetic that used
 # to sit in twenty files was the thing that made any move expensive.
 base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
+# The FSM suite links two versions of the header into one binary: the new
+# conn_machine from the working tree and the close_fsm it replaced, kept as a
+# checked-in oracle at the branch point (8d55d8f). #pragma once is path-based,
+# so the two files can coexist inside separate namespaces.
+fsm_flags=("${base_flags[@]}" -Iverify
+           -DNEWH='"tcp-server-mt.h"' -DOLDH='"tcp-server-mt.prev.h"')
 
 # The test uses the same switches to build, so both must agree on the macro or
 # the harness silently compiles itself away. It cannot: fault_injection.cpp
@@ -70,6 +76,8 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o "$out/harness_selftest"
     g++ "${base_flags[@]}" "$@" verify/watermark.cpp -o "$out/watermark"
     g++ "${base_flags[@]}" "$@" verify/hardening.cpp -o "$out/hardening"
+    g++ "${fsm_flags[@]}" "$@" verify/tcp_server_fsm_test.cpp \
+        -o "$out/tcp_server_fsm_test"
 }
 
 run_all() {
@@ -99,7 +107,8 @@ run_all() {
                    "config_budget:$out/config_budget" \
                    "harness_selftest:$out/harness_selftest" \
                    "watermark:$out/watermark" \
-                   "hardening:$out/hardening"; do
+                   "hardening:$out/hardening" \
+                   "tcp_server_fsm_test:$out/tcp_server_fsm_test"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
@@ -227,6 +236,12 @@ cat <<EOF
     implementation that always returned the first reactor leaves every other
     suite green. It runs twice, at four reactors and at two, so the assertion is
     shown to follow the configuration rather than a constant in the test.
+  - tcp_server_fsm_test checks conn_machine directly: exhaustive closure over
+    every state valid() admits, a differential against the close_fsm it replaced,
+    and random walks. Test D is the one intentional difference -- a drained
+    budget is clamped at zero so a second close request cannot re-measure it.
+    The checked-in verify/tcp-server-mt.prev.h is the branch-point oracle;
+    `--table` regenerates docs/conn-fsm.md.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as

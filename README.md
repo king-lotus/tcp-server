@@ -48,8 +48,8 @@ This project has no "just run it and see" position. Everything is settled by
 building and running it on Linux:
 
 ```bash
-# Eleven suites, thirteen runs per configuration -- two of them run twice, at
-# different reactor counts -- over {plain, asan+ubsan, tsan}: 39 configurations,
+# Twelve suites, fourteen runs per configuration -- two of them run twice, at
+# different reactor counts -- over {plain, asan+ubsan, tsan}: 42 configurations,
 # cpplint included.
 ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh
 ```
@@ -74,7 +74,7 @@ because the three configurations, cpplint and the ordering live there.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # the same thirteen runs
+ctest --test-dir build --output-on-failure     # the same fourteen runs
 ```
 
 `-DTCP_SANITIZE=address,undefined` (or `thread`) rebuilds the suites under one
