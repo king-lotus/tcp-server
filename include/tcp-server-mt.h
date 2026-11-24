@@ -469,6 +469,41 @@ inline uint64_t overdue_us(std::chrono::steady_clock::time_point from,
     return us > expected_us ? us - expected_us : 0;
 }
 
+namespace detail {
+// One scoped sample: the destructor records on every exit path, including an
+// exception, and a null histogram is inert without even a clock read.
+class latency_sample {
+ public:
+    explicit latency_sample(latency_histogram* h) noexcept
+        : h_(h), from_(h ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{}) {}
+
+    latency_sample(latency_histogram* h,
+                   std::chrono::steady_clock::time_point from,
+                   uint64_t expected_us = 0) noexcept
+        : h_(h), from_(from), expected_us_(expected_us) {}
+
+    ~latency_sample() noexcept {
+        if (h_ == nullptr) return;
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t us = expected_us_ == 0
+                                ? elapsed_us(from_, now)
+                                : overdue_us(from_, now, expected_us_);
+        h_->add(us);
+    }
+
+    latency_sample(const latency_sample&) = delete;
+    latency_sample& operator=(const latency_sample&) = delete;
+
+    void dismiss() noexcept { h_ = nullptr; }
+
+ private:
+    latency_histogram* h_ = nullptr;
+    std::chrono::steady_clock::time_point from_{};
+    uint64_t expected_us_ = 0;
+};
+}  // namespace detail
+
 // ==================== Statistics ====================
 struct server_stats {
     // Connections fully registered with a reactor: in both maps, counted by
@@ -2409,12 +2444,13 @@ inline void sub_reactor::process_pending() noexcept {
         // frames; their pending_bytes reservations are not returned (cleanup()
         // explains why that cannot leak and is not counted).
         if (!running_.load() || !server_->is_running()) break;
-        // One indirect call through the table, indexed by the alternative.
-        k_task_dispatch[t.task.index()](this, t.task);
-        if (server_->latency_histograms_enabled()) {
-            const auto done = std::chrono::steady_clock::now();
-            server_->stats_ref().queue_wait_us.add(
-                elapsed_us(t.enqueued_at, done));
+        {
+            detail::latency_sample sample(
+                server_->latency_histograms_enabled()
+                    ? &server_->stats_ref().queue_wait_us : nullptr,
+                t.enqueued_at);
+            // One indirect call through the table, indexed by the alternative.
+            k_task_dispatch[t.task.index()](this, t.task);
         }
         flush_close_callbacks();
     }
@@ -3413,11 +3449,10 @@ inline void sub_reactor::parse_frames(connection* c,
             c->rbuf.consume(len);
             auto& mh = server_->msg_handler_ref();
             if (mh) {
-                const bool measure = server_->latency_histograms_enabled();
-                std::chrono::steady_clock::time_point handler_start{};
-                if (measure) {
-                    handler_start = std::chrono::steady_clock::now();
-                }
+                detail::latency_sample sample(
+                    server_->latency_histograms_enabled()
+                        ? &server_->stats_ref().handler_duration_us
+                        : nullptr);
                 try {
                     mh(c->id, frame_scratch_.data(), len);
                 } catch (...) {
@@ -3427,11 +3462,7 @@ inline void sub_reactor::parse_frames(connection* c,
                     // to count. Letting it cross parse_frames() -- noexcept --
                     // would call std::terminate() and take every connection
                     // with it, not just the one whose message it was.
-                }
-                if (measure) {
-                    const auto done = std::chrono::steady_clock::now();
-                    server_->stats_ref().handler_duration_us.add(
-                        elapsed_us(handler_start, done));
+                    // The scoped sample still records the failed call.
                 }
             }
         }
@@ -4080,13 +4111,14 @@ inline void sub_reactor::loop() noexcept {
             if (measure_lag) {
                 wait_start = std::chrono::steady_clock::now();
             }
+            detail::latency_sample lag(
+                measure_lag ? &server_->stats_ref().loop_lag_us : nullptr,
+                wait_start, static_cast<uint64_t>(wait_ms) * 1000);
             int n = ::epoll_wait(epoll_fd_, events.data(),
                                  static_cast<int>(events.size()), wait_ms);
-            if (n == 0 && wait_ms > 0 && measure_lag) {
-                const auto done = std::chrono::steady_clock::now();
-                server_->stats_ref().loop_lag_us.add(overdue_us(
-                    wait_start, done, static_cast<uint64_t>(wait_ms) * 1000));
-            }
+            // Only a timer expiry is a loop-lag sample; event-driven and
+            // continuation iterations have no tick to be late against.
+            if (n != 0 || wait_ms <= 0) lag.dismiss();
             if (n < 0) {
                 if (errno == EINTR) continue;
                 server_->on_reactor_failed(this);

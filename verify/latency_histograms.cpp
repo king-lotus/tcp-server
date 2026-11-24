@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 namespace {
@@ -109,6 +110,33 @@ void case_handler_duration() {
                     "handler buckets add up to the sample count");
 }
 
+void case_throwing_handler() {
+    std::printf("C. a throwing handler is still sampled\n");
+    auto cfg = harness::quiet_config();
+    cfg.num_reactors = 1;
+    cfg.latency_histograms = true;
+    std::atomic<int> calls{0};
+    harness::fixture f(cfg, [&](uint64_t, const uint8_t*, size_t) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        throw std::runtime_error("handler failure");
+    });
+    harness::expect(f.started(), "server started");
+
+    harness::peer p;
+    harness::expect(!!p.connect(f.port()), "peer connected");
+    const uint8_t byte = 0x51;
+    harness::expect(!!p.send(industrial::frame_type::DATA, &byte, 1),
+                    "DATA frame sent");
+    harness::expect(wait_for(2000, [&] {
+        return calls.load(std::memory_order_relaxed) == 1;
+    }), "the handler ran once");
+    f.stop();
+
+    const auto& st = f.stats();
+    harness::expect(samples(st.handler_duration_us) == 1,
+                    "the thrown call was still recorded");
+}
+
 // The only reactor is parked inside the handler, so tasks submitted from
 // the test thread stay in the queue until it is released.
 struct handler_gate {
@@ -134,7 +162,7 @@ struct handler_gate {
 };
 
 void case_queue_wait_and_loop_lag() {
-    std::printf("C. queued tasks and timer expiries are sampled\n");
+    std::printf("D. queued tasks and timer expiries are sampled\n");
     auto cfg = harness::quiet_config();
     cfg.num_reactors = 1;
     cfg.latency_histograms = true;
@@ -217,6 +245,7 @@ int main() {
     std::printf("== latency histograms ==\n");
     case_flag_off();
     case_handler_duration();
+    case_throwing_handler();
     case_queue_wait_and_loop_lag();
     std::printf("== latency histograms end ==\n");
     return harness::finish();
