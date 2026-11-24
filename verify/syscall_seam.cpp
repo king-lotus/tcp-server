@@ -312,6 +312,43 @@ void case_accept_emfile() {
     harness::expect(!!q.connect(f.port()), "a later connection is accepted");
 }
 
+void case_short_write_iovec_bounds() {
+    std::printf("H. a short write can span more than two iovecs\n");
+    seam_policy::reset();
+    int sv[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        harness::expect(false, "socketpair created");
+        return;
+    }
+
+    uint8_t a[2] = {1, 2};
+    uint8_t b[2] = {3, 4};
+    uint8_t c[2] = {5, 6};
+    struct iovec vec[3] = {{a, sizeof(a)}, {b, sizeof(b)}, {c, sizeof(c)}};
+    struct msghdr msg{};
+    msg.msg_iov = vec;
+    msg.msg_iovlen = 3;
+
+    // Five bytes cross both iovec boundaries and touch the third segment.
+    // A two-element array in the policy would be indexed out of bounds here.
+    seam_policy::sendmsg_short_bytes.store(5, std::memory_order_release);
+    const ssize_t sent = seam_policy::sendmsg(sv[0], &msg, MSG_NOSIGNAL);
+    harness::expect(sent == 5,
+                    "the injected short write sent exactly five bytes",
+                    "sent " + std::to_string(sent));
+
+    uint8_t got[6] = {};
+    const ssize_t nread = ::recv(sv[1], got, sizeof(got), MSG_DONTWAIT);
+    harness::expect(nread == 5, "only the injected bytes reached the peer",
+                    "read " + std::to_string(nread));
+    harness::expect(got[0] == 1 && got[1] == 2 && got[2] == 3 &&
+                        got[3] == 4 && got[4] == 5,
+                    "the bytes crossed both boundaries in order");
+
+    ::close(sv[0]);
+    ::close(sv[1]);
+}
+
 }  // namespace
 
 int main() {
@@ -320,6 +357,7 @@ int main() {
     case_recv_error();
     case_sendmsg_epipe();
     case_sendmsg_short_write();
+    case_short_write_iovec_bounds();
     case_shutdown_failure();
     case_epoll_ctl_mod_failure();
     case_accept_emfile();

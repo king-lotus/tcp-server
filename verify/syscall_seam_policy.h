@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <vector>
 
 namespace industrial {
 
@@ -83,15 +84,18 @@ struct seam_policy {
             sendmsg_short_bytes.exchange(0, std::memory_order_acq_rel);
         if (short_n > 0) {
             struct msghdr partial = *msg;
-            struct iovec iov[2]{};
+            // Sized from the caller, not a fixed two-element array: a short
+            // write can span any number of segments, and indexing past a
+            // fixed array would corrupt the test binary's stack.
+            std::vector<struct iovec> iov(msg->msg_iovlen);
             size_t left = static_cast<size_t>(short_n);
             size_t n = 0;
-            for (; n < msg->msg_iovlen && left > 0; ++n) {
+            for (; n < iov.size() && left > 0; ++n) {
                 iov[n].iov_base = msg->msg_iov[n].iov_base;
                 iov[n].iov_len = std::min(left, msg->msg_iov[n].iov_len);
                 left -= iov[n].iov_len;
             }
-            partial.msg_iov = iov;
+            partial.msg_iov = iov.data();
             partial.msg_iovlen = n;
             return ::sendmsg(fd, &partial, flags);
         }
