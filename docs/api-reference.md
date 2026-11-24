@@ -490,6 +490,23 @@ The `reason` passed to `close_handler`, and why each one appears.
 | `epoll resume registration failed` | `EPOLL_CTL_MOD` to resume reading failed. |
 | `epoll park registration failed` | Re-arming interest on a parked half-close failed. |
 
+## Syscall policy seam
+
+`recv`, `sendmsg`, `shutdown`, `epoll_ctl` and `accept4` are called through
+`industrial::syscall_policy` rather than directly. In a normal build that alias
+names `default_syscall_policy`, five `static inline` forwarders — one direct
+call per site, no virtual dispatch, no state. There is nothing to configure and
+no runtime cost.
+
+A test binary can replace the alias at compile time by defining
+`TCP_SERVER_SYSCALL_POLICY` to a type with the same five static signatures
+**before** any include of the header. Since the alias is part of the class
+definition's inline bodies, every translation unit in one binary must see the
+same policy; the verify runner compiles the injecting suite as its own target.
+`verify/syscall_seam_policy.h` is the reference implementation and
+`verify/syscall_seam.cpp` uses it to make EPIPE, short writes, a failed
+`shutdown`, a failed `epoll_ctl(MOD)` and `accept4` EMFILE deterministic tests.
+
 ## What the library does not do
 
 - **No TLS and no authentication.** `bind_addr` defaults to every interface;

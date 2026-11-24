@@ -47,6 +47,15 @@ if(TCP_BUILD_SUITES)
         state_invariants
         frame_codec)
 
+    # The seam suite selects a policy type at compile time. It is a separate
+    # target because that macro must not leak into the other suites: one
+    # binary, one syscall_policy definition.
+    add_executable(syscall_seam verify/syscall_seam.cpp)
+    target_link_libraries(syscall_seam PRIVATE tcp_server_mt)
+    target_include_directories(syscall_seam PRIVATE verify)
+    target_compile_definitions(syscall_seam PRIVATE
+        TCP_SERVER_SYSCALL_POLICY=industrial::seam_policy)
+
     foreach(suite IN LISTS TCP_SUITES)
         add_executable(${suite} verify/${suite}.cpp)
         target_link_libraries(${suite} PRIVATE tcp_server_mt)
@@ -69,7 +78,7 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same fifteen runs run.sh performs: thirteen suites, plus the two that
+    # The same sixteen runs run.sh performs: fourteen suites, plus the two that
     # run a second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)
@@ -105,6 +114,8 @@ if(TCP_BUILD_SUITES)
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:state_invariants>)
     add_test(NAME frame_codec
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:frame_codec>)
+    add_test(NAME syscall_seam
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:syscall_seam>)
 
     # run.sh gives each case 180s so a hang presents as a failure; the same
     # bound here keeps ctest from outliving the CI job.
@@ -113,7 +124,7 @@ if(TCP_BUILD_SUITES)
                          fault_injection reactor_spread
                          reactor_spread_2_reactors config_budget
                          harness_selftest watermark hardening
-                         state_invariants frame_codec
+                         state_invariants frame_codec syscall_seam
                          PROPERTIES TIMEOUT 180)
 endif()
 

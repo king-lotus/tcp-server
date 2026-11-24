@@ -1,6 +1,6 @@
 # Testing
 
-Thirteen suites, fifteen runs, three configurations. `verify/run.sh` is the
+Fourteen suites, sixteen runs, three configurations. `verify/run.sh` is the
 authority; `CMakeLists.txt` mirrors it for `ctest`. What follows is how a suite
 is written, and why the client half of every one of them now lives in a single
 file.
@@ -9,7 +9,7 @@ file.
 
 ```
 bash verify/run.sh                               # plain only
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 45 configurations
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 48 configurations
 ```
 
 Each run is a separate build: ASan and TSan cannot be linked into one binary, and
@@ -42,6 +42,35 @@ The dictionary is not decoration: two specific magic bytes out of 65536 are a
 rare mutation to find from empty input, and a fuzzer without them spends its
 time in `need_more`. `TCP_FUZZING=1` drops the suite's `main()` and its
 `harness.h` dependency, leaving the pure header and the checker.
+
+### The syscall seam
+
+Five syscalls — `recv`, `sendmsg`, `shutdown`, `epoll_ctl` and `accept4` — are
+called through `syscall_policy::` rather than `::` directly. The production
+policy is five static inline forwarders, so this is one direct call at `-O0` and
+less at `-O2`: no virtual, no pointer, no branch, no per-server state.
+
+A test binary may replace the whole policy by defining
+`TCP_SERVER_SYSCALL_POLICY` before any include of `tcp-server-mt.h`.
+`verify/syscall_seam.cpp` does that with `verify/syscall_seam_policy.h`, whose
+knobs are one-shot errnos consumed with `exchange(0)` on the reactor thread.
+That turns five failure paths into ordinary assertions, with no fork, no
+lowered `RLIMIT_NOFILE` and no attempt to manufacture a real EPIPE window:
+
+- `recv` error → abort, not a spurious FIN;
+- `sendmsg` EPIPE → counter moves, no EPOLLOUT spin, peer sees RST;
+- short `sendmsg` → the remaining bytes reach the peer and the frame count is
+  still one;
+- `shutdown` failure → a parked close ends in RST rather than an unearned FIN;
+- `epoll_ctl(MOD)` failure → `epoll_ctl_errors` moves and the connection aborts;
+- `accept4` EMFILE → the reserved descriptor takes the queued victim, EMFILE is
+  counted, and the accept loop still serves the next client.
+
+The macro is a per-binary choice, not a per-file one. Every translation unit
+linked into a binary must see the same `syscall_policy` alias; `run.sh` and
+CMake compile this suite as its own target for that reason. Removing the seam
+from a header copy makes 15 of these assertions fail, so they test the
+injection path rather than the loopback socket.
 
 ## Writing a suite
 
@@ -130,7 +159,7 @@ after a reset has been reported once, `recv()` returns 0, which is
 indistinguishable from an orderly FIN, so a second `expect_close(fin)` relabelled a
 reset connection as a clean one. `peer` now remembers what it observed.
 
-running the full 39 configurations -- not only the suites that were touched --
+running the full 48 configurations -- not only the suites that were touched --
 caught the other: `port_is_listening` closed its probe descriptor twice when the
 connect succeeded, and the second close could land on a descriptor number the
 accept loop had just handed out. TSan reported it once, in a suite the change had

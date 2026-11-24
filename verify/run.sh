@@ -73,6 +73,12 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/state_invariants.cpp \
         -o "$out/state_invariants"
     g++ "${base_flags[@]}" "$@" verify/frame_codec.cpp -o "$out/frame_codec"
+    # The syscall seam test needs its own policy type and an extra include path.
+    # Both must be present in this TU only: a second TU compiled with a
+    # different syscall_policy would be an ODR violation in the same binary.
+    g++ "${base_flags[@]}" "$@" -Iverify \
+        -DTCP_SERVER_SYSCALL_POLICY=industrial::seam_policy \
+        verify/syscall_seam.cpp -o "$out/syscall_seam"
 }
 
 run_all() {
@@ -104,7 +110,8 @@ run_all() {
                    "watermark:$out/watermark" \
                    "hardening:$out/hardening" \
                    "state_invariants:$out/state_invariants" \
-                   "frame_codec:$out/frame_codec"; do
+                   "frame_codec:$out/frame_codec" \
+                   "syscall_seam:$out/syscall_seam"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0

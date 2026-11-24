@@ -14,6 +14,7 @@ bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加�
 - 头文件被多个翻译单元包含时的 ODR/重复定义问题
 - 连接状态轴的非法组合：debug 构建里的断言 + 一张合法/非法组合与决策效果表
 - 帧头纯函数的全部判定分支：手工边界表、与旧解析的逐字节对照，以及 20 万条确定性随机输入；`LLVMFuzzerTestOneInput` 与套件共用同一套不变量检查
+- syscall seam 的六条失败路径：用编译期 policy 一次性注入 `recv` / `sendmsg` / `shutdown` / `epoll_ctl` / `accept4` 的 errno，断言原有计数与 FIN/RST 行为，不再依赖 fork 或降 rlimit
 
 ## 不能验证什么
 

@@ -49,6 +49,44 @@
 
 namespace industrial {
 
+// ==================== Syscall seam ====================
+// The five syscalls whose failure paths used to need a live socket, a fork or
+// a lowered rlimit are called through this type rather than directly. The
+// production policy is a set of static inline forwarders: one direct call, no
+// virtual, no pointer, no branch, no per-server state. Test builds replace the
+// whole type before including this header (see verify/syscall_seam_policy.h),
+// which lets a suite decide the errno and return value of any single call.
+//
+// Replacement is compile-time, so every translation unit in one binary must
+// see the same policy -- the alias is the ODR boundary, exactly as the
+// class layout is. Do not define TCP_SERVER_SYSCALL_POLICY in only some TUs.
+struct default_syscall_policy {
+    static ssize_t recv(int fd, void* buf, size_t len, int flags) noexcept {
+        return ::recv(fd, buf, len, flags);
+    }
+    static ssize_t sendmsg(int fd, const struct msghdr* msg,
+                           int flags) noexcept {
+        return ::sendmsg(fd, msg, flags);
+    }
+    static int shutdown(int fd, int how) noexcept {
+        return ::shutdown(fd, how);
+    }
+    static int epoll_ctl(int epfd, int op, int fd,
+                         struct epoll_event* ev) noexcept {
+        return ::epoll_ctl(epfd, op, fd, ev);
+    }
+    static int accept4(int fd, struct sockaddr* addr, socklen_t* len,
+                       int flags) noexcept {
+        return ::accept4(fd, addr, len, flags);
+    }
+};
+
+#ifdef TCP_SERVER_SYSCALL_POLICY
+using syscall_policy = TCP_SERVER_SYSCALL_POLICY;
+#else
+using syscall_policy = default_syscall_policy;
+#endif
+
 // ==================== Frame protocol ====================
 constexpr uint16_t FRAME_MAGIC       = 0xEB90;
 constexpr size_t   FRAME_HEADER_SIZE = 8;
@@ -2168,7 +2206,8 @@ inline bool sub_reactor::start() noexcept {
 
     struct epoll_event ev{};
     ev.events = EPOLLIN; ev.data.u64 = REACTOR_WAKE_TAG;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) < 0) {
+    if (syscall_policy::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) <
+        0) {
         ::close(wake_fd_); ::close(epoll_fd_);
         wake_fd_ = epoll_fd_ = -1; running_.store(false); return false;
     }
@@ -2353,7 +2392,8 @@ inline void sub_reactor::handle_task(
 
         struct epoll_event ev{};
         ev.events = EPOLLIN; ev.data.u64 = t.id;
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, t.fd.fd, &ev) < 0) {
+        if (syscall_policy::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, t.fd.fd,
+                                      &ev) < 0) {
             server_->stats_ref().epoll_ctl_errors.fetch_add(
                 1, std::memory_order_relaxed);
             server_->stats_ref().rejected.fetch_add(
@@ -2639,11 +2679,14 @@ inline void sub_reactor::apply_interest(connection* c,
     ev.data.u64 = c->id;
     if (!c->read_paused && !c->peer_closed) ev.events |= EPOLLIN;
     if (c->write_armed) ev.events |= EPOLLOUT;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, c->fd, &ev) == 0) return;
+    if (syscall_policy::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, c->fd, &ev) == 0)
+        return;
     if (errno == ENOENT) {
         // Registered set out of sync (fd was re-added elsewhere): restore it
         // with ADD.
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, c->fd, &ev) == 0) return;
+        if (syscall_policy::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, c->fd, &ev) ==
+            0)
+            return;
     }
     server_->stats_ref().epoll_ctl_errors.fetch_add(
         1, std::memory_order_relaxed);
@@ -2738,7 +2781,7 @@ inline drain_outcome sub_reactor::drain_wbuf_to_socket(connection* c) noexcept {
         msghdr msg{};
         msg.msg_iov = spans;
         msg.msg_iovlen = spans[1].iov_len ? 2 : 1;
-        ssize_t k = ::sendmsg(c->fd, &msg, MSG_NOSIGNAL);
+        ssize_t k = syscall_policy::sendmsg(c->fd, &msg, MSG_NOSIGNAL);
         if (k < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -2862,7 +2905,7 @@ inline int sub_reactor::handle_read(connection* c) noexcept {
         size_t want = std::min(c->rbuf.write_span(),
                                static_cast<size_t>(bytes_left));
         assert(want > 0);
-        ssize_t n = ::recv(c->fd, c->rbuf.write_ptr(), want, 0);
+        ssize_t n = syscall_policy::recv(c->fd, c->rbuf.write_ptr(), want, 0);
         if (n > 0) {
             c->rbuf.commit(static_cast<size_t>(n));
             bytes_left -= static_cast<int>(n);
@@ -3008,7 +3051,7 @@ inline bool sub_reactor::try_begin_write_shutdown(connection* c) noexcept {
     // Never FIN over bytes still in wbuf: they would be lost, and the peer
     // would see a clean end to a truncated stream.
     if (!c->fsm.wbuf_empty()) return false;
-    if (::shutdown(c->fd, SHUT_WR) < 0) return false;
+    if (syscall_policy::shutdown(c->fd, SHUT_WR) < 0) return false;
     c->fsm.fin_sent = true;
     return true;
 }
@@ -3318,7 +3361,7 @@ inline void sub_reactor::unregister_conn(connection* c,
         lg.l_linger = 0;
         setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
     }
-    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, c->fd, nullptr);
+    syscall_policy::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, c->fd, nullptr);
     ::close(c->fd);
     c->fd = -1;
     c->write_armed = false;
@@ -4924,10 +4967,12 @@ inline bool multi_reactor_server::open_accept_descriptors() noexcept {
         fail_epoll_add_for_test_.store(false, std::memory_order_relaxed);
         return false;
     }
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) != 0)
+    if (syscall_policy::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) !=
+        0)
         return false;
     ev.data.fd = wake_fd_;
-    return ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) == 0;
+    return syscall_policy::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) ==
+           0;
 }
 
 inline void multi_reactor_server::close_accept_descriptors() noexcept {
@@ -4981,8 +5026,8 @@ multi_reactor_server::salvage_descriptor_exhaustion(
     // for a slot that -- on a server that owns the machine -- never comes.
     ::close(spare_fd_);
     spare_fd_ = -1;
-    const int victim = ::accept4(listen_fd_, nullptr, nullptr,
-                                 SOCK_NONBLOCK | SOCK_CLOEXEC);
+    const int victim = syscall_policy::accept4(listen_fd_, nullptr, nullptr,
+                                                SOCK_NONBLOCK | SOCK_CLOEXEC);
     const int victim_errno = errno;
     if (victim >= 0) {
         // Never served, so never FIN: an orderly close would tell the peer the
@@ -5157,8 +5202,9 @@ inline void multi_reactor_server::accept_loop(
             for (int k = 0; k < k_max_accept_per_round; ++k) {
                 struct sockaddr_storage ss{};
                 socklen_t slen = sizeof(ss);
-                int cfd = ::accept4(listen_fd_, (struct sockaddr*)&ss, &slen,
-                                    SOCK_NONBLOCK | SOCK_CLOEXEC);
+                int cfd = syscall_policy::accept4(
+                    listen_fd_, (struct sockaddr*)&ss, &slen,
+                    SOCK_NONBLOCK | SOCK_CLOEXEC);
                 if (cfd < 0) {
                     if (errno == EINTR) continue;
                     const int accept_errno = errno;
