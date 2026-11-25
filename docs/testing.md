@@ -64,11 +64,16 @@ lowered `RLIMIT_NOFILE` and no attempt to manufacture a real EPIPE window:
 - `sendmsg` EPIPE → counter moves, no EPOLLOUT spin, peer sees RST;
 - short `sendmsg` → the remaining bytes reach the peer and the frame count is
   still one; a five-byte write across three iovecs verifies the injection
-  helper walks the caller's segments and stays within its fixed capacity;
+  helper walks every caller segment rather than indexing a fixed array;
 - `shutdown` failure → a parked close ends in RST rather than an unearned FIN;
 - `epoll_ctl(MOD)` failure → `epoll_ctl_errors` moves and the connection aborts;
 - `accept4` EMFILE → the reserved descriptor takes the queued victim, EMFILE is
-  counted, and the accept loop still serves the next client.
+  counted, and the accept loop still serves the next client;
+- `accept4` EINTR → retried inside the same bounded round, and the admitted
+  connection is then served;
+- a non-EINTR `accept4` error → ends only that round; the thread survives and
+  the next readable listen event admits the queued connection. These two cases
+  pin the distinction that a bare `break` used to hide.
 - 512 queued sends while the reactor is blocked → at most one eventfd wake,
   with all frames drained afterward. This tests coalescing rather than timing.
 

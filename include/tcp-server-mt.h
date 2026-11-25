@@ -2163,7 +2163,16 @@ class multi_reactor_server {
     void        close_listen_socket() noexcept;
     void        accept_loop(std::promise<bool>& ready) noexcept;
     // accept_loop's parts. open/close own the four descriptors this thread
-    // holds; accept_cleanup guarantees the close runs on every exit.
+    // holds; accept_cleanup guarantees the close runs on every exit. The two
+    // outcome enums name jumps that used to be indistinguishable `break`s:
+    // one ends a wait, the other ends only the bounded accept round.
+    enum class accept_wait_outcome { events, interrupted, fatal };
+    enum class accept_batch_outcome { round_done, round_stopped };
+    accept_wait_outcome wait_for_accept_events(
+        struct epoll_event* events, int capacity, int& n) noexcept;
+    bool        drain_accept_events(const struct epoll_event* events,
+                                    int n) noexcept;
+    accept_batch_outcome accept_ready_connections() noexcept;
     bool        open_accept_descriptors() noexcept;
     void        close_accept_descriptors() noexcept;
     enum class accept_salvage { progress, backoff, stop };
@@ -5322,6 +5331,70 @@ inline void multi_reactor_server::admit_accept(
     }
 }
 
+inline multi_reactor_server::accept_wait_outcome
+multi_reactor_server::wait_for_accept_events(
+        struct epoll_event* events, int capacity, int& n) noexcept {
+    n = ::epoll_wait(epoll_fd_, events, capacity, accept_wait_ms());
+    if (n >= 0) return accept_wait_outcome::events;
+    if (errno == EINTR) {
+        // A signal must not skip the only watchdog sample. Without this, a
+        // steady signal stream starves it entirely.
+        check_reactor_stalls();
+        return accept_wait_outcome::interrupted;
+    }
+    stats_.accept_thread_failures.fetch_add(1, std::memory_order_relaxed);
+    return accept_wait_outcome::fatal;
+}
+
+inline bool multi_reactor_server::drain_accept_events(
+        const struct epoll_event* events, int n) noexcept {
+    bool listen_ready = false;
+    for (int i = 0; i < n; ++i) {
+        const int fd = events[i].data.fd;
+        if (fd == wake_fd_) {
+            uint64_t v = 0;
+            ssize_t r = ::read(wake_fd_, &v, sizeof(v)); (void)r;
+        } else if (fd == listen_fd_) {
+            listen_ready = true;
+        }
+    }
+    return listen_ready;
+}
+
+inline multi_reactor_server::accept_batch_outcome
+multi_reactor_server::accept_ready_connections() noexcept {
+    // Bounded, so a flood of new connections cannot starve the other fds.
+    constexpr int k_max_accept_per_round = 64;
+    for (int k = 0; k < k_max_accept_per_round; ++k) {
+        struct sockaddr_storage ss{};
+        socklen_t slen = sizeof(ss);
+        int cfd = syscall_policy::accept4(
+            listen_fd_, (struct sockaddr*)&ss, &slen,
+            SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (cfd >= 0) {
+            admit_accept(cfd, ss, slen);
+            continue;
+        }
+        if (errno == EINTR) continue;
+        const int accept_errno = errno;
+        // Out of descriptors is countable, and salvage either makes progress,
+        // asks for a short backoff, or ends this round. It never ends the
+        // thread: the next readable event gets another round.
+        if (accept_errno == EMFILE || accept_errno == ENFILE) {
+            const accept_salvage action =
+                salvage_descriptor_exhaustion(accept_errno);
+            if (action != accept_salvage::stop) {
+                if (action == accept_salvage::backoff)
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(1));
+                continue;
+            }
+        }
+        return accept_batch_outcome::round_stopped;
+    }
+    return accept_batch_outcome::round_done;
+}
+
 inline void multi_reactor_server::accept_loop(
         std::promise<bool>& ready) noexcept {
     // One owner for every descriptor this thread opens. Constructed first, so
@@ -5353,64 +5426,21 @@ inline void multi_reactor_server::accept_loop(
             fail_accept_for_test_.store(false, std::memory_order_relaxed);
             throw 1;
         }
-        int n = ::epoll_wait(epoll_fd_, events.data(),
-                             static_cast<int>(events.size()),
-                             accept_wait_ms());
-        if (n < 0) {
-            if (errno == EINTR) {
-                // A signal must not skip the only watchdog sample. Without
-                // this, a steady signal stream starves it entirely.
-                check_reactor_stalls();
-                continue;
-            }
-            stats_.accept_thread_failures.fetch_add(
-                1, std::memory_order_relaxed);
+        int n = 0;
+        const accept_wait_outcome waited = wait_for_accept_events(
+            events.data(), static_cast<int>(events.size()), n);
+        if (waited == accept_wait_outcome::interrupted) continue;
+        if (waited == accept_wait_outcome::fatal) {
             fail();
             break;
         }
         check_reactor_stalls();
-        for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
-            if (fd == wake_fd_) {
-                uint64_t v = 0;
-                ssize_t r = ::read(wake_fd_, &v, sizeof(v)); (void)r;
-                continue;
-            }
-            if (fd != listen_fd_) continue;
-
-            // bounded accept, so a flood of new connections cannot starve the
-            // other fds
-            constexpr int k_max_accept_per_round = 64;
-            for (int k = 0; k < k_max_accept_per_round; ++k) {
-                struct sockaddr_storage ss{};
-                socklen_t slen = sizeof(ss);
-                int cfd = syscall_policy::accept4(
-                    listen_fd_, (struct sockaddr*)&ss, &slen,
-                    SOCK_NONBLOCK | SOCK_CLOEXEC);
-                if (cfd < 0) {
-                    if (errno == EINTR) continue;
-                    const int accept_errno = errno;
-                    // Out of descriptors is not an error to swallow and it is
-                    // not one to spin on either: the listening socket stays
-                    // readable, so returning to epoll_wait immediately means
-                    // burning a core rejecting nothing. It is also the one
-                    // accept failure that can be predicted at startup and
-                    // therefore should be countable -- without a counter the
-                    // only symptom is "it stopped accepting and said nothing".
-                    if (accept_errno == EMFILE || accept_errno == ENFILE) {
-                        const accept_salvage action =
-                            salvage_descriptor_exhaustion(accept_errno);
-                        if (action != accept_salvage::stop) {
-                            if (action == accept_salvage::backoff)
-                                std::this_thread::sleep_for(
-                                    std::chrono::milliseconds(1));
-                            continue;
-                        }
-                    }
-                    break;
-                }
-                admit_accept(cfd, ss, slen);
-            }
+        const bool listen_ready = drain_accept_events(events.data(), n);
+        if (listen_ready &&
+            accept_ready_connections() == accept_batch_outcome::round_stopped) {
+            // Only this round ended. The loop stays alive so the next
+            // readable listen event gets another bounded batch.
+            continue;
         }
     }
     } catch (...) {

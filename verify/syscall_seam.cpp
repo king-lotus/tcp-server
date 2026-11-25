@@ -15,10 +15,8 @@
 #include "harness.h"
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,28 +49,25 @@ uint64_t counter(const std::atomic<uint64_t>& a) {
 }
 
 // A reactor parked in the message handler cannot drain its task queue, which
-// is what makes the wake count deterministic. The gate publishes the incoming
-// message's connection id under the mutex the handler waits on.
+// is what makes the wake count deterministic. Two atomics and a polling wait
+// are enough here, and keep the test out of the condition-variable internals
+// that TSan cannot model reliably on this toolchain.
 struct blocked_handler {
-    std::mutex m;
-    std::condition_variable cv;
-    bool entered = false;
-    bool release = false;
-    uint64_t conn_id = 0;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    std::atomic<uint64_t> conn_id{0};
 
     bool wait_for_entry(int timeout_ms) {
-        std::unique_lock<std::mutex> lk(m);
-        return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-                           [this] { return entered; });
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        while (!entered.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return true;
     }
 
-    void release_once() {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            release = true;
-        }
-        cv.notify_all();
-    }
+    void release_once() { release.store(true, std::memory_order_release); }
 };
 
 struct batch_result {
@@ -241,11 +236,10 @@ void case_wakeup_coalescing() {
     auto cfg = base_config();
     cfg.num_reactors = 1;
     harness::fixture f(cfg, [&](uint64_t id, const uint8_t*, size_t) {
-        std::unique_lock<std::mutex> lk(gate.m);
-        gate.conn_id = id;
-        gate.entered = true;
-        gate.cv.notify_all();
-        gate.cv.wait(lk, [&] { return gate.release; });
+        gate.conn_id.store(id, std::memory_order_release);
+        gate.entered.store(true, std::memory_order_release);
+        while (!gate.release.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     });
     harness::expect(f.started(), "server started");
 
@@ -261,7 +255,8 @@ void case_wakeup_coalescing() {
     }
 
     constexpr int kTasks = 512;
-    const batch_result batch = queue_batch(f, gate.conn_id, byte, kTasks);
+    const batch_result batch = queue_batch(
+        f, gate.conn_id.load(std::memory_order_acquire), byte, kTasks);
     gate.release_once();
 
     harness::expect(batch.accepted == kTasks, "every queued send was accepted");
@@ -318,6 +313,51 @@ void case_accept_emfile() {
     harness::expect(!!q.connect(f.port()), "a later connection is accepted");
 }
 
+void case_accept_eintr() {
+    std::printf("I. accept4 EINTR retries inside the same accept round\n");
+    seam_policy::reset();
+    harness::fixture f(base_config());
+    harness::expect(f.started(), "server started");
+
+    const uint64_t before = counter(seam_policy::accept4_calls);
+    seam_policy::accept4_errno.store(EINTR, std::memory_order_release);
+    harness::peer p;
+    harness::expect(!!p.connect(f.port()), "peer connected");
+    harness::expect(wait_for(2000, [&] {
+        return counter(seam_policy::accept4_calls) >= before + 2;
+    }), "the interrupted accept was retried");
+
+    harness::expect(!!p.send(frame_type::PING, nullptr, 0), "PING sent");
+    harness::frame out;
+    harness::expect(!!p.expect_frame(&out),
+                    "the retried accept admitted the connection");
+    harness::expect(out.type == frame_type::PONG,
+                    "the admitted connection was served");
+}
+
+void case_accept_non_eintr_error() {
+    std::printf("J. a non-EINTR accept error ends the round, not the thread\n");
+    seam_policy::reset();
+    harness::fixture f(base_config());
+    harness::expect(f.started(), "server started");
+
+    const uint64_t before = counter(seam_policy::accept4_calls);
+    seam_policy::accept4_errno.store(ECONNABORTED, std::memory_order_release);
+    harness::peer p;
+    harness::expect(!!p.connect(f.port()), "peer connected");
+    harness::expect(wait_for(2000, [&] {
+        return counter(seam_policy::accept4_calls) >= before + 2;
+    }), "the next round called accept4 again");
+    harness::expect(f.server().is_running(), "the accept thread survived");
+
+    harness::expect(!!p.send(frame_type::PING, nullptr, 0), "PING sent");
+    harness::frame out;
+    harness::expect(!!p.expect_frame(&out),
+                    "the next round admitted the queued connection");
+    harness::expect(out.type == frame_type::PONG,
+                    "the admitted connection was served");
+}
+
 void case_short_write_iovec_bounds() {
     std::printf("H. a short write can span more than two iovecs\n");
     seam_policy::reset();
@@ -367,6 +407,8 @@ int main() {
     case_shutdown_failure();
     case_epoll_ctl_mod_failure();
     case_accept_emfile();
+    case_accept_eintr();
+    case_accept_non_eintr_error();
     case_wakeup_coalescing();
     std::printf("== syscall seam end ==\n");
     return harness::finish();

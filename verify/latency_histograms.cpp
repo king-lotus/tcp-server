@@ -13,11 +13,9 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
-#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -138,27 +136,24 @@ void case_throwing_handler() {
 }
 
 // The only reactor is parked inside the handler, so tasks submitted from
-// the test thread stay in the queue until it is released.
+// the test thread stay in the queue until it is released. Atomics and a
+// polling wait avoid depending on TSan's condition-variable modelling.
 struct handler_gate {
-    std::mutex m;
-    std::condition_variable cv;
-    bool entered = false;
-    bool release = false;
-    uint64_t conn_id = 0;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    std::atomic<uint64_t> conn_id{0};
 
     bool wait_entry(int timeout_ms) {
-        std::unique_lock<std::mutex> lk(m);
-        return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-                           [this] { return entered; });
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        while (!entered.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return true;
     }
 
-    void open() {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            release = true;
-        }
-        cv.notify_all();
-    }
+    void open() { release.store(true, std::memory_order_release); }
 };
 
 void case_queue_wait_and_loop_lag() {
@@ -169,11 +164,10 @@ void case_queue_wait_and_loop_lag() {
     handler_gate gate;
     harness::fixture f(cfg, [&](uint64_t id, const uint8_t* p, size_t n) {
         if (n == 1 && p[0] == 'x') {
-            std::unique_lock<std::mutex> lk(gate.m);
-            gate.conn_id = id;
-            gate.entered = true;
-            gate.cv.notify_all();
-            gate.cv.wait(lk, [&] { return gate.release; });
+            gate.conn_id.store(id, std::memory_order_release);
+            gate.entered.store(true, std::memory_order_release);
+            while (!gate.release.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     });
     harness::expect(f.started(), "server started");
@@ -194,7 +188,8 @@ void case_queue_wait_and_loop_lag() {
     const uint8_t payload = 'y';
     int accepted = 0;
     for (int i = 0; i < kTasks; ++i) {
-        if (f.server().send_to(gate.conn_id, &payload, 1) ==
+        if (f.server().send_to(gate.conn_id.load(std::memory_order_acquire),
+                               &payload, 1) ==
             industrial::send_result::ok) {
             ++accepted;
         }
