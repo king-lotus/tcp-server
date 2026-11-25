@@ -185,9 +185,10 @@ on the FSM and `do_tick` performs the same drain-then-close one tick later; the
 close is delayed, not lost. A connection that is already `closing` needs no
 retry. Read-side backpressure is overridden by a close: `drain_input_then_close`
 and `park_close` resume reading, the drain round sets `draining_input` so the
-high-water pause cannot reapply before the first buffered frame is served, and
-the existing `close_input_bytes` budget and `close_linger_ms` bound how much
-input the close may consume. Replies the drain produces still meet the normal
+high-water pause cannot reapply before the first buffered frame is served. The
+existing `close_input_bytes` budget bounds the drain rounds; after the park,
+only the peer's FIN or `close_linger_ms` bounds further input. Replies the
+drain produces still meet the normal
 `send_to` ceiling: a frame over it is refused as `overloaded` (counted), not
 silently lost to a teardown.
 
@@ -198,8 +199,10 @@ from nothing else. Bytes the kernel still holds at that point are not in the
 budget: the drain's own round pulls at most one read budget (64 KiB / 256 frames)
 of them into service, and `draining_input` exempts that round from the output
 watermark. The connection's ordinary read continuation may serve more before the
-park lands, but it is not exempt: it stops at the high watermark. Neither is a
-promise.
+park lands. Once the park sets `closing`, the high watermark no longer applies:
+fresh input is still parsed and handed to the handler (its replies are refused)
+until the peer's FIN or `close_linger_ms` ends the connection. Neither the
+drain round nor the continuation is a promise.
 
 The widest case is the one `draining_input` exists for: a connection that was
 read-paused. The pause exists precisely to leave bytes in the kernel, so at close

@@ -331,11 +331,11 @@ A close answers what it promised and no more. What it serves is the input alread
 in the read buffer when the request is dequeued — the `close_input_bytes` budget
 — plus, at most, one read round (64 KiB / 256 frames) pulled out of the kernel
 receive buffer while that round runs. That round is exempt from the high-water
-pause; the connection's ordinary continuation after it is not, so output
-backpressure decides whether it gets to serve any more before the park. Requests
-still in the kernel buffer past that are parsed and handed to the message
-handler, but their replies are refused once the close parks, and the peer
-receives a FIN over them. Measured
+pause; the connection's ordinary continuation before the park is not, so output
+backpressure can still stop it early. Requests still in the kernel buffer past
+that are parsed and handed to the message handler once the close parks:
+`closing` lifts the high-water check, their replies are refused, and only the
+peer's FIN or `close_linger_ms` ends the connection. Measured
 (`verify/evidence/probe_close_while_paused.cpp`): 4000 requests sitting in the
 kernel of a read-paused connection, 256 answered, then FIN — while
 `frames_recv` accounted for all 4000. Both numbers are real; only the second is
@@ -448,7 +448,8 @@ after `stop()` when a stable snapshot matters.
 | `idle_timeouts` | No activity within `idle_timeout_ms`, where activity is bytes received or bytes drained to the peer. |
 | `frame_assembly_timeouts` | A partial frame did not complete within `frame_assembly_timeout_ms`, even though bytes were arriving. |
 | `epoll_ctl_errors` | An `epoll_ctl` registration failed. |
-| `reactor_failures` | A reactor thread crashed or exited abnormally. That reactor is quarantined: it accepts no new connections, its connections are reset (close reason `reactor failure`), and the server keeps serving while another reactor is alive. The increment that empties the pool — or any accept-thread failure — is fatal. |
+| `reactor_failures` | A reactor thread crashed or exited abnormally. That reactor is quarantined: it accepts no new connections, its connections are reset (close reason `reactor failure`), and the server keeps serving while another reactor is alive. The increment that empties the pool is fatal. |
+| `accept_thread_failures` | The accept thread failed at runtime (`epoll_wait` returned an error, or the accept loop threw). A descriptor-setup failure at start is reported by `start()` and is not counted here. Unlike a reactor failure this is always fatal: nothing else accepts connections, so the server stops. Kept apart from `reactor_failures` so that counter can be reconciled with `reactor_stats()` without a dead reactor that never existed. |
 | `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. One increment per episode, not per sample: the episode ends when the reactor has made progress for a full window again. Sampled at least every `min(500 ms, timeout/2)`; shorter transients can fall between samples, and a server that is no longer running is not sampled. The server is not stopped. |
 | `reactor_stall_skips` | A new connection that would have gone to a stalled reactor went to a live one instead. Counted once per connection, not once per reactor passed over. Zero while the watchdog is off, and zero when every reactor is stalled: the accept loop then takes the bad hand-off rather than refusing the connection. |
 | `handler_installs_refused` | `set_message_handler`, `set_conn_state_handler` or `set_close_handler` was called while the server was not fully stopped, or the install itself failed, and the handler was left unchanged. Handlers are read by every worker without synchronization, so installing one while they run is a data race rather than a reconfiguration. |

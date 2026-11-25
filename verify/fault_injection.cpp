@@ -246,13 +246,20 @@ int main() {
         multi_reactor_server server(cfg);
         harness::expect(server.start(), "start() ok");
         harness::expect(port_is_listening(port), "listening before the fault");
-        const uint64_t before = server.stats().reactor_failures.load();
+        const uint64_t before_reactor =
+            server.stats().reactor_failures.load();
+        const uint64_t before_accept =
+            server.stats().accept_thread_failures.load();
 
         industrial::test_access::fail_accept_once(server);
         harness::expect(wait_for(3000, [&] { return !server.is_running(); }),
                "the server stops reporting itself as running");
-        harness::expect(server.stats().reactor_failures.load() > before,
-               "reactor_failures counted it");
+        harness::expect(
+            server.stats().accept_thread_failures.load() > before_accept,
+            "accept_thread_failures counted it");
+        harness::expect(
+            server.stats().reactor_failures.load() == before_reactor,
+            "reactor_failures stayed put");
         harness::expect(wait_for(3000, [&] { return !port_is_listening(port); }),
                "the listening socket it owned was released");
         harness::expect(within(3000, "stop()", [&] { server.stop(); }),
@@ -277,7 +284,11 @@ int main() {
                 ++harness::failure_count();
                 break;
             }
-            const uint64_t before = server.stats().reactor_failures.load();
+            const bool accept_round = (round % 2) != 0;
+            const uint64_t before =
+                accept_round
+                    ? server.stats().accept_thread_failures.load()
+                    : server.stats().reactor_failures.load();
             if (round % 2 == 0) industrial::test_access::fail_worker_once(server);
             else                industrial::test_access::fail_accept_once(server);
             if (!wait_for(3000, [&] { return !server.is_running(); })) {
@@ -285,8 +296,14 @@ int main() {
                 ++harness::failure_count();
                 break;
             }
-            if (server.stats().reactor_failures.load() <= before) {
-                std::printf("  [FAIL] round %d: reactor_failures did not move\n", round);
+            const uint64_t after =
+                accept_round
+                    ? server.stats().accept_thread_failures.load()
+                    : server.stats().reactor_failures.load();
+            if (after <= before) {
+                std::printf("  [FAIL] round %d: %s did not move\n", round,
+                            accept_round ? "accept_thread_failures"
+                                         : "reactor_failures");
                 ++harness::failure_count();
                 break;
             }

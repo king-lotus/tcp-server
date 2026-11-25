@@ -81,7 +81,7 @@ g++ -std=c++17 -Wall -Wextra -pthread \
 | 用例 | 断言 |
 |------|------|
 | A | reactor 异常退出 → 只死一个（failpoint 用 exchange 消费）、`reactor_failures` 恰好加一、`is_running()` 仍为真、幸存 reactor 应答 PING、`reactor_stats()` 标出 dead 槽位；再注入一次 → 最后一个 reactor 失败才停服；`stop()` 与重启均正常 |
-| B | accept 线程异常退出 → `is_running()` 转假、`reactor_failures` 计数，且它把持的监听套接字被真正释放 |
+| B | accept 线程异常退出 → `is_running()` 转假、`accept_thread_failures` 计数（`reactor_failures` 不动），且它把持的监听套接字被真正释放 |
 | C | 12 轮「启动 → 注入故障 → stop → 再启动」→ 每次都留下一个还能重新起来的服务器 |
 | D | `close_linger_ms` / `backlog <= 0` 在 `start()` 被拒绝（否则 fd/准入泄漏或零长度 accept 队列） |
 | E | message handler 抛异常 → 被吞掉（与 R8-2 的 open state handler 同处理），连接继续分发 |

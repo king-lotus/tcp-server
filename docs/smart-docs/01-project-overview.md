@@ -59,7 +59,7 @@ predictable behaviour when a peer misbehaves:
 - **Backpressure**, not unbounded buffering: a connection that stops reading
   hits `max_pending_bytes` and further frames are refused with a result code.
 - **Optional offload pool** for work that must not block a reactor.
-- **Observability by default**: 20 atomic counters, each documented with the
+- **Observability by default**: atomic counters, each documented with the
   branch that moves it.
 - **Operational honesty**: `start()` refuses an impossible configuration, tries
   to raise `RLIMIT_NOFILE`, and warns when the machine cannot serve the

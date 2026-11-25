@@ -22,9 +22,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
-#include <vector>
 
 namespace industrial {
 
@@ -84,13 +84,18 @@ struct seam_policy {
             sendmsg_short_bytes.exchange(0, std::memory_order_acq_rel);
         if (short_n > 0) {
             struct msghdr partial = *msg;
-            // Sized from the caller, not a fixed two-element array: a short
-            // write can span any number of segments, and indexing past a
-            // fixed array would corrupt the test binary's stack.
-            std::vector<struct iovec> iov(msg->msg_iovlen);
+            // Fixed capacity: this seam runs on the reactor's hot path and
+            // must not allocate. The reactor passes at most two segments and
+            // the iovec-bounds case passes three; a short write is allowed to
+            // send fewer bytes than requested, so stopping at capacity is
+            // still a valid short write. The old vector made an allocation
+            // failure terminate the test binary from a noexcept function.
+            std::array<struct iovec, 8> iov{};
             size_t left = static_cast<size_t>(short_n);
             size_t n = 0;
-            for (; n < iov.size() && left > 0; ++n) {
+            const size_t segments =
+                std::min(static_cast<size_t>(msg->msg_iovlen), iov.size());
+            for (; n < segments && left > 0; ++n) {
                 iov[n].iov_base = msg->msg_iov[n].iov_base;
                 iov[n].iov_len = std::min(left, msg->msg_iov[n].iov_len);
                 left -= iov[n].iov_len;

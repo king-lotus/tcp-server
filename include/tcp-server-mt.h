@@ -579,9 +579,16 @@ struct server_stats {
     // A reactor thread crashed or exited abnormally. The reactor is
     // quarantined -- it takes no new connections and its connections are
     // reset -- and the server keeps serving while at least one other reactor
-    // is alive. The count that makes the pool empty (or an accept-thread
-    // failure) is fatal.
+    // is alive. The count that makes the pool empty is fatal.
     std::atomic<uint64_t> reactor_failures{0};
+    // The accept thread failed at runtime: epoll_wait returned an error or the
+    // accept loop threw. Unlike a reactor failure this is always fatal:
+    // nothing else accepts connections, so fail() stops the server. A
+    // descriptor-setup failure at start is reported by start() and is not
+    // counted here. Kept out of reactor_failures so an operator comparing that
+    // counter with reactor_stats() does not go looking for a dead reactor that
+    // never existed.
+    std::atomic<uint64_t> accept_thread_failures{0};
     // The accept thread's watchdog observed a live reactor whose last
     // completed loop iteration is older than reactor_stall_timeout_ms. One
     // increment per episode, not per sample: the stall is counted when it is
@@ -3287,11 +3294,12 @@ inline void sub_reactor::parse_frames(connection* c,
            c->rbuf.readable() >= FRAME_HEADER_SIZE) {
         // Read backpressure stops here, at a frame boundary with the header
         // still untouched, so the frame can be retried intact after resume. A
-        // graceful close overrides it: close_input_bytes and close_linger_ms
-        // are what bound input during a close. draining_input marks the
-        // narrow window where the close is serving that backlog; without it
-        // the pause reapplies before the first frame and the drain parks over
-        // exactly what it was asked to answer.
+        // graceful close overrides it: close_input_bytes bounds the drain
+        // rounds, and after the park only the peer's FIN or close_linger_ms
+        // bounds further input. draining_input marks the narrow window where
+        // the close is serving that backlog; without it the pause reapplies
+        // before the first frame and the drain parks over exactly what it was
+        // asked to answer.
         if (!c->fsm.closing.load(std::memory_order_acquire) &&
             !c->fsm.draining_input &&
             c->pending_bytes.load(std::memory_order_relaxed) >=
@@ -3492,6 +3500,12 @@ inline void sub_reactor::unregister_conn(connection* c,
                                          bool graceful) noexcept {
     state_guard guard(c);
     if (c->fd < 0) return;
+    // A detached descriptor must not stay on the read continuation list. The
+    // debug state axes treat that combination as fatal, and the only reason it
+    // has not fired is that today's callers happen to unschedule first. Do it
+    // here, where the descriptor is actually lost, so the guarantee belongs to
+    // this function rather than to its callers.
+    unschedule_read(c);
     // An abort asks for the reset explicitly instead of relying on whatever the
     // close() picks: SO_LINGER{1,0} drops the send buffer and sends RST. It is
     // set on abort only -- never on close normally, or every orderly close
@@ -3689,8 +3703,10 @@ inline void sub_reactor::park_close(connection* c,
 // resume reads, and `draining_input` exempts this one round from the output
 // watermark, so it pulls up to one read budget (64 KiB / 256 frames) of them
 // into service while `closing` is still false. The connection's ordinary read
-// continuation may serve more before the park lands, but that path is not
-// exempt: it stops at the high watermark. Neither is a promise. Measured
+// continuation may serve more before the park lands. Once the park sets
+// `closing`, the watermark no longer applies: further input is still parsed and
+// handed to the handler, with the peer's FIN or close_linger_ms as the only
+// bound. Neither the drain round nor the continuation is a promise. Measured
 // (verify/evidence/probe_close_while_paused.cpp): a
 // read-paused connection with 4000 requests sitting in the kernel answered 256
 // of them -- one round -- and then FIN. All 4000 were parsed and handed to the
@@ -4111,16 +4127,26 @@ inline void sub_reactor::loop() noexcept {
             if (measure_lag) {
                 wait_start = std::chrono::steady_clock::now();
             }
-            detail::latency_sample lag(
-                measure_lag ? &server_->stats_ref().loop_lag_us : nullptr,
-                wait_start, static_cast<uint64_t>(wait_ms) * 1000);
-            int n = ::epoll_wait(epoll_fd_, events.data(),
+            int n;
+            int epoll_errno = 0;
+            {
+                detail::latency_sample lag(
+                    measure_lag ? &server_->stats_ref().loop_lag_us : nullptr,
+                    wait_start, static_cast<uint64_t>(wait_ms) * 1000);
+                n = ::epoll_wait(epoll_fd_, events.data(),
                                  static_cast<int>(events.size()), wait_ms);
-            // Only a timer expiry is a loop-lag sample; event-driven and
-            // continuation iterations have no tick to be late against.
-            if (n != 0 || wait_ms <= 0) lag.dismiss();
+                // Capture errno before leaving the block. The sample is
+                // dismissed on an error, so its destructor does not read the
+                // clock today, but the EINTR test should not depend on that.
+                epoll_errno = errno;
+                // Only a timer expiry is a loop-lag sample; event-driven and
+                // continuation iterations have no tick to be late against.
+                // The sample must end here, not at the end of the iteration:
+                // event dispatch and do_tick() are not part of the wait.
+                if (n != 0 || wait_ms <= 0) lag.dismiss();
+            }
             if (n < 0) {
-                if (errno == EINTR) continue;
+                if (epoll_errno == EINTR) continue;
                 server_->on_reactor_failed(this);
                 break;
             }
@@ -5337,7 +5363,8 @@ inline void multi_reactor_server::accept_loop(
                 check_reactor_stalls();
                 continue;
             }
-            stats_.reactor_failures.fetch_add(1, std::memory_order_relaxed);
+            stats_.accept_thread_failures.fetch_add(
+                1, std::memory_order_relaxed);
             fail();
             break;
         }
@@ -5387,7 +5414,8 @@ inline void multi_reactor_server::accept_loop(
         }
     }
     } catch (...) {
-        stats_.reactor_failures.fetch_add(1, std::memory_order_relaxed);
+        stats_.accept_thread_failures.fetch_add(
+            1, std::memory_order_relaxed);
         fail();
         try {
             ready.set_value(false);

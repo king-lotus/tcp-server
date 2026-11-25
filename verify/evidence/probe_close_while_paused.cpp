@@ -237,10 +237,11 @@ int main() {
     // 3. Close, and let the reactor spend its close round while the peer is
     // still not reading. `draining_input` exempts that round from the output
     // watermark, so it serves one read budget (256 frames here) rather than
-    // stopping at the watermark. The ordinary continuation that follows is not
-    // exempt: with output still above the high mark it pauses before parsing
-    // the rest, and by the time the peer reads, the park has set `closing` and
-    // those replies are refused.
+    // stopping at the watermark. The ordinary continuation that follows may
+    // serve more before the park lands. Once the park sets `closing`, the high
+    // watermark no longer applies: the remaining input is parsed and handed to
+    // the handler (its replies are refused) until the peer's FIN or
+    // close_linger_ms.
     (void)server.close_connection(id);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     const uint64_t recv_after_park = server.stats().frames_recv.load();

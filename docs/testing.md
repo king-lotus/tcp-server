@@ -64,7 +64,7 @@ lowered `RLIMIT_NOFILE` and no attempt to manufacture a real EPIPE window:
 - `sendmsg` EPIPE → counter moves, no EPOLLOUT spin, peer sees RST;
 - short `sendmsg` → the remaining bytes reach the peer and the frame count is
   still one; a five-byte write across three iovecs verifies the injection
-  helper itself spans every segment instead of indexing a fixed array;
+  helper walks the caller's segments and stays within its fixed capacity;
 - `shutdown` failure → a parked close ends in RST rather than an unearned FIN;
 - `epoll_ctl(MOD)` failure → `epoll_ctl_errors` moves and the connection aborts;
 - `accept4` EMFILE → the reserved descriptor takes the queued victim, EMFILE is
