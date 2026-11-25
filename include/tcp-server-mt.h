@@ -1204,6 +1204,88 @@ struct closed_conn {
     std::string           reason;
 };
 
+// ==================== Tick sweep classification ====================
+// Which bucket of do_tick's walk a connection belongs in. The five buckets used
+// to exist only as five push_back + continue pairs inside the walk, which made
+// their priority the statement order -- readable once and testable only through
+// a live reactor and a clock. Naming the outcome puts that order in one place
+// that verify/idle_semantics.cpp case F can call with a connection it built
+// itself and no sockets at all.
+namespace detail {
+
+enum class sweep_action {
+    none,       // nothing due this tick
+    wanted,     // close_connection() could not queue its task
+    expired,    // closing, past close_linger_ms -> forced
+    resumable,  // read-paused, backlog below the low mark
+    idle,       // no inbound bytes and no drain progress -> graceful
+    stalled,    // bytes arriving, frame never completing -> forced
+};
+
+// One tick's worth of inputs, so the classifier never reads the clock or the
+// live config: those are read once, at the top of do_tick, and shared by the
+// whole walk -- two connections cannot disagree about which tick it is.
+struct sweep_ctx {
+    int64_t now           = 0;  // ms, one clock read per tick
+    int64_t cutoff        = 0;  // now - idle_timeout_ms
+    int64_t linger        = 0;  // close_linger_ms
+    int64_t frame_timeout = 0;  // resolved_frame_assembly_timeout_ms
+    size_t  low_watermark = 0;  // read low mark, bytes
+};
+
+// `close_claimed` is the close_connection() flag already consumed by the
+// caller: claiming it is a mutation that its owner must perform, so everything
+// below is a function of the connection's own state.
+//
+// Priority is the order of the returns. A requested close outranks a closing
+// one; a close outranks read resumption; resumption outranks the idle clock (a
+// paused connection is not receiving by design, and it is resumed this tick
+// anyway); and the idle clock outranks the frame deadline (a quiet peer is
+// idle, a peer still sending is stalled).
+inline sweep_action classify_sweep(const connection& c,
+                                   const sweep_ctx& ctx,
+                                   bool close_claimed) noexcept {
+    if (close_claimed) return sweep_action::wanted;
+    const close_fsm& fsm = c.fsm;
+    if (fsm.closing.load(std::memory_order_acquire)) {
+        // One deadline for every stage a close can stall in, measured from the
+        // park that set `closing` (close_fsm::on_graceful): the peer has
+        // nothing left to send, so last_recv_ms is useless here.
+        //
+        // fd >= 0 is a debug-asserted invariant rather than a condition
+        // (state_violation: "closing survives the descriptor"), so a detached
+        // descriptor is not a stage this has to bound.
+        if (ctx.linger > 0 && c.fd >= 0 && fsm.close_started_at_ms != 0 &&
+            ctx.now - fsm.close_started_at_ms >= ctx.linger)
+            return sweep_action::expired;
+        return sweep_action::none;
+    }
+    // The drain path resumes a paused connection the moment the backlog falls;
+    // this is the fallback for releases that happen on a caller thread
+    // (send_to's rollback), which cannot touch this reactor's registration.
+    if (c.read_paused &&
+        c.pending_bytes.load(std::memory_order_relaxed) <= ctx.low_watermark)
+        return sweep_action::resumable;
+    // Drain progress counts as activity: while paused no inbound byte is
+    // stamped, and a peer that is reading steadily is not idle because it is
+    // slow. Graceful, not forced: an idle peer may still hold a half-finished
+    // exchange, so its close parks until what we owe it is out.
+    const int64_t last_activity =
+        std::max(c.last_recv_ms, c.last_drain_progress_ms);
+    if (last_activity < ctx.cutoff) return sweep_action::idle;
+    // Bytes keep arriving but the frame never completes. This is the case
+    // idle_timeout_ms deliberately does not catch; forced rather than parked,
+    // so the slot is released now. A paused connection is exempt: it is not
+    // reading, so an incomplete frame is our backpressure, not the peer
+    // dribbling, and resume_read() restarts the deadline.
+    if (!c.read_paused && c.frame_started_at_ms != 0 && ctx.frame_timeout > 0 &&
+        ctx.now - c.frame_started_at_ms >= ctx.frame_timeout)
+        return sweep_action::stalled;
+    return sweep_action::none;
+}
+
+}  // namespace detail
+
 // ==================== sub_reactor ====================
 class sub_reactor {
     friend class multi_reactor_server;
@@ -3946,11 +4028,12 @@ inline void sub_reactor::unschedule_read(connection* c) noexcept {
 }
 
 inline void sub_reactor::do_tick() noexcept {
-    const int64_t now   = now_ms();
-    const int64_t cutoff = now - server_->idle_timeout_ms();
-    const int64_t linger = server_->close_linger_ms();
-    const int64_t frame_timeout =
-        server_->cfg_.resolved_frame_assembly_timeout_ms();
+    detail::sweep_ctx ctx{};
+    ctx.now           = now_ms();
+    ctx.cutoff        = ctx.now - server_->idle_timeout_ms();
+    ctx.linger        = server_->close_linger_ms();
+    ctx.frame_timeout = server_->cfg_.resolved_frame_assembly_timeout_ms();
+    ctx.low_watermark = server_->cfg_.resolved_read_low_watermark_bytes();
     // Every due close is collected during the walk and performed after it,
     // because close_conn is not always content to park the connection. Three
     // ways in reach from a single call all erase from conns_ -- the map this
@@ -3975,67 +4058,42 @@ inline void sub_reactor::do_tick() noexcept {
     std::vector<connection_ptr> idle;      // graceful: may still owe bytes
     std::vector<connection_ptr> expired;   // past its deadline: forced
     std::vector<connection_ptr> stalled;   // frame never completed
+    // The priority between the five buckets, and the condition behind each,
+    // live in detail::classify_sweep. What is left here is the one thing that
+    // function must not do -- mutating the close request it reports on -- and
+    // the counting, which belongs to the stats the sweep owns rather than to
+    // the state being classified.
     for (auto& kv : conns_) {
         connection* c = kv.second.get();
-        // close_connection() could not queue its task. The request still
-        // stands, so perform the same drain-then-close here. Checked before
-        // the deadline sweeps: a requested close must not be reclassified as
-        // an idle timeout, and the connection may already be closing (then the
-        // flag is just a stale retry and the deadline logic below owns it).
-        if (c->fsm.close_wanted.load(std::memory_order_acquire) &&
+        // Claimed before the `closing` test, as the ladder did: a request that
+        // lands on an already-closing connection is a stale retry, and the
+        // close's own deadline owns it.
+        const bool claimed =
+            c->fsm.close_wanted.load(std::memory_order_acquire) &&
             c->fsm.close_wanted.exchange(false, std::memory_order_acq_rel) &&
-            !c->fsm.closing.load(std::memory_order_acquire)) {
+            !c->fsm.closing.load(std::memory_order_acquire);
+        switch (detail::classify_sweep(*c, ctx, claimed)) {
+          case detail::sweep_action::wanted:
             wanted.push_back(kv.second);
-            continue;
-        }
-        if (c->fsm.closing.load(std::memory_order_acquire)) {
-            // A closing connection has a deadline regardless of which stage it
-            // reached, and it is the same value for both: how long the close
-            // may take. last_recv_ms is useless here (the peer has nothing left
-            // to send), so measure from the close itself; park_close stamps
-            // close_started_at_ms before any of the stages that can stall.
-            if (linger > 0 && c->fd >= 0 && c->fsm.close_started_at_ms != 0 &&
-                now - c->fsm.close_started_at_ms >= linger)
-                expired.push_back(kv.second);
-            continue;
-        }
-        // A paused connection resumes here when the backlog has fallen to the
-        // low mark. The drain path resumes immediately; this covers releases
-        // that happen on a caller thread (send_to's rollback), which cannot
-        // touch this reactor's epoll registration.
-        if (c->read_paused) {
-            if (c->pending_bytes.load(std::memory_order_relaxed) <=
-                server_->cfg_.resolved_read_low_watermark_bytes()) {
-                resumable.push_back(kv.second);
-                continue;
-            }
-            // Still backpressured. The idle check below still applies, but it
-            // must count drain progress as activity: while paused, no inbound
-            // bytes are stamped, and a peer that is reading steadily is not
-            // idle just because it is slow.
-        }
-        const int64_t last_activity =
-            std::max(c->last_recv_ms, c->last_drain_progress_ms);
-        if (last_activity < cutoff) {
+            break;
+          case detail::sweep_action::resumable:
+            resumable.push_back(kv.second);
+            break;
+          case detail::sweep_action::idle:
             server_->stats_ref().idle_timeouts.fetch_add(
                 1, std::memory_order_relaxed);
-            // Default (graceful): an idle connection is still a legitimate peer
-            // and may hold a half-finished exchange, so let the close park
-            // until what we owe it is out.
             idle.push_back(kv.second);
-            continue;
-        }
-        // Bytes keep arriving but the frame never completes. This is the case
-        // idle_timeout_ms deliberately does not catch; abort rather than park
-        // so the slot is released now. A paused connection is exempt: it is
-        // not reading, so a frame left incomplete is our backpressure, not the
-        // peer dribbling. resume_read() restarts the deadline.
-        if (!c->read_paused && c->frame_started_at_ms != 0 &&
-            frame_timeout > 0 &&
-            now - c->frame_started_at_ms >= frame_timeout) {
+            break;
+          case detail::sweep_action::expired:
+            expired.push_back(kv.second);
+            break;
+          case detail::sweep_action::stalled:
             server_->stats_ref().frame_assembly_timeouts.fetch_add(
                 1, std::memory_order_relaxed);
             stalled.push_back(kv.second);
+            break;
+          case detail::sweep_action::none:
+            break;
         }
     }
     for (auto& c : wanted)    drain_input_then_close(c.get());

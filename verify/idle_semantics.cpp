@@ -324,6 +324,91 @@ void case_stuck_frame() {
     peer.close();
 }
 
+// F. The sweep ladder as a table.
+//
+// do_tick sorts every connection into one of five buckets, and the interesting
+// part is not any single condition but which one wins when two are true at
+// once: a connection that is closing *and* silent, or paused *and* silent, or
+// paused *and* holding an unfinished frame. As a ladder of push_back +
+// continue inside the walk, that could only be probed by steering a live
+// reactor into the overlap and watching which counter moved.
+// detail::classify_sweep answers from the connection's own state, so each
+// overlap below is one call and the whole table runs without a socket.
+void case_sweep_priority() {
+    std::printf("F. sweep priority: which bucket wins when conditions "
+                "overlap\n");
+    industrial::ring_buffer wbuf, rbuf;
+    industrial::connection c;
+    c.fsm.attach(&wbuf, &rbuf, &c.pending_bytes);
+    c.fd = 7;
+
+    industrial::detail::sweep_ctx ctx{};
+    ctx.now           = 100000;
+    ctx.cutoff        = 99000;   // idle after 1s without activity
+    ctx.linger        = 500;
+    ctx.frame_timeout = 1000;
+    ctx.low_watermark = 100;
+
+    using industrial::detail::classify_sweep;
+    using industrial::detail::sweep_action;
+
+    // Baseline: recent input, nothing else true.
+    c.last_recv_ms = ctx.now;
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::none,
+                    "F1 active connection is left alone");
+
+    // A claimed close request outranks every deadline at once. It is also the
+    // only bucket that still does work (drain, then close) rather than being
+    // an end of its own.
+    c.fsm.closing.store(true);
+    c.fsm.close_started_at_ms = ctx.now - 10000;   // past linger
+    c.last_recv_ms = 0;                            // and long silent
+    harness::expect(classify_sweep(c, ctx, true) == sweep_action::wanted,
+                    "F2 claimed close outranks linger and idle");
+
+    // Closing outranks idle: an idle peer is parked, a closing one is already
+    // on a deadline, and reading it as idle would restart a close.
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::expired,
+                    "F3 closing past linger expires, never goes idle");
+    c.fsm.close_started_at_ms = ctx.now;   // inside the linger window
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::none,
+                    "F4 closing inside linger is idle-proof");
+    c.fsm.close_started_at_ms = 0;         // unreachable: on_graceful stamps
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::none,
+                    "F5 closing without a park stamp invents no deadline");
+    c.fsm.closing.store(false);
+
+    // Resumption outranks the idle clock: a paused connection is not receiving
+    // by design, so silence says nothing about it.
+    c.read_paused = true;
+    c.last_recv_ms = 0;
+    c.pending_bytes.store(10);   // below the low mark
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::resumable,
+                    "F6 paused below the low mark resumes, not idle");
+    c.pending_bytes.store(500);  // still backpressured
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::idle,
+                    "F7 paused but backpressured is idle when silent");
+
+    // Drain progress is activity: a paused peer that keeps reading is not idle
+    // merely because it is slow.
+    c.last_drain_progress_ms = ctx.now;
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::none,
+                    "F8 drain progress keeps a silent peer alive");
+    c.last_drain_progress_ms = 0;
+    c.read_paused = false;
+
+    // The frame deadline applies only to a connection that is reading.
+    c.last_recv_ms = ctx.now;
+    c.frame_started_at_ms = ctx.now - 2000;   // past frame_timeout
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::stalled,
+                    "F9 an incomplete frame past its deadline stalls");
+    c.read_paused = true;
+    c.pending_bytes.store(500);
+    c.last_drain_progress_ms = ctx.now;
+    harness::expect(classify_sweep(c, ctx, false) == sweep_action::none,
+                    "F10 a paused connection is exempt from that deadline");
+}
+
 }  // namespace
 
 int main() {
@@ -336,6 +421,7 @@ int main() {
     case_full_frames();
     case_half_frame_then_silent();
     case_stuck_frame();
+    case_sweep_priority();
     std::printf("\n");
     return harness::finish();
 }
