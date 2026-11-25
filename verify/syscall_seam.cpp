@@ -302,8 +302,14 @@ void case_accept_emfile() {
     harness::expect(wait_for(2000, [&] {
         return counter(seam_policy::accept4_calls) >= 2;
     }), "both accept4 calls went through the seam");
-    harness::expect(counter(f.stats().fd_exhausted_drops) > before_drops,
-                    "the queued victim was reset once, not left in the backlog");
+    // Wait for the effect, not the call. accept4_calls is bumped on entry to
+    // the salvage's accept4, but fd_exhausted_drops only after that call
+    // returns and the victim is closed. Under TSan those two points are far
+    // enough apart that a bare read here can see 0 and report a failure the
+    // server did not make.
+    harness::expect(wait_for(2000, [&] {
+        return counter(f.stats().fd_exhausted_drops) > before_drops;
+    }), "the queued victim was reset once, not left in the backlog");
     harness::expect(f.server().is_running(), "the server survived EMFILE");
 
     // One-shot: the next peer must get in normally, proving salvage restored
