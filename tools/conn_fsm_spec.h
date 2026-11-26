@@ -15,8 +15,8 @@
 #pragma once
 // The spec needs only the header's vocabulary (enums, conn_facts, close_step), so
 // by default it asks for just that: the generator must build before the
-// generated region of the header exists. A different header can be named (the
-// pre-migration snapshot, to re-run the Step 1 proof) with -DCONN_FSM_HEADER.
+// generated region of the header exists. A different header can be named with
+// -DCONN_FSM_HEADER.
 #ifndef CONN_FSM_HEADER
 #define INDUSTRIAL_CONN_FSM_VOCABULARY_ONLY
 #define CONN_FSM_HEADER "../include/tcp-server-mt.h"

@@ -135,7 +135,7 @@ shrinking; that one is open.
 
 ```
 include/tcp-server-mt.h   the only deliverable
-tools/                    state-machine rules, generator, migration history
+tools/                    state-machine rules and generator
 verify/                   runtime suites, the peer harness, one-off probes
 docs/api-reference.md     the public surface: config, lifecycle, send/close, stats
 docs/testing.md           how a suite is written, and how the harness is tested
