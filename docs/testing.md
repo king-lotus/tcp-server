@@ -28,14 +28,27 @@ never reaches EMFILE prints `[SKIP]` instead of a pass.
 
 `verify/tcp_server_fsm_test.cpp` is the exception to the socket-based pattern.
 It includes two headers under different paths and namespaces: the working-tree
-`tcp-server-mt.h` (the `conn_machine`) and the checked-in
+`tcp-server-mt.h` (the closed-enum `conn_machine`) and the checked-in
 `verify/tcp-server-mt.prev.h`, a copy at the branch point where `close_fsm`
-still existed. That gives it an exhaustive closure check over every state the
-new machine admits, a decision-by-decision differential against the old one,
-and 40x20000 random walks. One difference is intentional and pinned as test D:
-the drained input budget is clamped at zero, so a second close request cannot
-re-measure it from the receive buffer. `--table` prints the transition table;
-[`docs/conn-fsm.md`](conn-fsm.md) is that output, not a hand-written summary.
+still existed. It re-derives the 77 states from the five rules, checks every
+generated cell against the shipped `transition()`, applies each cell through
+`conn_sm::step()` with real payloads, diffs the whole machine against the
+five-axis oracle in `tools/conn_fsm_spec.h`, and compares the close decisions
+with the old implementation over every state plus 40x20000 random walks. One
+difference is intentional and pinned as test 7: the drained input budget is
+clamped at zero, so a second close request cannot re-measure it from the
+receive buffer.
+
+The machine is generated. `tools/conn_fsm_spec.h` holds the rules;
+`tools/gen_conn_fsm.cpp` derives the table and rewrites the header's generated
+region, `verify/conn_fsm_cases.inc` and [`docs/conn-fsm.md`](conn-fsm.md) from
+the same run. `--check` exits non-zero when any of the three is stale:
+
+```bash
+g++ -std=c++17 -O1 tools/gen_conn_fsm.cpp -o gen
+./gen --header include/tcp-server-mt.h \
+      --cases verify/conn_fsm_cases.inc --doc docs/conn-fsm.md
+```
 
 ## Writing a suite
 
