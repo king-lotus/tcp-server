@@ -81,7 +81,7 @@ ctest --test-dir build --output-on-failure     # the same fourteen runs
 sanitizer set; the tsan configuration wraps every test in `setarch -R` for the
 same reason `run.sh` does. `-DTCP_BUILD_BENCH=ON` adds the four benchmarks.
 
-`verify/bench.sh` is the third kind of check, and it is deliberately not in CI:
+`verify/bench/run.sh` is the third kind of check, and it is deliberately not in CI:
 it measures resident memory per idle connection, ingest rate at one, two and
 four reactors, and the echo round trip at p50 and p99. A shared runner hands its
 cores to other tenants, so a threshold there would fail on someone else's load
@@ -124,7 +124,7 @@ attempts -- frame budget, read size, a `spans_view` struct more expensive than t
 memcpy it replaced, and a header fast path worth 0.6%. One profile named
 `clock_gettime` immediately.
 
-At 4KB batches the server now reaches what `verify/bench_floor.cpp` -- the same
+At 4KB batches the server now reaches what `verify/bench/floor.cpp` -- the same
 socket shape with nothing in between -- manages with the same client, so the read
 path is no longer where the remaining difference lives. At 2.8 GB/s it uses 0.83
 of 8 cores: it is waiting, not computing. What is left is in the kernel and in
@@ -136,7 +136,7 @@ shrinking; that one is open.
 ```
 include/tcp-server-mt.h   the only deliverable
 tools/                    state-machine rules and generator
-verify/                   runtime suites, the peer harness, one-off probes
+verify/                   run.sh + suites/, support/, bench/, evidence/
 docs/api-reference.md     the public surface: config, lifecycle, send/close, stats
 docs/testing.md           how a suite is written, and how the harness is tested
 docs/review/              ten rounds of review, with an index
@@ -173,7 +173,7 @@ were only never executed locally. Two of the three have since been closed:
   belongs to one worker is averaged away and reads as a pass. What was really
   unasserted was narrower and worse -- nothing observed `pick_reactor()`'s
   round-robin, so returning the first reactor every time left all 21
-  configurations green. `verify/reactor_spread.cpp` asks it directly: eight
+  configurations green. `verify/suites/reactor_spread.cpp` asks it directly: eight
   connections over four reactors have to be handled by four distinct threads. It
   runs at four reactors and again at two, so the assertion is shown to follow the
   configuration rather than a constant, and both existing two-reactor suites were

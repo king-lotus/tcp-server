@@ -626,7 +626,7 @@ bool accepted = server.offload(id, [id, &server] {
 ### 10.5 客户端侧
 
 服务端只负责帧的收发，客户端可以按第 3 节的协议自己实现。下面是最小发送/接收
-参考；测试里的完整实现见 `verify/harness.h` 的 `harness::peer`。
+参考；测试里的完整实现见 `verify/support/harness.h` 的 `harness::peer`。
 
 ```cpp
 #include "tcp-server-mt.h"

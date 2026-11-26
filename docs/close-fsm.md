@@ -252,7 +252,7 @@ No step changes wire behaviour; `close_semantics`, `idle_semantics`, `ping_pong`
 **Surviving (integration, unchanged):** `close_semantics` (FIN-vs-RST, mid-close
 reads, counter closure), `idle_semantics`, `ping_pong`, `backpressure`, `fault_injection`.
 
-**New (unit, no socket):** `run_close_fsm_unit_cases()` in `verify/close_semantics.cpp`
+**New (unit, no socket):** `run_close_fsm_unit_cases()` in `verify/suites/close_semantics.cpp`
 drives `close_fsm` directly with a fake `wbuf`/`rbuf`/`pending_bytes` view and
 asserts the returned action:
 

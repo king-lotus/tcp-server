@@ -184,7 +184,7 @@ serves the frames already in `rbuf` when the close runs; frames still in the
 kernel's receive buffer are not part of the promise, and how many PONGs are owed
 from the backlog varies with its size, the drain rate and `close_input_bytes`.
 A test that asserts "every request sent before the close was answered" is
-asserting more than the design offers; case B2 in `verify/watermark.cpp` can
+asserting more than the design offers; case B2 in `verify/suites/watermark.cpp` can
 assert the whole backlog only because its pending ceiling lets the drain round
 serve it.
 

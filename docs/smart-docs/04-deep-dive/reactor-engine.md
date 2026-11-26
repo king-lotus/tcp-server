@@ -48,8 +48,8 @@ flowchart TB
   `handle_read` / `parse_frames` (ingest), `handle_write` /
   `drain_wbuf_to_socket` (egress), `do_tick` (timers), `close_conn` /
   `park_close` / `teardown_closed` (lifetime), `process_pending` (task queue).
-- **`verify/close_semantics.cpp`** — the suite that pins the close machinery.
-- **`verify/backpressure.cpp`** — queue fan-out and the refusal paths.
+- **`verify/suites/close_semantics.cpp`** — the suite that pins the close machinery.
+- **`verify/suites/backpressure.cpp`** — queue fan-out and the refusal paths.
 
 ## Implementation details
 
@@ -168,10 +168,10 @@ suppress the other notification.
 
 ## Testing
 
-`verify/close_semantics.cpp` is the suite for this component: it drives FIN and
+`verify/suites/close_semantics.cpp` is the suite for this component: it drives FIN and
 RST sequences, close under write backpressure, half-close, counter accuracy and
-`stop_gracefully`. `verify/backpressure.cpp` forces queue-full and credit-limit
-refusals. `verify/reactor_spread.cpp` asserts that connections land on distinct
+`stop_gracefully`. `verify/suites/backpressure.cpp` forces queue-full and credit-limit
+refusals. `verify/suites/reactor_spread.cpp` asserts that connections land on distinct
 reactors. See [`verification.md`](verification.md).
 
 ## Known gaps

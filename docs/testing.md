@@ -17,7 +17,7 @@ a suite that only passes under a sanitizer is a different claim from one that
 passes without. A hang is bounded by `timeout 180`; a failure is a non-zero exit,
 which is the only thing the runner reads.
 
-The suites live in `verify/`. Most probes under `verify/evidence/` are not part
+The suites live in `verify/suites/`. Most probes under `verify/evidence/` are not part
 of this: each settles one claim against a history that has since changed. The
 EMFILE probe is the exception — `verify/evidence/run_emfile.sh` builds and runs
 it with assertions, CI calls that script in its own step, and
@@ -26,10 +26,10 @@ outside the three-configuration matrix: the claim is about accept-queue
 behaviour under a low descriptor ceiling, not about sanitizers. A host that
 never reaches EMFILE prints `[SKIP]` instead of a pass.
 
-`verify/tcp_server_fsm_test.cpp` is the exception to the socket-based pattern.
+`verify/suites/tcp_server_fsm_test.cpp` is the exception to the socket-based pattern.
 It includes two headers under different paths and namespaces: the working-tree
 `tcp-server-mt.h` (the closed-enum `conn_machine`) and the checked-in
-`verify/tcp-server-mt.prev.h`, a copy at the branch point where `close_fsm`
+`verify/support/tcp-server-mt.prev.h`, a copy at the branch point where `close_fsm`
 still existed. It re-derives the 77 states from the five rules, checks every
 generated cell against the shipped `transition()`, applies each cell through
 `conn_sm::step()` with real payloads, diffs the whole machine against the
@@ -41,18 +41,18 @@ receive buffer.
 
 The machine is generated. `tools/conn_fsm_spec.h` holds the rules;
 `tools/gen_conn_fsm.cpp` derives the table and rewrites the header's generated
-region, `verify/conn_fsm_cases.inc` and [`docs/conn-fsm.md`](conn-fsm.md) from
+region, `verify/suites/conn_fsm_cases.inc` and [`docs/conn-fsm.md`](conn-fsm.md) from
 the same run. `--check` exits non-zero when any of the three is stale:
 
 ```bash
 g++ -std=c++17 -O1 tools/gen_conn_fsm.cpp -o gen
 ./gen --header include/tcp-server-mt.h \
-      --cases verify/conn_fsm_cases.inc --doc docs/conn-fsm.md
+      --cases verify/suites/conn_fsm_cases.inc --doc docs/conn-fsm.md
 ```
 
 ## Writing a suite
 
-`verify/harness.h` is one header with four things in it:
+`verify/support/harness.h` is one header with four things in it:
 
 | | |
 |---|---|

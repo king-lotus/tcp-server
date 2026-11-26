@@ -42,9 +42,10 @@ flowchart LR
 | File | Role |
 |---|---|
 | `verify/run.sh` | The gate: builds each configuration, runs every case with a 180 s timeout, runs cpplint |
-| `verify/harness.h` | Peer side shared by all suites: connect, send, split writes, expect a frame, FIN/RST, raw sockets |
-| `verify/*.cpp` | Nine suites and four benchmarks |
-| `verify/evidence/` | Fifteen one-off probes, written to settle a single claim; not part of CI |
+| `verify/support/harness.h` | Peer side shared by all suites: connect, send, split writes, expect a frame, FIN/RST, raw sockets |
+| `verify/suites/*.cpp` | Twelve suites |
+| `verify/bench/*.cpp` | Four benchmarks |
+| `verify/evidence/` | Twenty one-off probes, written to settle a single claim; not part of CI |
 | `CMakeLists.txt` | INTERFACE target plus 11 `ctest` entries mirroring the suite |
 | `.github/workflows/c-cpp.yml` | Runs the same three configurations on every push and PR |
 
@@ -122,7 +123,7 @@ Four programs, deliberately outside CI: `bench_rss` (resident memory per idle
 connection), `bench_rx` (ingest rate at one, two and four reactors),
 `bench_send` (echo round trip at p50 and p99) and `bench_floor` (the same
 socket shape with no server in between, as a ceiling). They are driven by
-`verify/bench.sh` and `verify/bench_matrix.sh`.
+`verify/bench/run.sh` and `verify/bench/matrix.sh`.
 
 No thresholds are asserted. A shared runner hands its cores to other tenants, so
 a number recorded there would fail on someone else's load rather than on a
