@@ -12,8 +12,9 @@ bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加�
 - **运行时行为**：关闭语义、背压、空闲判定、故障注入、`send_to` 的每一种回答
 - race 与内存错误：ASan + UBSan、TSan 各跑一整套
 - 头文件被多个翻译单元包含时的 ODR/重复定义问题
+- syscall seam 的六条失败路径：用编译期 policy 一次性注入 `recv` / `sendmsg` / `shutdown` / `epoll_ctl` / `accept4` 的 errno，断言原有计数与 FIN/RST 行为，不再依赖 fork 或降 rlimit
 
-`tcp_server_fsm_test.cpp` is the one suite that opens no sockets. It compiles
+The FSM suite is the one that opens no sockets. It compiles
 the working-tree `conn_machine` and the checked-in `tcp-server-mt.prev.h`
 (the `close_fsm` at the branch point) into different namespaces, then checks
 every admitted state, compares every close decision against the old machine,
@@ -84,7 +85,7 @@ g++ -std=c++17 -Wall -Wextra -pthread \
 | 用例 | 断言 |
 |------|------|
 | A | reactor 异常退出 → 只死一个（failpoint 用 exchange 消费）、`reactor_failures` 恰好加一、`is_running()` 仍为真、幸存 reactor 应答 PING、`reactor_stats()` 标出 dead 槽位；再注入一次 → 最后一个 reactor 失败才停服；`stop()` 与重启均正常 |
-| B | accept 线程异常退出 → `is_running()` 转假、`reactor_failures` 计数，且它把持的监听套接字被真正释放 |
+| B | accept 线程异常退出 → `is_running()` 转假、`accept_thread_failures` 计数（`reactor_failures` 不动），且它把持的监听套接字被真正释放 |
 | C | 12 轮「启动 → 注入故障 → stop → 再启动」→ 每次都留下一个还能重新起来的服务器 |
 | D | `close_linger_ms` / `backlog <= 0` 在 `start()` 被拒绝（否则 fd/准入泄漏或零长度 accept 队列） |
 | E | message handler 抛异常 → 被吞掉（与 R8-2 的 open state handler 同处理），连接继续分发 |
@@ -92,7 +93,7 @@ g++ -std=c++17 -Wall -Wextra -pthread \
 | G | accept setup 在 spare fd 打开后失败 → 全部描述符（含 spare）释放；重试与析构均无泄漏 |
 | H | handler pool 启动失败（listen、reactor、accept 线程均已存在）→ 完整回滚、端口释放、重试成功 |
 | I | 第二个 reactor 启动失败 → 已启动的子集被停止、无 fd 泄漏、重试成功 |
-| J | 每 reactor 统计之和等于生命周期聚合值；重启后仍累计；resolved reactor 数收缩后多余槽位标记 `retired`、流量仍计入总和；失败启动保留已分配槽位；stop 后连接数归零；handler 卡住 → `reactor_stalls` 计数但不停服；timeout < `max(100, 2×tick_ms)` 被拒绝 |
+| J | 每 reactor 统计之和等于生命周期聚合值；重启后仍累计；resolved reactor 数收缩后多余槽位标记 `retired`、流量仍计入总和；失败启动保留已分配槽位；stop 后连接数归零；handler 卡住 → `reactor_stalls` 计数但不停服；timeout < `max(100, 2×tick_ms)` 被拒绝；watchdog 在发布 stalled 前被隔离抢占时，dead 槽位不残留 stalled、不误计 `reactor_stalls` |
 | K | 按 `reactor_stats()[i].connections` 定位连接所属 reactor，用索引 failpoint 精确隔离它 → close_handler 收到 `reactor failure`、对端看到 RST、另一个 reactor 继续服务 |
 
 `stop()` 一律包在带超时的 `within()` 里跑：恢复路径死锁时的表现只是"测试跑得久"，

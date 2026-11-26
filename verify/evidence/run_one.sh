@@ -20,7 +20,11 @@ cd "$proj"
 out_dir="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
 mkdir -p "$out_dir"
 out="$out_dir/$(basename "$src" .cpp)"
-flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -O1 -Iinclude)
+# Suites include harness.h from verify/support (relocated from verify/ in the
+# layering change), so both roots are needed -- -Iinclude alone cannot build
+# any relocated suite.
+flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -O1
+       -Iinclude -Iverify/support)
 
 g++ "${flags[@]}" "$src" -o "$out" || { echo "build failed"; exit 2; }
 "$out" "$@"

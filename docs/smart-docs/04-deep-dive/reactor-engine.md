@@ -118,8 +118,9 @@ cannot keep the loop on a zero-timeout `epoll_wait`.
 Two exemptions keep the pause honest: `frame_assembly_timeout_ms` does not fire
 while paused (the incomplete frame is waiting on us, not dribbling), and the
 idle sweep uses `max(last_recv, last_drain_progress)` so a slow-but-reading peer
-is not reclaimed. A close request lifts the pause; `close_input_bytes` and
-`close_linger_ms` bound what the close may then consume.
+is not reclaimed. A close request lifts the pause; `close_input_bytes` bounds
+the drain rounds, and after the park only the peer's FIN or `close_linger_ms`
+bounds input.
 
 ### Close machinery
 

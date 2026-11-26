@@ -37,10 +37,33 @@ HDR_BEFORE=$(hdr_in "$BEFORE_REF") || exit 9
 HDR_AFTER=include/tcp-server-mt.h
 [ -f "$HDR_AFTER" ] || HDR_AFTER=tcp-server-mt.h
 
+# The suite moved to verify/suites/ and harness.h moved to verify/support/ in
+# the layering change. Probe both layouts for the before side; the after side
+# uses the relocated paths. Both files land at the throwaway tree's root so
+# the bare #include "harness.h" / "tcp-server-mt.h" resolve with -I.
+src_in() {
+  for p in verify/suites/close_semantics.cpp verify/close_semantics.cpp; do
+    if git cat-file -e "$1:$p" 2>/dev/null; then printf '%s' "$p"; return 0; fi
+  done
+  echo "loop_close_race: no close_semantics.cpp in $1" >&2
+  return 1
+}
+harness_in() {
+  for p in verify/support/harness.h verify/harness.h; do
+    if git cat-file -e "$1:$p" 2>/dev/null; then printf '%s' "$p"; return 0; fi
+  done
+  echo "loop_close_race: no harness.h in $1" >&2
+  return 1
+}
+SRC_BEFORE=$(src_in "$BEFORE_REF") || exit 9
+HARNESS_BEFORE=$(harness_in "$BEFORE_REF") || exit 9
+
 git show "$BEFORE_REF:$HDR_BEFORE" > /tmp/cfr_before/tcp-server-mt.h || exit 9
-git show "$BEFORE_REF":verify/close_semantics.cpp > /tmp/cfr_before/verify/close_semantics.cpp || exit 9
+git show "$BEFORE_REF:$SRC_BEFORE" > /tmp/cfr_before/verify/close_semantics.cpp || exit 9
+git show "$BEFORE_REF:$HARNESS_BEFORE" > /tmp/cfr_before/harness.h || exit 9
 cp "$PROJ/$HDR_AFTER"                 /tmp/cfr_after/tcp-server-mt.h
 cp "$PROJ/verify/suites/close_semantics.cpp" /tmp/cfr_after/verify/close_semantics.cpp
+cp "$PROJ/verify/support/harness.h"  /tmp/cfr_after/harness.h
 
 FLAGS=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -g
        -fsanitize=thread -fno-omit-frame-pointer)

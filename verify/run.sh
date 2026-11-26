@@ -77,8 +77,16 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/suites/harness_selftest.cpp -o "$out/harness_selftest"
     g++ "${base_flags[@]}" "$@" verify/suites/watermark.cpp -o "$out/watermark"
     g++ "${base_flags[@]}" "$@" verify/suites/hardening.cpp -o "$out/hardening"
+    g++ "${base_flags[@]}" "$@" verify/suites/frame_codec.cpp -o "$out/frame_codec"
     g++ "${fsm_flags[@]}" "$@" verify/suites/tcp_server_fsm_test.cpp \
         -o "$out/tcp_server_fsm_test"
+    g++ "${base_flags[@]}" "$@" verify/suites/latency_histograms.cpp \
+        -o "$out/latency_histograms"
+    # The seam suite selects its policy in this TU only; a second
+    # policy in the same binary would be an ODR violation.
+    g++ "${base_flags[@]}" "$@" \
+        -DTCP_SERVER_SYSCALL_POLICY=industrial::seam_policy \
+        verify/suites/syscall_seam.cpp -o "$out/syscall_seam"
 }
 
 run_all() {
@@ -109,7 +117,10 @@ run_all() {
                    "harness_selftest:$out/harness_selftest" \
                    "watermark:$out/watermark" \
                    "hardening:$out/hardening" \
-                   "tcp_server_fsm_test:$out/tcp_server_fsm_test"; do
+                   "frame_codec:$out/frame_codec" \
+                   "tcp_server_fsm_test:$out/tcp_server_fsm_test" \
+                   "latency_histograms:$out/latency_histograms" \
+                   "syscall_seam:$out/syscall_seam"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
@@ -237,6 +248,11 @@ cat <<EOF
     implementation that always returned the first reactor leaves every other
     suite green. It runs twice, at four reactors and at two, so the assertion is
     shown to follow the configuration rather than a constant in the test.
+  - frame_codec checks the eight header bytes without a socket: every status
+    at its boundary, equivalence against the byte order the reactor used
+    before the extraction, and 200000 deterministic inputs through the fuzz
+    entry point. verify/fuzz/decode_header.dict is the libFuzzer word list for
+    driving that same entry point under clang's fuzzer.
   - tcp_server_fsm_test checks conn_machine directly: it re-derives the 77
     states from the five rules, checks every generated cell against the
     transition() the header ships, diffs the whole machine against the oracle
@@ -245,6 +261,9 @@ cat <<EOF
     budget is clamped at zero so a second close request cannot re-measure it.
     The checked-in verify/support/tcp-server-mt.prev.h is the branch-point oracle; the
     generator, tools/gen_conn_fsm.cpp, rewrites docs/conn-fsm.md.
+  - latency_histograms checks the opt-in latency histograms for loop-lag,
+    handler-duration and queue-wait, including that they stay empty when the
+    config flag is off.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as

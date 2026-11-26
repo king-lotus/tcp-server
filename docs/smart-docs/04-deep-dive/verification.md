@@ -43,10 +43,10 @@ flowchart LR
 |---|---|
 | `verify/run.sh` | The gate: builds each configuration, runs every case with a 180 s timeout, runs cpplint |
 | `verify/support/harness.h` | Peer side shared by all suites: connect, send, split writes, expect a frame, FIN/RST, raw sockets |
-| `verify/suites/*.cpp` | Twelve suites |
+| `verify/suites/*.cpp` | Fifteen suites |
 | `verify/bench/*.cpp` | Four benchmarks |
 | `verify/evidence/` | Twenty one-off probes, written to settle a single claim; not part of CI |
-| `CMakeLists.txt` | INTERFACE target plus 11 `ctest` entries mirroring the suite |
+| `CMakeLists.txt` | INTERFACE target plus 17 `ctest` entries mirroring the suite |
 | `.github/workflows/c-cpp.yml` | Runs the same three configurations on every push and PR |
 
 ## The standing suites
@@ -58,12 +58,16 @@ flowchart LR
 | `ping_pong` | PING answered while healthy and while closing |
 | `send_results` | Every `send_result` value, descriptor exhaustion, EMFILE rescue retry policy, HUP/ERR delivery, offload ordering and limits |
 | `backpressure` | Reactor queue fan-out, reserved control slots, close queued under a reply flood |
-| `fault_injection` | Worker/accept exceptions, deterministic reactor quarantine and the `reactor failure` close reason, restart after failure, rejected configuration, handler throws, queue-refused close, failed-start rollback, partial reactor set, per-reactor stats (including retired slots after a shrinking reactor count and a failed start), and the stall watchdog |
+| `fault_injection` | Worker/accept exceptions, deterministic reactor quarantine and the `reactor failure` close reason, restart after failure, rejected configuration, handler throws, queue-refused close, failed-start rollback, partial reactor set, per-reactor stats (including retired slots after a shrinking reactor count and a failed start), the stall watchdog, and the watchdog/quarantine publish interleaving |
 | `reactor_spread` | Round-robin placement, and that it follows the configured reactor count |
 | `config_budget` | Default buffer budget, new admission/watermark validation, ring buffer commit behaviour |
 | `watermark` | Pausing at the high mark, resuming at the low mark, close overrides the pause, assembly-deadline and idle exemptions |
 | `hardening` | Unique ids under churn, close-callback containment, global byte budget, per-IP cap, opt-in `SO_REUSEPORT` |
 | `harness_selftest` | The harness itself: send, split, FIN, RST, timeout, raw sockets |
+| `frame_codec` | Eight header bytes off the reactor: every status at its boundary, equivalence with the pre-extraction byte order, and 200000 inputs through the fuzz entry point (`verify/fuzz/decode_header.dict` drives that entry point under clang's fuzzer) |
+| `tcp_server_fsm_test` | The closed-enum machine against the branch-point `close_fsm` oracle and the 77-state spec |
+| `syscall_seam` | The compile-time syscall policy seam |
+| `latency_histograms` | Latency sampling under the reactor path |
 
 Two suites run twice — `close_semantics` at one reactor and at the default, and
 `reactor_spread` at four and at two. A single-reactor run averages away a fault

@@ -317,7 +317,8 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
    **这个额度不含内核接收缓冲里的字节。** drain 会临时恢复读取，`draining_input`
    让这一轮不受输出水位约束，因此它最多再从内核取出一个读预算（64 KiB / 256 帧）；
    关闭落定（park）之前，连接的普通读续跑可能再多服务一些，但那条路径仍受高水位
-   约束。两者都不是承诺。读侧背压暂停中的连接差距最大——
+   约束；落定之后 `closing` 会解除高水位检查，后续输入仍会被解析并交给 handler
+   （应答被拒），直到对端 FIN 或 `close_linger_ms`。两者都不是承诺。读侧背压暂停中的连接差距最大——
    暂停的存在就是为了把字节留在内核里。实测
    （`verify/evidence/probe_close_while_paused.cpp`）：内核里排着 4000 个请求、
    一次关闭 → 对端收到 256 个应答，然后 FIN；`frames_recv` 记到 4000，说明这些
@@ -470,6 +471,7 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 | `frame_assembly_timeouts` | 不完整帧超过 `frame_assembly_timeout_ms`（字节仍在到达） |
 | `epoll_ctl_errors` | `epoll_ctl` 失败 |
 | `reactor_failures` | reactor 线程异常退出。该 reactor 被隔离：不再接新连接、其连接全部重置（关闭原因 `reactor failure`）；只要还有别的 reactor 存活，服务器继续服务 |
+| `accept_thread_failures` | accept 线程在运行时失败（`epoll_wait` 返回错误或 accept 循环抛异常）。启动时的描述符建立失败由 `start()` 报告，不计入此计数器。与 reactor 失败不同，它总是致命的：没有别的线程接受连接，服务器随即停止。与 `reactor_failures` 分开计数，便于和 `reactor_stats()` 对账 |
 | `reactor_stalls` | stall watchdog 发现某 reactor 超过 `reactor_stall_timeout_ms` 未完成一轮循环；每个"停滞 episode"计一次（连续一个完整窗口恢复后才算结束）；采样间隔不超过 `min(500 ms, timeout/2)`，更短的瞬态可能落在两次采样之间；只在服务器运行中采样；不停服 |
 | `reactor_stall_skips` | 本该投给停滞 reactor 的新连接改投给了存活 reactor。按连接计一次，不按被跳过的 reactor 计。看门狗关闭时为 0；全部 reactor 都停滞时也为 0（此时宁可按原轮转投递，也不拒绝连接） |
 | `handler_installs_refused` | `set_message_handler` / `set_conn_state_handler` / `set_close_handler` 在服务器未完全停止时被调用，或安装本身失败，handler 保持原样。worker 无同步地读这些 `std::function`，运行中替换是数据竞争而非"重新配置" |

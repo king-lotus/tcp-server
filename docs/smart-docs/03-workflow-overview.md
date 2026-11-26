@@ -228,6 +228,7 @@ flowchart LR
 | `epoll_ctl` registration failure | Abort the connection | `epoll_ctl_errors` |
 | `accept4` failure | Continue accepting | `accept_errors` |
 | Reactor loop throws | Quarantine that reactor: no new connections, its connections reset with `reactor failure` | `reactor_failures`; fatal only if no reactor is left alive |
+| Accept loop throws | Fatal: no other thread accepts connections | `accept_thread_failures` |
 | Handler throws | Swallowed; connection unaffected | — |
 | Close notification cannot be allocated | Connection goes anyway | `close_callbacks_dropped` |
 

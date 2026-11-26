@@ -43,7 +43,19 @@ if(TCP_BUILD_SUITES)
         config_budget
         harness_selftest
         watermark
-        hardening)
+        hardening
+        frame_codec
+        latency_histograms)
+
+    # The seam suite selects a policy type at compile time. It is a separate
+    # target because that macro must not leak into the other suites: one
+    # binary, one syscall_policy definition.
+    add_executable(syscall_seam verify/suites/syscall_seam.cpp)
+    target_link_libraries(syscall_seam PRIVATE tcp_server_mt)
+    target_include_directories(syscall_seam PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/verify/support")
+    target_compile_definitions(syscall_seam PRIVATE
+        TCP_SERVER_SYSCALL_POLICY=industrial::seam_policy)
 
     foreach(suite IN LISTS TCP_SUITES)
         add_executable(${suite} verify/suites/${suite}.cpp)
@@ -81,7 +93,7 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same fourteen runs run.sh performs: twelve suites, plus the two that
+    # The same sixteen runs run.sh performs: fourteen suites, plus the two that
     # run a second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)
@@ -113,6 +125,12 @@ if(TCP_BUILD_SUITES)
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:watermark>)
     add_test(NAME hardening
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:hardening>)
+    add_test(NAME syscall_seam
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:syscall_seam>)
+    add_test(NAME latency_histograms
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:latency_histograms>)
+    add_test(NAME frame_codec
+             COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:frame_codec>)
     add_test(NAME tcp_server_fsm_test
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:tcp_server_fsm_test>)
 
@@ -122,8 +140,8 @@ if(TCP_BUILD_SUITES)
                          idle_semantics ping_pong send_results backpressure
                          fault_injection reactor_spread
                          reactor_spread_2_reactors config_budget
-                         harness_selftest watermark hardening
-                         tcp_server_fsm_test
+                         harness_selftest watermark hardening frame_codec
+                         tcp_server_fsm_test syscall_seam latency_histograms
                          PROPERTIES TIMEOUT 180)
 endif()
 

@@ -199,7 +199,7 @@ slowloris case is bounded by progress, not by silence.
 | Connection | `connection` | Per-connection state, both buffers, close flags, timestamps | buffers, protocol |
 | Reactor | `sub_reactor` | Event loop, framing, write drain, timers, task queue | connection, stats |
 | Control plane | `multi_reactor_server` | Lifecycle, acceptance, submission, offload, introspection | reactors, shards, pool |
-| Observability | `server_stats` | 20 counters, each tied to a branch | — |
+| Observability | `server_stats` | counters, each tied to a branch | — |
 
 The public contract of the control plane is documented separately in
 [`../api-reference.md`](../api-reference.md); this document is about why it is

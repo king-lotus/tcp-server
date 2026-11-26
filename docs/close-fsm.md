@@ -188,9 +188,10 @@ on the FSM and `do_tick` performs the same drain-then-close one tick later; the
 close is delayed, not lost. A connection that is already `closing` needs no
 retry. Read-side backpressure is overridden by a close: `drain_input_then_close`
 and `park_close` resume reading, the drain round sets `draining_input` so the
-high-water pause cannot reapply before the first buffered frame is served, and
-the existing `close_input_bytes` budget and `close_linger_ms` bound how much
-input the close may consume. Replies the drain produces still meet the normal
+high-water pause cannot reapply before the first buffered frame is served. The
+existing `close_input_bytes` budget bounds the drain rounds; after the park,
+only the peer's FIN or `close_linger_ms` bounds further input. Replies the
+drain produces still meet the normal
 `send_to` ceiling: a frame over it is refused as `overloaded` (counted), not
 silently lost to a teardown.
 
@@ -201,8 +202,10 @@ from nothing else. Bytes the kernel still holds at that point are not in the
 budget: the drain's own round pulls at most one read budget (64 KiB / 256 frames)
 of them into service, and `draining_input` exempts that round from the output
 watermark. The connection's ordinary read continuation may serve more before the
-park lands, but it is not exempt: it stops at the high watermark. Neither is a
-promise.
+park lands. Once the park sets `closing`, the high watermark no longer applies:
+fresh input is still parsed and handed to the handler (its replies are refused)
+until the peer's FIN or `close_linger_ms` ends the connection. Neither the
+drain round nor the continuation is a promise.
 
 The widest case is the one `draining_input` exists for: a connection that was
 read-paused. The pause exists precisely to leave bytes in the kernel, so at close
@@ -246,6 +249,40 @@ as a plain struct holding the fields; behaviour moves into it one method at a ti
 
 No step changes wire behaviour; `close_semantics`, `idle_semantics`, `ping_pong`,
 `backpressure`, and `fault_injection` must pass unchanged throughout.
+
+## State axes and debug invariants
+
+`connection` does not have a single state variable. It has four independent
+axes: interest (`write_armed`, `read_paused`, `read_pending`), transport (`fd`,
+`peer_closed`), close (`fsm.closing`, `fsm.fin_sent`, `fsm.deferred_round`) and
+activity (`fsm.draining_input`). Folding them into one enum would produce a
+state per product of the axes, most of them legal, and the result would be
+harder to verify than the fields it replaced. What is worth writing down is the
+smaller set of combinations that must never be observed:
+
+- a paused connection left on the read continuation list (a level-triggered
+  spin), or a paused connection after the peer's FIN;
+- a `peer_closed` round owed when the connection has not seen a FIN;
+- our FIN with `closing` false, or with bytes still in `wbuf` (a truncated
+  stream presented as a clean close);
+- write interest, a read continuation or `closing` left behind on a detached
+  descriptor, where a recycled fd could inherit them.
+
+`connection::state_violation()` is a pure, always-compiled checker for those
+rules; `check_invariants()` aborts on them in debug builds and is compiled out
+under `NDEBUG`. A `state_guard` at the top of each function that moves an axis
+checks both entry and exit, so all return paths are covered. Legitimate
+intermediate states are documented in the checker rather than asserted away:
+a rejected connection closes its fd before marking itself closed, a paused
+connection can be torn down while still paused, EPOLLOUT can stay armed just
+after our own FIN, and a handler can tear a connection down while a close drain
+round is still on the stack.
+
+`verify/state_invariants.cpp` locks this down in three layers: a table of
+legal and illegal combinations (including the exact reason strings), a table
+of close decisions whose reactor-side effects must leave a legal combination,
+and a forked child proving the debug guard really aborts. The action-only
+transition table for `close_fsm` stays in `close_semantics.cpp`.
 
 ## Tests
 

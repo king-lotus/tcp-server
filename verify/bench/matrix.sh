@@ -18,7 +18,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-proj="$(dirname "$here")"
+proj="$(dirname "$(dirname "$here")")"
 cd "$proj"
 
 REPS="${REPS:-3}"

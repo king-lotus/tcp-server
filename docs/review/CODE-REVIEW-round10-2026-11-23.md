@@ -28,10 +28,10 @@
 
 ### What the code did
 
-`check_reactor_stalls()` (`:4432` at the baseline, `:4609` now) sampled
+`check_reactor_stalls()` (`:4432` at the baseline, `:4716` now) sampled
 `reactor_slot::last_progress_ms` once per accept-loop pass and, on a late
 sample, incremented `reactor_stalls` and printed a line. `pick_reactor()`
-(`:4354` at the baseline, `:4500` now) skipped `dead_` and nothing else.
+(`:4354` at the baseline, `:4607` now) skipped `dead_` and nothing else.
 
 A reactor blocked inside a message handler is neither stopped nor dead:
 `running_` is still true (its loop is *inside* an iteration, not past it), and
@@ -61,7 +61,7 @@ wait; a *new* one does not.
 `reactor_slot::stall_reported` became `stalled` plus `stalled_at_ms`
 (`:148–172`). The watchdog sets `stalled` on the first late sample (and counts
 the episode, and logs once), and clears it under hysteresis
-(`check_reactor_stalls()`, `:4609`):
+(`check_reactor_stalls()`, `:4716`):
 
 - **enter** at `now - last > timeout`;
 - **leave** only when the reactor looks fresh by half a window
@@ -75,7 +75,7 @@ routing flap, with a log line and a counter increment each time. The cost is
 stated rather than hidden: a reactor that recovers immediately after being
 flagged takes up to one timeout longer to receive new connections again.
 
-`pick_reactor()` (`:4500`) now returns the first live, non-stalled reactor and,
+`pick_reactor()` (`:4607`) now returns the first live, non-stalled reactor and,
 when it had to pass over a stalled one, counts `reactor_stall_skips`. If every
 live reactor is stalled it returns one of them anyway: a queue that drains late
 still beats refusing every connection, and "every reactor is blocked in a
@@ -110,7 +110,7 @@ one build where nobody is watching for it.
 ### The fix
 
 The switches moved into the private section, still unconditional, still checked
-in every build, with `friend struct test_access;` (`:1716–1753`). The accessor
+in every build, with `friend struct test_access;` (`:1809–1846`). The accessor
 lives in `verify/harness.h`, is the only thing that names the members, and wraps
 each one in a named one-shot call (`fail_worker_once`, `fail_reactor_start_after`,
 `force_reactor_count`, …) so a suite cannot leave a switch armed by accident.
@@ -141,7 +141,7 @@ missing callback.
 ### The fix
 
 All three now return `bool` and route through a private `install_handler()`
-(`:1680`) which takes `lifecycle_mutex_` with `try_to_lock` and refuses unless
+(`:1773`) which takes `lifecycle_mutex_` with `try_to_lock` and refuses unless
 the lifecycle is `stopped`, counting `handler_installs_refused`. `false` means
 the handler was **not** installed; the old one is still the one running.
 

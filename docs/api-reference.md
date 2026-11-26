@@ -73,6 +73,14 @@ Every frame is an 8-byte big-endian header followed by up to 64 KiB of payload.
   hold the frame, or a received frame that cannot be answered (see [close
   reasons](#close-reasons)) ends the connection with a reset rather than a
   partial delivery.
+- The inline pure function `decode_header(const uint8_t*, size_t, bool
+  allow_unknown_types)` makes those header decisions without a socket, a
+  connection or a counter. It returns a `decoded_header` whose `status` is one
+  of `need_more`, `ok`, `bad_magic`, `unknown_type`, `frame_too_large`; `type`
+  and `len` carry a value only when the status is `ok`. The check order —
+  magic, then type, then length — is part of the protocol. `parse_frames`
+  maps the status onto a close reason and a statistic. Because the function is
+  pure, its decisions are asserted directly, without a socket.
 
 ## Quick start
 
@@ -129,6 +137,7 @@ validated by `start()`; nothing is checked at construction.
 | `reactor_stall_timeout_ms` | `0` | Watchdog for a reactor alive but not completing a loop iteration for this long. 0 disables it; otherwise it must be at least `max(100, 2 × tick_ms)`. One iteration is `tick_ms` in `epoll_wait` plus the loop body (event batch, pending tasks, `do_tick`), so a timeout just over `tick_ms` reports healthy reactors; it must also exceed the longest expected body. With the watchdog on, the accept thread samples at least every `min(500 ms, timeout/2)`, so a stall shorter than the timeout plus one sample can fall between samples. A stall has two effects, both on the accept side: the episode is counted once (`reactor_stalls`) and logged, and the reactor stops receiving **new** connections (`reactor_stall_skips`) until it has made progress for a full timeout window again. Its existing connections are not touched, and the server is never stopped. |
 | `frame_assembly_timeout_ms` | `0` | Deadline for one frame, measured from its first byte. `0` means 5 × `idle_timeout_ms`. Must be ≥ 0. |
 | `allow_unknown_frame_types` | `false` | Deliver a type outside `1`/`2`/`3` to the message handler as DATA instead of closing the connection. See [wire protocol](#wire-protocol). |
+| `latency_histograms` | `false` | Opt in to the three `server_stats` latency histograms below. Off by default: when enabled, the reactor takes clock readings around handler calls, queued-task dispatch and timer expiries, and increments atomic buckets. The flag is read once in `start()` and is fixed for the run. |
 | `rbuf_capacity` | `65544` | Per-connection read buffer. Must be ≥ 65544: a smaller one cannot hold a legal maximum frame. |
 | `wbuf_capacity` | `65544` | Per-connection write buffer. Must be ≥ 8. |
 | `max_pending_bytes` | `65544` | Ceiling on bytes accepted for one connection but not yet written. Clamped down to `wbuf_capacity` by `start()`. |
@@ -321,11 +330,11 @@ A close answers what it promised and no more. What it serves is the input alread
 in the read buffer when the request is dequeued — the `close_input_bytes` budget
 — plus, at most, one read round (64 KiB / 256 frames) pulled out of the kernel
 receive buffer while that round runs. That round is exempt from the high-water
-pause; the connection's ordinary continuation after it is not, so output
-backpressure decides whether it gets to serve any more before the park. Requests
-still in the kernel buffer past that are parsed and handed to the message
-handler, but their replies are refused once the close parks, and the peer
-receives a FIN over them. Measured
+pause; the connection's ordinary continuation before the park is not, so output
+backpressure can still stop it early. Requests still in the kernel buffer past
+that are parsed and handed to the message handler once the close parks:
+`closing` lifts the high-water check, their replies are refused, and only the
+peer's FIN or `close_linger_ms` ends the connection. Measured
 (`verify/evidence/probe_close_while_paused.cpp`): 4000 requests sitting in the
 kernel of a read-paused connection, 256 answered, then FIN — while
 `frames_recv` accounted for all 4000. Both numbers are real; only the second is
@@ -415,7 +424,9 @@ enum class send_result : int {
 
 Read through `stats()`; every field is atomic and may be read at any time. The
 four traffic counters are batched per reactor and published once per loop
-iteration: exact when idle, up to one iteration behind under load.
+iteration: exact when idle, up to one iteration behind under load. The opt-in
+histograms below are written directly by the reactor thread; read their buckets
+after `stop()` when a stable snapshot matters.
 
 | Field | Counted when |
 |---|---|
@@ -436,7 +447,8 @@ iteration: exact when idle, up to one iteration behind under load.
 | `idle_timeouts` | No activity within `idle_timeout_ms`, where activity is bytes received or bytes drained to the peer. |
 | `frame_assembly_timeouts` | A partial frame did not complete within `frame_assembly_timeout_ms`, even though bytes were arriving. |
 | `epoll_ctl_errors` | An `epoll_ctl` registration failed. |
-| `reactor_failures` | A reactor thread crashed or exited abnormally. That reactor is quarantined: it accepts no new connections, its connections are reset (close reason `reactor failure`), and the server keeps serving while another reactor is alive. The increment that empties the pool — or any accept-thread failure — is fatal. |
+| `reactor_failures` | A reactor thread crashed or exited abnormally. That reactor is quarantined: it accepts no new connections, its connections are reset (close reason `reactor failure`), and the server keeps serving while another reactor is alive. The increment that empties the pool is fatal. |
+| `accept_thread_failures` | The accept thread failed at runtime (`epoll_wait` returned an error, or the accept loop threw). A descriptor-setup failure at start is reported by `start()` and is not counted here. Unlike a reactor failure this is always fatal: nothing else accepts connections, so the server stops. Kept apart from `reactor_failures` so that counter can be reconciled with `reactor_stats()` without a dead reactor that never existed. |
 | `reactor_stalls` | The accept thread's watchdog observed a live reactor whose last completed loop iteration was older than `reactor_stall_timeout_ms`. One increment per episode, not per sample: the episode ends when the reactor has made progress for a full window again. Sampled at least every `min(500 ms, timeout/2)`; shorter transients can fall between samples, and a server that is no longer running is not sampled. The server is not stopped. |
 | `reactor_stall_skips` | A new connection that would have gone to a stalled reactor went to a live one instead. Counted once per connection, not once per reactor passed over. Zero while the watchdog is off, and zero when every reactor is stalled: the accept loop then takes the bad hand-off rather than refusing the connection. |
 | `handler_installs_refused` | `set_message_handler`, `set_conn_state_handler` or `set_close_handler` was called while the server was not fully stopped, or the install itself failed, and the handler was left unchanged. Handlers are read by every worker without synchronization, so installing one while they run is a data race rather than a reconfiguration. |
@@ -445,6 +457,7 @@ iteration: exact when idle, up to one iteration behind under load.
 | `fd_exhausted_system` | `accept4` failed with `ENFILE`: the system-wide descriptor table is full, which closing one's own spare cannot fix. |
 | `read_pauses` | The reactor stopped reading a connection because its pending output passed the high watermark. |
 | `pending_tasks_total` / `pending_tasks_depth` | Tasks submitted through the cross-thread queue, and the current queue depth. The owner-thread fast path touches neither. |
+| `loop_lag_us` / `handler_duration_us` / `queue_wait_us` | Opt-in histograms (`config::latency_histograms`), in microseconds. `loop_lag_us` records each `epoll_wait` timeout, with 0 meaning the timer fired on time and larger values meaning it returned late; `handler_duration_us` records each message-handler call, including one that threw; `queue_wait_us` records the time from enqueue to dispatch for each cross-thread task. Each has `samples()`, `bucket(i)` (0-based; bucket 0 is 0 µs, buckets 1–10 cover powers of two up to 1024 µs, bucket 11 is ≥1024 µs) and `reset()`. All three stay empty when the flag is off. |
 | `eof_reads` | `recv` returned 0. A parked half-close makes this repeat under level-triggered epoll, so a fast-moving value means the reactor is spinning on one FIN. |
 | `close_requests_dropped` | The owning reactor refused the close hand-off. The close still happens — `do_tick` performs it — so this counter is a queue-pressure signal, not a lost close. |
 | `epipe_writes` | `sendmsg` returned `EPIPE`. Expected to stay 0 — every path that could reach it is guarded first. |
@@ -480,6 +493,26 @@ The `reason` passed to `close_handler`, and why each one appears.
 | `epoll pause registration failed` | `EPOLL_CTL_MOD` to stop reading for backpressure failed. |
 | `epoll resume registration failed` | `EPOLL_CTL_MOD` to resume reading failed. |
 | `epoll park registration failed` | Re-arming interest on a parked half-close failed. |
+
+## Syscall policy seam
+
+Six calls — `recv`, `sendmsg`, `shutdown`, `epoll_ctl`, `accept4` and the
+reactor's eventfd `wake_write` — go through `industrial::syscall_policy` rather
+than directly. In a normal build that alias names `default_syscall_policy`, six
+`static inline` forwarders — one direct call per site, no virtual dispatch, no
+state. `wake_write` exists so a test can count notifications, not to inject a
+fault. There is nothing to configure and no runtime cost.
+
+A test binary can replace the alias at compile time by defining
+`TCP_SERVER_SYSCALL_POLICY` to a type with the same six static signatures
+(`recv`, `sendmsg`, `shutdown`, `epoll_ctl`, `accept4`, `wake_write`) **before**
+any include of the header. Omitting `wake_write` is a compile error, not a
+runtime fallback. Since the alias is part of the class definition's inline
+bodies, every translation unit in one binary must see the same policy; the
+verify runner compiles the injecting suite as its own target.
+`verify/syscall_seam_policy.h` is the reference implementation and
+`verify/syscall_seam.cpp` uses it to make EPIPE, short writes, a failed
+`shutdown`, a failed `epoll_ctl(MOD)` and `accept4` EMFILE deterministic tests.
 
 ## What the library does not do
 
