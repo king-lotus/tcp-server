@@ -266,7 +266,7 @@ void run_conn_machine_unit_cases() {
         x.buffered(100);
         expect(x.sm.on_request(kNow).action == close_action::drain_input,
                "on_request -> drain_input");
-        expect(x.sm.state().close_input_bytes == 100,
+        expect(x.sm.state().close_input_bytes().value_or(-1) == 100,
                "on_request measures the close input budget");
     }
     {

@@ -236,12 +236,14 @@ cat <<EOF
     implementation that always returned the first reactor leaves every other
     suite green. It runs twice, at four reactors and at two, so the assertion is
     shown to follow the configuration rather than a constant in the test.
-  - tcp_server_fsm_test checks conn_machine directly: exhaustive closure over
-    every state valid() admits, a differential against the close_fsm it replaced,
-    and random walks. Test D is the one intentional difference -- a drained
+  - tcp_server_fsm_test checks conn_machine directly: it re-derives the 77
+    states from the five rules, checks every generated cell against the
+    transition() the header ships, diffs the whole machine against the oracle
+    in tools/conn_fsm_spec.h, and runs 40x20000 random walks against the
+    close_fsm it replaced. Test 7 is the one intentional difference -- a drained
     budget is clamped at zero so a second close request cannot re-measure it.
-    The checked-in verify/tcp-server-mt.prev.h is the branch-point oracle;
-    `--table` regenerates docs/conn-fsm.md.
+    The checked-in verify/tcp-server-mt.prev.h is the branch-point oracle; the
+    generator, tools/gen_conn_fsm.cpp, rewrites docs/conn-fsm.md.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as
