@@ -37,6 +37,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -576,18 +577,8 @@ enum class close_action {
 // ==================== Connection state machine ====================
 //
 // One state machine owns everything that decides what a connection may do
-// next. Before it existed that knowledge was eleven fields on two structs --
-// closing, fin_sent, is_closed, deferred_round, draining_input,
-// close_input_bytes and close_started_at_ms on close_fsm; write_armed,
-// read_paused, peer_closed and paused_at_ms on connection -- written from
-// fourteen places, so "may a paused connection be closing?" was a question
-// about the call graph. It is now a question about one predicate,
-// conn_sm::valid(), which the state-machine test checks after every
-// transition from every state it admits, and which every transition asserts.
-//
-// The state is a product of three regions, because the three really are
-// independent -- what is not independent is which combinations may coexist,
-// and that is what valid() says:
+// next. Its state is one value of conn_state_id: a closed enum of the 77 legal
+// combinations of
 //
 //   phase  open -> draining -> closing -> fin_sent -> closed
 //          open:     normal operation.
@@ -603,16 +594,26 @@ enum class close_action {
 //          close that has nothing left to serve); any phase may go to closed.
 //   read   active | paused | eof.
 //          paused is read-side backpressure (EPOLLIN dropped); eof is the
-//          peer's FIN. paused exists only in open/draining, outside a serving
-//          round: a close resumes a paused connection as part of entering
-//          closing, which is why the machine does it rather than the caller.
-//   write  write_armed: EPOLLOUT is wanted.
+//          peer's FIN. A close resumes a paused connection as part of entering
+//          draining or closing, which is why the machine does it rather than
+//          the caller.
+//   write  EPOLLOUT wanted or not.
+//   round  whether a serving round is on the stack, and which side owns the
+//          one queue round a close or a peer FIN may spend waiting for replies
+//          to land (none | close | peer_closed).
 //
-// Extended state, kept with the machine because it is what the close protocol
-// decides with: in_round (a serving round is on the stack), round (which side
-// owns the one queue round a close or a peer FIN may spend waiting for replies
-// to land), close_input_bytes (the input a graceful close still owes the peer,
-// measured once), close_started_at_ms, paused_at_ms.
+// A combination the rules forbid has no enumerator, so it cannot be named, let
+// alone reached: there is no invariant to check because there is nothing to
+// violate. (The rules are listed beside the enum.) What a state carries beyond
+// which state it is -- a stamp, a budget -- is a payload of conn_state, absent
+// from the states that cannot have it.
+//
+// The transition function is generated: (state, event, guard) -> (next state,
+// close_action, effects). tools/conn_fsm_spec.h holds the rules,
+// tools/gen_conn_fsm.cpp derives the table from them and emits the function,
+// the exhaustive test cases and docs/conn-fsm.md together, so none of the
+// three can drift. conn_sm applies a cell and its payload effects; conn_machine
+// owns one connection's state and its cross-thread channel.
 //
 // Threading: only the owning reactor mutates the state. The phase is mirrored
 // into an atomic on every transition, which is the only part other threads
@@ -650,24 +651,6 @@ enum class read_mode : uint8_t { active = 0, paused, eof };
 // side owns the round (see drain_input_then_close / finish_peer_closed).
 enum class close_round : uint8_t { none = 0, close, peer_closed };
 
-struct conn_state {
-    conn_phase  phase = conn_phase::open;
-    read_mode   read  = read_mode::active;
-    bool        write_armed = false;
-    // A drain_input_then_close() serving round is on the stack. Read-side
-    // backpressure does not apply inside one: pausing there is what made a
-    // close requested while the connection was read-paused serve nothing, park,
-    // and FIN over the requests already sitting in rbuf.
-    bool        in_round = false;
-    close_round round = close_round::none;
-    // Input this graceful close still owes the peer: the bytes buffered and
-    // unserved when the close was first requested. Negative means "not
-    // measured yet".
-    int64_t     close_input_bytes = -1;
-    int64_t     close_started_at_ms = 0;  // when the close was parked
-    int64_t     paused_at_ms = 0;         // when EPOLLIN was dropped, else 0
-};
-
 // What the machine needs to know about the connection's buffers to decide.
 // Passed in rather than reached for, which is what keeps the transitions pure.
 struct conn_facts {
@@ -690,54 +673,1598 @@ struct close_step {
     read_resume  resume;
 };
 
+#ifdef INDUSTRIAL_CONN_FSM_VOCABULARY_ONLY
+// Defined only by tools/: the generator needs the vocabulary above (the enums
+// and the small structs the table is stated in) to build, and it must be able
+// to build before the generated region below exists -- it is what writes it.
+}  // namespace industrial
+#else
+// ===== BEGIN GENERATED (tools/gen_conn_fsm.cpp; do not edit by hand) =====
+// Source of truth: tools/conn_fsm_spec.h (the rules) -> tools/gen_conn_fsm.cpp
+// (this text, verify/conn_fsm_cases.inc, docs/conn-fsm.md).
+// Regenerate; do not edit.
+//
+// A state is one value of conn_state_id: a closed enum of the 77 legal
+// combinations of (phase, read, in_round, round, write_armed). A combination
+// the five rules forbid has no enumerator, so it cannot be named, let alone
+// reached. The rules, from the 180 combinations of the five axes:
+//   - round == close needs phase != open;
+//   - round == peer_closed needs read == eof;
+//   - read == paused needs phase open/draining and no serving round;
+//   - closed has no write interest, no serving round and no pause;
+//   - a serving round needs phase != open.
+// Per phase: open 8, draining 24, closing 20, fin_sent 20, closed 5.
+//
+// <phase>_<read:act|pau|eof>[_<flags>]; flags in this order:
+//   R serving round on the stack, C round=close, P round=peer_closed,
+//   W write interest armed.
+// Ids are ordered by (phase, read, in_round, round, write).
+enum class conn_state_id : uint8_t {
+    // open (8)
+    open_act = 0,
+    open_act_W = 1,
+    open_pau = 2,
+    open_pau_W = 3,
+    open_eof = 4,
+    open_eof_W = 5,
+    open_eof_P = 6,
+    open_eof_PW = 7,
+    // draining (24)
+    draining_act = 8,
+    draining_act_W = 9,
+    draining_act_C = 10,
+    draining_act_CW = 11,
+    draining_act_R = 12,
+    draining_act_RW = 13,
+    draining_act_RC = 14,
+    draining_act_RCW = 15,
+    draining_pau = 16,
+    draining_pau_W = 17,
+    draining_pau_C = 18,
+    draining_pau_CW = 19,
+    draining_eof = 20,
+    draining_eof_W = 21,
+    draining_eof_C = 22,
+    draining_eof_CW = 23,
+    draining_eof_P = 24,
+    draining_eof_PW = 25,
+    draining_eof_R = 26,
+    draining_eof_RW = 27,
+    draining_eof_RC = 28,
+    draining_eof_RCW = 29,
+    draining_eof_RP = 30,
+    draining_eof_RPW = 31,
+    // closing (20)
+    closing_act = 32,
+    closing_act_W = 33,
+    closing_act_C = 34,
+    closing_act_CW = 35,
+    closing_act_R = 36,
+    closing_act_RW = 37,
+    closing_act_RC = 38,
+    closing_act_RCW = 39,
+    closing_eof = 40,
+    closing_eof_W = 41,
+    closing_eof_C = 42,
+    closing_eof_CW = 43,
+    closing_eof_P = 44,
+    closing_eof_PW = 45,
+    closing_eof_R = 46,
+    closing_eof_RW = 47,
+    closing_eof_RC = 48,
+    closing_eof_RCW = 49,
+    closing_eof_RP = 50,
+    closing_eof_RPW = 51,
+    // fin_sent (20)
+    fin_sent_act = 52,
+    fin_sent_act_W = 53,
+    fin_sent_act_C = 54,
+    fin_sent_act_CW = 55,
+    fin_sent_act_R = 56,
+    fin_sent_act_RW = 57,
+    fin_sent_act_RC = 58,
+    fin_sent_act_RCW = 59,
+    fin_sent_eof = 60,
+    fin_sent_eof_W = 61,
+    fin_sent_eof_C = 62,
+    fin_sent_eof_CW = 63,
+    fin_sent_eof_P = 64,
+    fin_sent_eof_PW = 65,
+    fin_sent_eof_R = 66,
+    fin_sent_eof_RW = 67,
+    fin_sent_eof_RC = 68,
+    fin_sent_eof_RCW = 69,
+    fin_sent_eof_RP = 70,
+    fin_sent_eof_RPW = 71,
+    // closed (5)
+    closed_act = 72,
+    closed_act_C = 73,
+    closed_eof = 74,
+    closed_eof_C = 75,
+    closed_eof_P = 76,
+};
+inline constexpr int k_conn_state_count = 77;
+
+constexpr conn_phase phase_of(conn_state_id s) noexcept {
+    using S = conn_state_id;
+    switch (s) {
+    case S::draining_act: case S::draining_act_W: case S::draining_act_C:
+    case S::draining_act_CW: case S::draining_act_R: case S::draining_act_RW:
+    case S::draining_act_RC: case S::draining_act_RCW: case S::draining_pau:
+    case S::draining_pau_W: case S::draining_pau_C: case S::draining_pau_CW:
+    case S::draining_eof: case S::draining_eof_W: case S::draining_eof_C:
+    case S::draining_eof_CW: case S::draining_eof_P: case S::draining_eof_PW:
+    case S::draining_eof_R: case S::draining_eof_RW: case S::draining_eof_RC:
+    case S::draining_eof_RCW: case S::draining_eof_RP:
+    case S::draining_eof_RPW:
+        return conn_phase::draining;
+    case S::closing_act: case S::closing_act_W: case S::closing_act_C:
+    case S::closing_act_CW: case S::closing_act_R: case S::closing_act_RW:
+    case S::closing_act_RC: case S::closing_act_RCW: case S::closing_eof:
+    case S::closing_eof_W: case S::closing_eof_C: case S::closing_eof_CW:
+    case S::closing_eof_P: case S::closing_eof_PW: case S::closing_eof_R:
+    case S::closing_eof_RW: case S::closing_eof_RC: case S::closing_eof_RCW:
+    case S::closing_eof_RP: case S::closing_eof_RPW:
+        return conn_phase::closing;
+    case S::fin_sent_act: case S::fin_sent_act_W: case S::fin_sent_act_C:
+    case S::fin_sent_act_CW: case S::fin_sent_act_R: case S::fin_sent_act_RW:
+    case S::fin_sent_act_RC: case S::fin_sent_act_RCW: case S::fin_sent_eof:
+    case S::fin_sent_eof_W: case S::fin_sent_eof_C: case S::fin_sent_eof_CW:
+    case S::fin_sent_eof_P: case S::fin_sent_eof_PW: case S::fin_sent_eof_R:
+    case S::fin_sent_eof_RW: case S::fin_sent_eof_RC: case S::fin_sent_eof_RCW:
+    case S::fin_sent_eof_RP: case S::fin_sent_eof_RPW:
+        return conn_phase::fin_sent;
+    case S::closed_act: case S::closed_act_C: case S::closed_eof:
+    case S::closed_eof_C: case S::closed_eof_P:
+        return conn_phase::closed;
+    default: break;
+    }
+    return conn_phase::open;
+}
+
+constexpr read_mode read_of(conn_state_id s) noexcept {
+    using S = conn_state_id;
+    switch (s) {
+    case S::open_pau: case S::open_pau_W: case S::draining_pau:
+    case S::draining_pau_W: case S::draining_pau_C: case S::draining_pau_CW:
+        return read_mode::paused;
+    case S::open_eof: case S::open_eof_W: case S::open_eof_P:
+    case S::open_eof_PW: case S::draining_eof: case S::draining_eof_W:
+    case S::draining_eof_C: case S::draining_eof_CW: case S::draining_eof_P:
+    case S::draining_eof_PW: case S::draining_eof_R: case S::draining_eof_RW:
+    case S::draining_eof_RC: case S::draining_eof_RCW: case S::draining_eof_RP:
+    case S::draining_eof_RPW: case S::closing_eof: case S::closing_eof_W:
+    case S::closing_eof_C: case S::closing_eof_CW: case S::closing_eof_P:
+    case S::closing_eof_PW: case S::closing_eof_R: case S::closing_eof_RW:
+    case S::closing_eof_RC: case S::closing_eof_RCW: case S::closing_eof_RP:
+    case S::closing_eof_RPW: case S::fin_sent_eof: case S::fin_sent_eof_W:
+    case S::fin_sent_eof_C: case S::fin_sent_eof_CW: case S::fin_sent_eof_P:
+    case S::fin_sent_eof_PW: case S::fin_sent_eof_R: case S::fin_sent_eof_RW:
+    case S::fin_sent_eof_RC: case S::fin_sent_eof_RCW: case S::fin_sent_eof_RP:
+    case S::fin_sent_eof_RPW: case S::closed_eof: case S::closed_eof_C:
+    case S::closed_eof_P:
+        return read_mode::eof;
+    default: break;
+    }
+    return read_mode::active;
+}
+
+constexpr close_round round_of(conn_state_id s) noexcept {
+    using S = conn_state_id;
+    switch (s) {
+    case S::draining_act_C: case S::draining_act_CW: case S::draining_act_RC:
+    case S::draining_act_RCW: case S::draining_pau_C: case S::draining_pau_CW:
+    case S::draining_eof_C: case S::draining_eof_CW: case S::draining_eof_RC:
+    case S::draining_eof_RCW: case S::closing_act_C: case S::closing_act_CW:
+    case S::closing_act_RC: case S::closing_act_RCW: case S::closing_eof_C:
+    case S::closing_eof_CW: case S::closing_eof_RC: case S::closing_eof_RCW:
+    case S::fin_sent_act_C: case S::fin_sent_act_CW: case S::fin_sent_act_RC:
+    case S::fin_sent_act_RCW: case S::fin_sent_eof_C: case S::fin_sent_eof_CW:
+    case S::fin_sent_eof_RC: case S::fin_sent_eof_RCW: case S::closed_act_C:
+    case S::closed_eof_C:
+        return close_round::close;
+    case S::open_eof_P: case S::open_eof_PW: case S::draining_eof_P:
+    case S::draining_eof_PW: case S::draining_eof_RP: case S::draining_eof_RPW:
+    case S::closing_eof_P: case S::closing_eof_PW: case S::closing_eof_RP:
+    case S::closing_eof_RPW: case S::fin_sent_eof_P: case S::fin_sent_eof_PW:
+    case S::fin_sent_eof_RP: case S::fin_sent_eof_RPW: case S::closed_eof_P:
+        return close_round::peer_closed;
+    default: break;
+    }
+    return close_round::none;
+}
+
+constexpr bool write_armed_of(conn_state_id s) noexcept {
+    using S = conn_state_id;
+    switch (s) {
+    case S::open_act_W: case S::open_pau_W: case S::open_eof_W:
+    case S::open_eof_PW: case S::draining_act_W: case S::draining_act_CW:
+    case S::draining_act_RW: case S::draining_act_RCW: case S::draining_pau_W:
+    case S::draining_pau_CW: case S::draining_eof_W: case S::draining_eof_CW:
+    case S::draining_eof_PW: case S::draining_eof_RW: case S::draining_eof_RCW:
+    case S::draining_eof_RPW: case S::closing_act_W: case S::closing_act_CW:
+    case S::closing_act_RW: case S::closing_act_RCW: case S::closing_eof_W:
+    case S::closing_eof_CW: case S::closing_eof_PW: case S::closing_eof_RW:
+    case S::closing_eof_RCW: case S::closing_eof_RPW: case S::fin_sent_act_W:
+    case S::fin_sent_act_CW: case S::fin_sent_act_RW: case S::fin_sent_act_RCW:
+    case S::fin_sent_eof_W: case S::fin_sent_eof_CW: case S::fin_sent_eof_PW:
+    case S::fin_sent_eof_RW: case S::fin_sent_eof_RCW:
+    case S::fin_sent_eof_RPW:
+        return true;
+    default: break;
+    }
+    return false;
+}
+
+constexpr bool in_round_of(conn_state_id s) noexcept {
+    using S = conn_state_id;
+    switch (s) {
+    case S::draining_act_R: case S::draining_act_RW: case S::draining_act_RC:
+    case S::draining_act_RCW: case S::draining_eof_R: case S::draining_eof_RW:
+    case S::draining_eof_RC: case S::draining_eof_RCW: case S::draining_eof_RP:
+    case S::draining_eof_RPW: case S::closing_act_R: case S::closing_act_RW:
+    case S::closing_act_RC: case S::closing_act_RCW: case S::closing_eof_R:
+    case S::closing_eof_RW: case S::closing_eof_RC: case S::closing_eof_RCW:
+    case S::closing_eof_RP: case S::closing_eof_RPW: case S::fin_sent_act_R:
+    case S::fin_sent_act_RW: case S::fin_sent_act_RC: case S::fin_sent_act_RCW:
+    case S::fin_sent_eof_R: case S::fin_sent_eof_RW: case S::fin_sent_eof_RC:
+    case S::fin_sent_eof_RCW: case S::fin_sent_eof_RP:
+    case S::fin_sent_eof_RPW:
+        return true;
+    default: break;
+    }
+    return false;
+}
+
+constexpr const char* name_of(conn_state_id s) noexcept {
+    switch (s) {
+    case conn_state_id::open_act: return "open_act";
+    case conn_state_id::open_act_W: return "open_act_W";
+    case conn_state_id::open_pau: return "open_pau";
+    case conn_state_id::open_pau_W: return "open_pau_W";
+    case conn_state_id::open_eof: return "open_eof";
+    case conn_state_id::open_eof_W: return "open_eof_W";
+    case conn_state_id::open_eof_P: return "open_eof_P";
+    case conn_state_id::open_eof_PW: return "open_eof_PW";
+    case conn_state_id::draining_act: return "draining_act";
+    case conn_state_id::draining_act_W: return "draining_act_W";
+    case conn_state_id::draining_act_C: return "draining_act_C";
+    case conn_state_id::draining_act_CW: return "draining_act_CW";
+    case conn_state_id::draining_act_R: return "draining_act_R";
+    case conn_state_id::draining_act_RW: return "draining_act_RW";
+    case conn_state_id::draining_act_RC: return "draining_act_RC";
+    case conn_state_id::draining_act_RCW: return "draining_act_RCW";
+    case conn_state_id::draining_pau: return "draining_pau";
+    case conn_state_id::draining_pau_W: return "draining_pau_W";
+    case conn_state_id::draining_pau_C: return "draining_pau_C";
+    case conn_state_id::draining_pau_CW: return "draining_pau_CW";
+    case conn_state_id::draining_eof: return "draining_eof";
+    case conn_state_id::draining_eof_W: return "draining_eof_W";
+    case conn_state_id::draining_eof_C: return "draining_eof_C";
+    case conn_state_id::draining_eof_CW: return "draining_eof_CW";
+    case conn_state_id::draining_eof_P: return "draining_eof_P";
+    case conn_state_id::draining_eof_PW: return "draining_eof_PW";
+    case conn_state_id::draining_eof_R: return "draining_eof_R";
+    case conn_state_id::draining_eof_RW: return "draining_eof_RW";
+    case conn_state_id::draining_eof_RC: return "draining_eof_RC";
+    case conn_state_id::draining_eof_RCW: return "draining_eof_RCW";
+    case conn_state_id::draining_eof_RP: return "draining_eof_RP";
+    case conn_state_id::draining_eof_RPW: return "draining_eof_RPW";
+    case conn_state_id::closing_act: return "closing_act";
+    case conn_state_id::closing_act_W: return "closing_act_W";
+    case conn_state_id::closing_act_C: return "closing_act_C";
+    case conn_state_id::closing_act_CW: return "closing_act_CW";
+    case conn_state_id::closing_act_R: return "closing_act_R";
+    case conn_state_id::closing_act_RW: return "closing_act_RW";
+    case conn_state_id::closing_act_RC: return "closing_act_RC";
+    case conn_state_id::closing_act_RCW: return "closing_act_RCW";
+    case conn_state_id::closing_eof: return "closing_eof";
+    case conn_state_id::closing_eof_W: return "closing_eof_W";
+    case conn_state_id::closing_eof_C: return "closing_eof_C";
+    case conn_state_id::closing_eof_CW: return "closing_eof_CW";
+    case conn_state_id::closing_eof_P: return "closing_eof_P";
+    case conn_state_id::closing_eof_PW: return "closing_eof_PW";
+    case conn_state_id::closing_eof_R: return "closing_eof_R";
+    case conn_state_id::closing_eof_RW: return "closing_eof_RW";
+    case conn_state_id::closing_eof_RC: return "closing_eof_RC";
+    case conn_state_id::closing_eof_RCW: return "closing_eof_RCW";
+    case conn_state_id::closing_eof_RP: return "closing_eof_RP";
+    case conn_state_id::closing_eof_RPW: return "closing_eof_RPW";
+    case conn_state_id::fin_sent_act: return "fin_sent_act";
+    case conn_state_id::fin_sent_act_W: return "fin_sent_act_W";
+    case conn_state_id::fin_sent_act_C: return "fin_sent_act_C";
+    case conn_state_id::fin_sent_act_CW: return "fin_sent_act_CW";
+    case conn_state_id::fin_sent_act_R: return "fin_sent_act_R";
+    case conn_state_id::fin_sent_act_RW: return "fin_sent_act_RW";
+    case conn_state_id::fin_sent_act_RC: return "fin_sent_act_RC";
+    case conn_state_id::fin_sent_act_RCW: return "fin_sent_act_RCW";
+    case conn_state_id::fin_sent_eof: return "fin_sent_eof";
+    case conn_state_id::fin_sent_eof_W: return "fin_sent_eof_W";
+    case conn_state_id::fin_sent_eof_C: return "fin_sent_eof_C";
+    case conn_state_id::fin_sent_eof_CW: return "fin_sent_eof_CW";
+    case conn_state_id::fin_sent_eof_P: return "fin_sent_eof_P";
+    case conn_state_id::fin_sent_eof_PW: return "fin_sent_eof_PW";
+    case conn_state_id::fin_sent_eof_R: return "fin_sent_eof_R";
+    case conn_state_id::fin_sent_eof_RW: return "fin_sent_eof_RW";
+    case conn_state_id::fin_sent_eof_RC: return "fin_sent_eof_RC";
+    case conn_state_id::fin_sent_eof_RCW: return "fin_sent_eof_RCW";
+    case conn_state_id::fin_sent_eof_RP: return "fin_sent_eof_RP";
+    case conn_state_id::fin_sent_eof_RPW: return "fin_sent_eof_RPW";
+    case conn_state_id::closed_act: return "closed_act";
+    case conn_state_id::closed_act_C: return "closed_act_C";
+    case conn_state_id::closed_eof: return "closed_eof";
+    case conn_state_id::closed_eof_C: return "closed_eof_C";
+    case conn_state_id::closed_eof_P: return "closed_eof_P";
+    }
+    return "?";
+}
+
+// Events. Each is a function of the state and, where the decision reads the
+// connection's buffers, of one guard.
+enum class conn_event : uint8_t {
+    pause,
+    resume,
+    eof,
+    write_on,
+    write_off,
+    graceful,
+    request,
+    round_begin,
+    round_end,
+    input_drained,
+    input_defer_failed,
+    peer_fin,
+    fin_sent,
+    closed,
+};
+
+// The facts an event branches on, reduced to the classes its decision
+// distinguishes. The reduction is lossless (the generator checks the oracle
+// against it over every combination of the facts).
+//   input_drained (a serving round finished):
+//     more       served > 0, rbuf still holds input, budget left
+//     served     served > 0 otherwise
+//     idle_owed  served == 0, replies are owed (pending > 0)
+//     idle_clear served == 0, nothing owed
+//   peer_fin (the peer's FIN, wbuf permitting):
+//     wbuf_busy  wbuf holds bytes: not our turn yet
+//     owed       wbuf empty, replies still reserved
+//     clear      wbuf empty, nothing owed
+enum class guard : uint8_t {
+    none,
+    more, served, idle_owed, idle_clear,
+    wbuf_busy, owed, clear,
+};
+
+inline constexpr guard input_guard(bool served, bool rbuf_nonempty,
+                                   bool budget_left, bool pending) noexcept {
+    if (served) {
+        const bool more = rbuf_nonempty && budget_left;
+        return more ? guard::more : guard::served;
+    }
+    return pending ? guard::idle_owed : guard::idle_clear;
+}
+inline constexpr guard peer_guard(bool wbuf_empty, bool pending) noexcept {
+    if (!wbuf_empty) return guard::wbuf_busy;
+    return pending ? guard::owed : guard::clear;
+}
+
+// Payload effects of a transition, applied by the wrapper that owns the
+// payloads (the table decides *whether*, the payload decides *what*).
+namespace conn_fx {
+constexpr uint8_t stamp = 1;    // the state's stamp := now
+constexpr uint8_t measure = 2;  // unmeasured budget := rbuf bytes
+constexpr uint8_t charge = 4;   // budget := max(0, budget - dealt)
+constexpr uint8_t resume = 8;   // reads were resumed: report it to the reactor
+}  // namespace conn_fx
+
+struct conn_step {
+    conn_state_id next;
+    close_action  action;
+    uint8_t       fx;
+};
+
+// (state, event, guard) -> (next, action, effects). Cells not listed leave the
+// state alone and do nothing; an event issued outside its precondition (see
+// conn_machine) is such a cell. An inline switch, not a data array: every
+// translation unit includes this header.
+constexpr conn_step transition(conn_state_id s, conn_event e,
+                              guard g) noexcept {
+    using S = conn_state_id;
+    using A = close_action;
+    (void)g;
+    switch (e) {
+    case conn_event::pause:
+        switch (s) {
+        case S::open_act: return {S::open_pau, A::none, conn_fx::stamp};
+        case S::open_act_W: return {S::open_pau_W, A::none, conn_fx::stamp};
+        case S::draining_act: return {S::draining_pau, A::none, conn_fx::stamp};
+        case S::draining_act_W:
+            return {S::draining_pau_W, A::none, conn_fx::stamp};
+        case S::draining_act_C:
+            return {S::draining_pau_C, A::none, conn_fx::stamp};
+        case S::draining_act_CW:
+            return {S::draining_pau_CW, A::none, conn_fx::stamp};
+        default: break;
+        }
+        break;
+    case conn_event::resume:
+        switch (s) {
+        case S::open_pau: return {S::open_act, A::none, conn_fx::resume};
+        case S::open_pau_W: return {S::open_act_W, A::none, conn_fx::resume};
+        case S::draining_pau:
+            return {S::draining_act, A::none, conn_fx::resume};
+        case S::draining_pau_W:
+            return {S::draining_act_W, A::none, conn_fx::resume};
+        case S::draining_pau_C:
+            return {S::draining_act_C, A::none, conn_fx::resume};
+        case S::draining_pau_CW:
+            return {S::draining_act_CW, A::none, conn_fx::resume};
+        default: break;
+        }
+        break;
+    case conn_event::eof:
+        switch (s) {
+        case S::open_act: return {S::open_eof, A::none, 0};
+        case S::open_act_W: return {S::open_eof_W, A::none, 0};
+        case S::open_pau: return {S::open_eof, A::none, 0};
+        case S::open_pau_W: return {S::open_eof_W, A::none, 0};
+        case S::draining_act: return {S::draining_eof, A::none, 0};
+        case S::draining_act_W: return {S::draining_eof_W, A::none, 0};
+        case S::draining_act_C: return {S::draining_eof_C, A::none, 0};
+        case S::draining_act_CW: return {S::draining_eof_CW, A::none, 0};
+        case S::draining_act_R: return {S::draining_eof_R, A::none, 0};
+        case S::draining_act_RW: return {S::draining_eof_RW, A::none, 0};
+        case S::draining_act_RC: return {S::draining_eof_RC, A::none, 0};
+        case S::draining_act_RCW: return {S::draining_eof_RCW, A::none, 0};
+        case S::draining_pau: return {S::draining_eof, A::none, 0};
+        case S::draining_pau_W: return {S::draining_eof_W, A::none, 0};
+        case S::draining_pau_C: return {S::draining_eof_C, A::none, 0};
+        case S::draining_pau_CW: return {S::draining_eof_CW, A::none, 0};
+        case S::closing_act: return {S::closing_eof, A::none, 0};
+        case S::closing_act_W: return {S::closing_eof_W, A::none, 0};
+        case S::closing_act_C: return {S::closing_eof_C, A::none, 0};
+        case S::closing_act_CW: return {S::closing_eof_CW, A::none, 0};
+        case S::closing_act_R: return {S::closing_eof_R, A::none, 0};
+        case S::closing_act_RW: return {S::closing_eof_RW, A::none, 0};
+        case S::closing_act_RC: return {S::closing_eof_RC, A::none, 0};
+        case S::closing_act_RCW: return {S::closing_eof_RCW, A::none, 0};
+        case S::fin_sent_act: return {S::fin_sent_eof, A::none, 0};
+        case S::fin_sent_act_W: return {S::fin_sent_eof_W, A::none, 0};
+        case S::fin_sent_act_C: return {S::fin_sent_eof_C, A::none, 0};
+        case S::fin_sent_act_CW: return {S::fin_sent_eof_CW, A::none, 0};
+        case S::fin_sent_act_R: return {S::fin_sent_eof_R, A::none, 0};
+        case S::fin_sent_act_RW: return {S::fin_sent_eof_RW, A::none, 0};
+        case S::fin_sent_act_RC: return {S::fin_sent_eof_RC, A::none, 0};
+        case S::fin_sent_act_RCW: return {S::fin_sent_eof_RCW, A::none, 0};
+        case S::closed_act: return {S::closed_eof, A::none, 0};
+        case S::closed_act_C: return {S::closed_eof_C, A::none, 0};
+        default: break;
+        }
+        break;
+    case conn_event::write_on:
+        switch (s) {
+        case S::open_act: return {S::open_act_W, A::none, 0};
+        case S::open_pau: return {S::open_pau_W, A::none, 0};
+        case S::open_eof: return {S::open_eof_W, A::none, 0};
+        case S::open_eof_P: return {S::open_eof_PW, A::none, 0};
+        case S::draining_act: return {S::draining_act_W, A::none, 0};
+        case S::draining_act_C: return {S::draining_act_CW, A::none, 0};
+        case S::draining_act_R: return {S::draining_act_RW, A::none, 0};
+        case S::draining_act_RC: return {S::draining_act_RCW, A::none, 0};
+        case S::draining_pau: return {S::draining_pau_W, A::none, 0};
+        case S::draining_pau_C: return {S::draining_pau_CW, A::none, 0};
+        case S::draining_eof: return {S::draining_eof_W, A::none, 0};
+        case S::draining_eof_C: return {S::draining_eof_CW, A::none, 0};
+        case S::draining_eof_P: return {S::draining_eof_PW, A::none, 0};
+        case S::draining_eof_R: return {S::draining_eof_RW, A::none, 0};
+        case S::draining_eof_RC: return {S::draining_eof_RCW, A::none, 0};
+        case S::draining_eof_RP: return {S::draining_eof_RPW, A::none, 0};
+        case S::closing_act: return {S::closing_act_W, A::none, 0};
+        case S::closing_act_C: return {S::closing_act_CW, A::none, 0};
+        case S::closing_act_R: return {S::closing_act_RW, A::none, 0};
+        case S::closing_act_RC: return {S::closing_act_RCW, A::none, 0};
+        case S::closing_eof: return {S::closing_eof_W, A::none, 0};
+        case S::closing_eof_C: return {S::closing_eof_CW, A::none, 0};
+        case S::closing_eof_P: return {S::closing_eof_PW, A::none, 0};
+        case S::closing_eof_R: return {S::closing_eof_RW, A::none, 0};
+        case S::closing_eof_RC: return {S::closing_eof_RCW, A::none, 0};
+        case S::closing_eof_RP: return {S::closing_eof_RPW, A::none, 0};
+        case S::fin_sent_act: return {S::fin_sent_act_W, A::none, 0};
+        case S::fin_sent_act_C: return {S::fin_sent_act_CW, A::none, 0};
+        case S::fin_sent_act_R: return {S::fin_sent_act_RW, A::none, 0};
+        case S::fin_sent_act_RC: return {S::fin_sent_act_RCW, A::none, 0};
+        case S::fin_sent_eof: return {S::fin_sent_eof_W, A::none, 0};
+        case S::fin_sent_eof_C: return {S::fin_sent_eof_CW, A::none, 0};
+        case S::fin_sent_eof_P: return {S::fin_sent_eof_PW, A::none, 0};
+        case S::fin_sent_eof_R: return {S::fin_sent_eof_RW, A::none, 0};
+        case S::fin_sent_eof_RC: return {S::fin_sent_eof_RCW, A::none, 0};
+        case S::fin_sent_eof_RP: return {S::fin_sent_eof_RPW, A::none, 0};
+        default: break;
+        }
+        break;
+    case conn_event::write_off:
+        switch (s) {
+        case S::open_act_W: return {S::open_act, A::none, 0};
+        case S::open_pau_W: return {S::open_pau, A::none, 0};
+        case S::open_eof_W: return {S::open_eof, A::none, 0};
+        case S::open_eof_PW: return {S::open_eof_P, A::none, 0};
+        case S::draining_act_W: return {S::draining_act, A::none, 0};
+        case S::draining_act_CW: return {S::draining_act_C, A::none, 0};
+        case S::draining_act_RW: return {S::draining_act_R, A::none, 0};
+        case S::draining_act_RCW: return {S::draining_act_RC, A::none, 0};
+        case S::draining_pau_W: return {S::draining_pau, A::none, 0};
+        case S::draining_pau_CW: return {S::draining_pau_C, A::none, 0};
+        case S::draining_eof_W: return {S::draining_eof, A::none, 0};
+        case S::draining_eof_CW: return {S::draining_eof_C, A::none, 0};
+        case S::draining_eof_PW: return {S::draining_eof_P, A::none, 0};
+        case S::draining_eof_RW: return {S::draining_eof_R, A::none, 0};
+        case S::draining_eof_RCW: return {S::draining_eof_RC, A::none, 0};
+        case S::draining_eof_RPW: return {S::draining_eof_RP, A::none, 0};
+        case S::closing_act_W: return {S::closing_act, A::none, 0};
+        case S::closing_act_CW: return {S::closing_act_C, A::none, 0};
+        case S::closing_act_RW: return {S::closing_act_R, A::none, 0};
+        case S::closing_act_RCW: return {S::closing_act_RC, A::none, 0};
+        case S::closing_eof_W: return {S::closing_eof, A::none, 0};
+        case S::closing_eof_CW: return {S::closing_eof_C, A::none, 0};
+        case S::closing_eof_PW: return {S::closing_eof_P, A::none, 0};
+        case S::closing_eof_RW: return {S::closing_eof_R, A::none, 0};
+        case S::closing_eof_RCW: return {S::closing_eof_RC, A::none, 0};
+        case S::closing_eof_RPW: return {S::closing_eof_RP, A::none, 0};
+        case S::fin_sent_act_W: return {S::fin_sent_act, A::none, 0};
+        case S::fin_sent_act_CW: return {S::fin_sent_act_C, A::none, 0};
+        case S::fin_sent_act_RW: return {S::fin_sent_act_R, A::none, 0};
+        case S::fin_sent_act_RCW: return {S::fin_sent_act_RC, A::none, 0};
+        case S::fin_sent_eof_W: return {S::fin_sent_eof, A::none, 0};
+        case S::fin_sent_eof_CW: return {S::fin_sent_eof_C, A::none, 0};
+        case S::fin_sent_eof_PW: return {S::fin_sent_eof_P, A::none, 0};
+        case S::fin_sent_eof_RW: return {S::fin_sent_eof_R, A::none, 0};
+        case S::fin_sent_eof_RCW: return {S::fin_sent_eof_RC, A::none, 0};
+        case S::fin_sent_eof_RPW: return {S::fin_sent_eof_RP, A::none, 0};
+        default: break;
+        }
+        break;
+    case conn_event::graceful:
+        switch (s) {
+        case S::open_act:
+            return {S::closing_act, A::drain_wbuf, conn_fx::stamp};
+        case S::open_act_W:
+            return {S::closing_act_W, A::drain_wbuf, conn_fx::stamp};
+        case S::open_pau:
+            return {S::closing_act, A::drain_wbuf,
+                    conn_fx::stamp | conn_fx::resume};
+        case S::open_pau_W:
+            return {S::closing_act_W, A::drain_wbuf,
+                    conn_fx::stamp | conn_fx::resume};
+        case S::open_eof:
+            return {S::closing_eof, A::drain_wbuf, conn_fx::stamp};
+        case S::open_eof_W:
+            return {S::closing_eof_W, A::drain_wbuf, conn_fx::stamp};
+        case S::open_eof_P:
+            return {S::closing_eof_P, A::drain_wbuf, conn_fx::stamp};
+        case S::open_eof_PW:
+            return {S::closing_eof_PW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act:
+            return {S::closing_act, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act_W:
+            return {S::closing_act_W, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act_C:
+            return {S::closing_act_C, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act_CW:
+            return {S::closing_act_CW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act_R:
+            return {S::closing_act_R, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act_RW:
+            return {S::closing_act_RW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act_RC:
+            return {S::closing_act_RC, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_act_RCW:
+            return {S::closing_act_RCW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_pau:
+            return {S::closing_act, A::drain_wbuf,
+                    conn_fx::stamp | conn_fx::resume};
+        case S::draining_pau_W:
+            return {S::closing_act_W, A::drain_wbuf,
+                    conn_fx::stamp | conn_fx::resume};
+        case S::draining_pau_C:
+            return {S::closing_act_C, A::drain_wbuf,
+                    conn_fx::stamp | conn_fx::resume};
+        case S::draining_pau_CW:
+            return {S::closing_act_CW, A::drain_wbuf,
+                    conn_fx::stamp | conn_fx::resume};
+        case S::draining_eof:
+            return {S::closing_eof, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_W:
+            return {S::closing_eof_W, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_C:
+            return {S::closing_eof_C, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_CW:
+            return {S::closing_eof_CW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_P:
+            return {S::closing_eof_P, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_PW:
+            return {S::closing_eof_PW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_R:
+            return {S::closing_eof_R, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_RW:
+            return {S::closing_eof_RW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_RC:
+            return {S::closing_eof_RC, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_RCW:
+            return {S::closing_eof_RCW, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_RP:
+            return {S::closing_eof_RP, A::drain_wbuf, conn_fx::stamp};
+        case S::draining_eof_RPW:
+            return {S::closing_eof_RPW, A::drain_wbuf, conn_fx::stamp};
+        case S::closing_act: return {S::closing_act, A::drain_wbuf, 0};
+        case S::closing_act_W: return {S::closing_act_W, A::drain_wbuf, 0};
+        case S::closing_act_C: return {S::closing_act_C, A::drain_wbuf, 0};
+        case S::closing_act_CW: return {S::closing_act_CW, A::drain_wbuf, 0};
+        case S::closing_act_R: return {S::closing_act_R, A::drain_wbuf, 0};
+        case S::closing_act_RW: return {S::closing_act_RW, A::drain_wbuf, 0};
+        case S::closing_act_RC: return {S::closing_act_RC, A::drain_wbuf, 0};
+        case S::closing_act_RCW: return {S::closing_act_RCW, A::drain_wbuf, 0};
+        case S::closing_eof: return {S::closing_eof, A::drain_wbuf, 0};
+        case S::closing_eof_W: return {S::closing_eof_W, A::drain_wbuf, 0};
+        case S::closing_eof_C: return {S::closing_eof_C, A::drain_wbuf, 0};
+        case S::closing_eof_CW: return {S::closing_eof_CW, A::drain_wbuf, 0};
+        case S::closing_eof_P: return {S::closing_eof_P, A::drain_wbuf, 0};
+        case S::closing_eof_PW: return {S::closing_eof_PW, A::drain_wbuf, 0};
+        case S::closing_eof_R: return {S::closing_eof_R, A::drain_wbuf, 0};
+        case S::closing_eof_RW: return {S::closing_eof_RW, A::drain_wbuf, 0};
+        case S::closing_eof_RC: return {S::closing_eof_RC, A::drain_wbuf, 0};
+        case S::closing_eof_RCW: return {S::closing_eof_RCW, A::drain_wbuf, 0};
+        case S::closing_eof_RP: return {S::closing_eof_RP, A::drain_wbuf, 0};
+        case S::closing_eof_RPW: return {S::closing_eof_RPW, A::drain_wbuf, 0};
+        default: break;
+        }
+        break;
+    case conn_event::request:
+        switch (s) {
+        case S::open_act:
+            return {S::draining_act, A::drain_input, conn_fx::measure};
+        case S::open_act_W:
+            return {S::draining_act_W, A::drain_input, conn_fx::measure};
+        case S::open_pau:
+            return {S::draining_act, A::drain_input,
+                    conn_fx::measure | conn_fx::resume};
+        case S::open_pau_W:
+            return {S::draining_act_W, A::drain_input,
+                    conn_fx::measure | conn_fx::resume};
+        case S::open_eof:
+            return {S::draining_eof, A::drain_input, conn_fx::measure};
+        case S::open_eof_W:
+            return {S::draining_eof_W, A::drain_input, conn_fx::measure};
+        case S::open_eof_P:
+            return {S::draining_eof_P, A::drain_input, conn_fx::measure};
+        case S::open_eof_PW:
+            return {S::draining_eof_PW, A::drain_input, conn_fx::measure};
+        case S::draining_act: return {S::draining_act, A::drain_input, 0};
+        case S::draining_act_W: return {S::draining_act_W, A::drain_input, 0};
+        case S::draining_act_C: return {S::draining_act_C, A::drain_input, 0};
+        case S::draining_act_CW: return {S::draining_act_CW, A::drain_input, 0};
+        case S::draining_act_R: return {S::draining_act_R, A::drain_input, 0};
+        case S::draining_act_RW: return {S::draining_act_RW, A::drain_input, 0};
+        case S::draining_act_RC: return {S::draining_act_RC, A::drain_input, 0};
+        case S::draining_act_RCW:
+            return {S::draining_act_RCW, A::drain_input, 0};
+        case S::draining_pau:
+            return {S::draining_act, A::drain_input, conn_fx::resume};
+        case S::draining_pau_W:
+            return {S::draining_act_W, A::drain_input, conn_fx::resume};
+        case S::draining_pau_C:
+            return {S::draining_act_C, A::drain_input, conn_fx::resume};
+        case S::draining_pau_CW:
+            return {S::draining_act_CW, A::drain_input, conn_fx::resume};
+        case S::draining_eof: return {S::draining_eof, A::drain_input, 0};
+        case S::draining_eof_W: return {S::draining_eof_W, A::drain_input, 0};
+        case S::draining_eof_C: return {S::draining_eof_C, A::drain_input, 0};
+        case S::draining_eof_CW: return {S::draining_eof_CW, A::drain_input, 0};
+        case S::draining_eof_P: return {S::draining_eof_P, A::drain_input, 0};
+        case S::draining_eof_PW: return {S::draining_eof_PW, A::drain_input, 0};
+        case S::draining_eof_R: return {S::draining_eof_R, A::drain_input, 0};
+        case S::draining_eof_RW: return {S::draining_eof_RW, A::drain_input, 0};
+        case S::draining_eof_RC: return {S::draining_eof_RC, A::drain_input, 0};
+        case S::draining_eof_RCW:
+            return {S::draining_eof_RCW, A::drain_input, 0};
+        case S::draining_eof_RP: return {S::draining_eof_RP, A::drain_input, 0};
+        case S::draining_eof_RPW:
+            return {S::draining_eof_RPW, A::drain_input, 0};
+        case S::closing_act:
+            return {S::closing_act, A::drain_input, conn_fx::measure};
+        case S::closing_act_W:
+            return {S::closing_act_W, A::drain_input, conn_fx::measure};
+        case S::closing_act_C:
+            return {S::closing_act_C, A::drain_input, conn_fx::measure};
+        case S::closing_act_CW:
+            return {S::closing_act_CW, A::drain_input, conn_fx::measure};
+        case S::closing_act_R:
+            return {S::closing_act_R, A::drain_input, conn_fx::measure};
+        case S::closing_act_RW:
+            return {S::closing_act_RW, A::drain_input, conn_fx::measure};
+        case S::closing_act_RC:
+            return {S::closing_act_RC, A::drain_input, conn_fx::measure};
+        case S::closing_act_RCW:
+            return {S::closing_act_RCW, A::drain_input, conn_fx::measure};
+        case S::closing_eof:
+            return {S::closing_eof, A::drain_input, conn_fx::measure};
+        case S::closing_eof_W:
+            return {S::closing_eof_W, A::drain_input, conn_fx::measure};
+        case S::closing_eof_C:
+            return {S::closing_eof_C, A::drain_input, conn_fx::measure};
+        case S::closing_eof_CW:
+            return {S::closing_eof_CW, A::drain_input, conn_fx::measure};
+        case S::closing_eof_P:
+            return {S::closing_eof_P, A::drain_input, conn_fx::measure};
+        case S::closing_eof_PW:
+            return {S::closing_eof_PW, A::drain_input, conn_fx::measure};
+        case S::closing_eof_R:
+            return {S::closing_eof_R, A::drain_input, conn_fx::measure};
+        case S::closing_eof_RW:
+            return {S::closing_eof_RW, A::drain_input, conn_fx::measure};
+        case S::closing_eof_RC:
+            return {S::closing_eof_RC, A::drain_input, conn_fx::measure};
+        case S::closing_eof_RCW:
+            return {S::closing_eof_RCW, A::drain_input, conn_fx::measure};
+        case S::closing_eof_RP:
+            return {S::closing_eof_RP, A::drain_input, conn_fx::measure};
+        case S::closing_eof_RPW:
+            return {S::closing_eof_RPW, A::drain_input, conn_fx::measure};
+        default: break;
+        }
+        break;
+    case conn_event::round_begin:
+        switch (s) {
+        case S::draining_act: return {S::draining_act_R, A::none, 0};
+        case S::draining_act_W: return {S::draining_act_RW, A::none, 0};
+        case S::draining_act_C: return {S::draining_act_RC, A::none, 0};
+        case S::draining_act_CW: return {S::draining_act_RCW, A::none, 0};
+        case S::draining_eof: return {S::draining_eof_R, A::none, 0};
+        case S::draining_eof_W: return {S::draining_eof_RW, A::none, 0};
+        case S::draining_eof_C: return {S::draining_eof_RC, A::none, 0};
+        case S::draining_eof_CW: return {S::draining_eof_RCW, A::none, 0};
+        case S::draining_eof_P: return {S::draining_eof_RP, A::none, 0};
+        case S::draining_eof_PW: return {S::draining_eof_RPW, A::none, 0};
+        case S::closing_act: return {S::closing_act_R, A::none, 0};
+        case S::closing_act_W: return {S::closing_act_RW, A::none, 0};
+        case S::closing_act_C: return {S::closing_act_RC, A::none, 0};
+        case S::closing_act_CW: return {S::closing_act_RCW, A::none, 0};
+        case S::closing_eof: return {S::closing_eof_R, A::none, 0};
+        case S::closing_eof_W: return {S::closing_eof_RW, A::none, 0};
+        case S::closing_eof_C: return {S::closing_eof_RC, A::none, 0};
+        case S::closing_eof_CW: return {S::closing_eof_RCW, A::none, 0};
+        case S::closing_eof_P: return {S::closing_eof_RP, A::none, 0};
+        case S::closing_eof_PW: return {S::closing_eof_RPW, A::none, 0};
+        default: break;
+        }
+        break;
+    case conn_event::round_end:
+        switch (s) {
+        case S::draining_act_R: return {S::draining_act, A::none, 0};
+        case S::draining_act_RW: return {S::draining_act_W, A::none, 0};
+        case S::draining_act_RC: return {S::draining_act_C, A::none, 0};
+        case S::draining_act_RCW: return {S::draining_act_CW, A::none, 0};
+        case S::draining_eof_R: return {S::draining_eof, A::none, 0};
+        case S::draining_eof_RW: return {S::draining_eof_W, A::none, 0};
+        case S::draining_eof_RC: return {S::draining_eof_C, A::none, 0};
+        case S::draining_eof_RCW: return {S::draining_eof_CW, A::none, 0};
+        case S::draining_eof_RP: return {S::draining_eof_P, A::none, 0};
+        case S::draining_eof_RPW: return {S::draining_eof_PW, A::none, 0};
+        case S::closing_act_R: return {S::closing_act, A::none, 0};
+        case S::closing_act_RW: return {S::closing_act_W, A::none, 0};
+        case S::closing_act_RC: return {S::closing_act_C, A::none, 0};
+        case S::closing_act_RCW: return {S::closing_act_CW, A::none, 0};
+        case S::closing_eof_R: return {S::closing_eof, A::none, 0};
+        case S::closing_eof_RW: return {S::closing_eof_W, A::none, 0};
+        case S::closing_eof_RC: return {S::closing_eof_C, A::none, 0};
+        case S::closing_eof_RCW: return {S::closing_eof_CW, A::none, 0};
+        case S::closing_eof_RP: return {S::closing_eof_P, A::none, 0};
+        case S::closing_eof_RPW: return {S::closing_eof_PW, A::none, 0};
+        case S::fin_sent_act_R: return {S::fin_sent_act, A::none, 0};
+        case S::fin_sent_act_RW: return {S::fin_sent_act_W, A::none, 0};
+        case S::fin_sent_act_RC: return {S::fin_sent_act_C, A::none, 0};
+        case S::fin_sent_act_RCW: return {S::fin_sent_act_CW, A::none, 0};
+        case S::fin_sent_eof_R: return {S::fin_sent_eof, A::none, 0};
+        case S::fin_sent_eof_RW: return {S::fin_sent_eof_W, A::none, 0};
+        case S::fin_sent_eof_RC: return {S::fin_sent_eof_C, A::none, 0};
+        case S::fin_sent_eof_RCW: return {S::fin_sent_eof_CW, A::none, 0};
+        case S::fin_sent_eof_RP: return {S::fin_sent_eof_P, A::none, 0};
+        case S::fin_sent_eof_RPW: return {S::fin_sent_eof_PW, A::none, 0};
+        default: break;
+        }
+        break;
+    case conn_event::input_drained:
+        switch (g) {
+        case guard::more:
+            switch (s) {
+            case S::draining_act:
+                return {S::draining_act, A::defer_drain_input, conn_fx::charge};
+            case S::draining_act_W:
+                return {S::draining_act_W, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_act_C:
+                return {S::draining_act_C, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_act_CW:
+                return {S::draining_act_CW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_act_R:
+                return {S::draining_act_R, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_act_RW:
+                return {S::draining_act_RW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_act_RC:
+                return {S::draining_act_RC, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_act_RCW:
+                return {S::draining_act_RCW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_pau:
+                return {S::draining_pau, A::defer_drain_input, conn_fx::charge};
+            case S::draining_pau_W:
+                return {S::draining_pau_W, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_pau_C:
+                return {S::draining_pau_C, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_pau_CW:
+                return {S::draining_pau_CW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof:
+                return {S::draining_eof, A::defer_drain_input, conn_fx::charge};
+            case S::draining_eof_W:
+                return {S::draining_eof_W, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_C:
+                return {S::draining_eof_C, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_CW:
+                return {S::draining_eof_CW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_P:
+                return {S::draining_eof_P, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_PW:
+                return {S::draining_eof_PW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_R:
+                return {S::draining_eof_R, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_RW:
+                return {S::draining_eof_RW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_RC:
+                return {S::draining_eof_RC, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_RCW:
+                return {S::draining_eof_RCW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_RP:
+                return {S::draining_eof_RP, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::draining_eof_RPW:
+                return {S::draining_eof_RPW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_act:
+                return {S::closing_act, A::defer_drain_input, conn_fx::charge};
+            case S::closing_act_W:
+                return {S::closing_act_W, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_act_C:
+                return {S::closing_act_C, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_act_CW:
+                return {S::closing_act_CW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_act_R:
+                return {S::closing_act_R, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_act_RW:
+                return {S::closing_act_RW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_act_RC:
+                return {S::closing_act_RC, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_act_RCW:
+                return {S::closing_act_RCW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof:
+                return {S::closing_eof, A::defer_drain_input, conn_fx::charge};
+            case S::closing_eof_W:
+                return {S::closing_eof_W, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_C:
+                return {S::closing_eof_C, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_CW:
+                return {S::closing_eof_CW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_P:
+                return {S::closing_eof_P, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_PW:
+                return {S::closing_eof_PW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_R:
+                return {S::closing_eof_R, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_RW:
+                return {S::closing_eof_RW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_RC:
+                return {S::closing_eof_RC, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_RCW:
+                return {S::closing_eof_RCW, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_RP:
+                return {S::closing_eof_RP, A::defer_drain_input,
+                        conn_fx::charge};
+            case S::closing_eof_RPW:
+                return {S::closing_eof_RPW, A::defer_drain_input,
+                        conn_fx::charge};
+            default: break;
+            }
+            break;
+        case guard::served:
+            switch (s) {
+            case S::draining_act:
+                return {S::draining_act_C, A::defer_park, conn_fx::charge};
+            case S::draining_act_W:
+                return {S::draining_act_CW, A::defer_park, conn_fx::charge};
+            case S::draining_act_C:
+                return {S::draining_act_C, A::drain_wbuf, conn_fx::charge};
+            case S::draining_act_CW:
+                return {S::draining_act_CW, A::drain_wbuf, conn_fx::charge};
+            case S::draining_act_R:
+                return {S::draining_act_RC, A::defer_park, conn_fx::charge};
+            case S::draining_act_RW:
+                return {S::draining_act_RCW, A::defer_park, conn_fx::charge};
+            case S::draining_act_RC:
+                return {S::draining_act_RC, A::drain_wbuf, conn_fx::charge};
+            case S::draining_act_RCW:
+                return {S::draining_act_RCW, A::drain_wbuf, conn_fx::charge};
+            case S::draining_pau:
+                return {S::draining_pau_C, A::defer_park, conn_fx::charge};
+            case S::draining_pau_W:
+                return {S::draining_pau_CW, A::defer_park, conn_fx::charge};
+            case S::draining_pau_C:
+                return {S::draining_pau_C, A::drain_wbuf, conn_fx::charge};
+            case S::draining_pau_CW:
+                return {S::draining_pau_CW, A::drain_wbuf, conn_fx::charge};
+            case S::draining_eof:
+                return {S::draining_eof_C, A::defer_park, conn_fx::charge};
+            case S::draining_eof_W:
+                return {S::draining_eof_CW, A::defer_park, conn_fx::charge};
+            case S::draining_eof_C:
+                return {S::draining_eof_C, A::drain_wbuf, conn_fx::charge};
+            case S::draining_eof_CW:
+                return {S::draining_eof_CW, A::drain_wbuf, conn_fx::charge};
+            case S::draining_eof_P:
+                return {S::draining_eof_P, A::none, conn_fx::charge};
+            case S::draining_eof_PW:
+                return {S::draining_eof_PW, A::none, conn_fx::charge};
+            case S::draining_eof_R:
+                return {S::draining_eof_RC, A::defer_park, conn_fx::charge};
+            case S::draining_eof_RW:
+                return {S::draining_eof_RCW, A::defer_park, conn_fx::charge};
+            case S::draining_eof_RC:
+                return {S::draining_eof_RC, A::drain_wbuf, conn_fx::charge};
+            case S::draining_eof_RCW:
+                return {S::draining_eof_RCW, A::drain_wbuf, conn_fx::charge};
+            case S::draining_eof_RP:
+                return {S::draining_eof_RP, A::none, conn_fx::charge};
+            case S::draining_eof_RPW:
+                return {S::draining_eof_RPW, A::none, conn_fx::charge};
+            case S::closing_act:
+                return {S::closing_act_C, A::defer_park, conn_fx::charge};
+            case S::closing_act_W:
+                return {S::closing_act_CW, A::defer_park, conn_fx::charge};
+            case S::closing_act_C:
+                return {S::closing_act_C, A::drain_wbuf, conn_fx::charge};
+            case S::closing_act_CW:
+                return {S::closing_act_CW, A::drain_wbuf, conn_fx::charge};
+            case S::closing_act_R:
+                return {S::closing_act_RC, A::defer_park, conn_fx::charge};
+            case S::closing_act_RW:
+                return {S::closing_act_RCW, A::defer_park, conn_fx::charge};
+            case S::closing_act_RC:
+                return {S::closing_act_RC, A::drain_wbuf, conn_fx::charge};
+            case S::closing_act_RCW:
+                return {S::closing_act_RCW, A::drain_wbuf, conn_fx::charge};
+            case S::closing_eof:
+                return {S::closing_eof_C, A::defer_park, conn_fx::charge};
+            case S::closing_eof_W:
+                return {S::closing_eof_CW, A::defer_park, conn_fx::charge};
+            case S::closing_eof_C:
+                return {S::closing_eof_C, A::drain_wbuf, conn_fx::charge};
+            case S::closing_eof_CW:
+                return {S::closing_eof_CW, A::drain_wbuf, conn_fx::charge};
+            case S::closing_eof_P:
+                return {S::closing_eof_P, A::none, conn_fx::charge};
+            case S::closing_eof_PW:
+                return {S::closing_eof_PW, A::none, conn_fx::charge};
+            case S::closing_eof_R:
+                return {S::closing_eof_RC, A::defer_park, conn_fx::charge};
+            case S::closing_eof_RW:
+                return {S::closing_eof_RCW, A::defer_park, conn_fx::charge};
+            case S::closing_eof_RC:
+                return {S::closing_eof_RC, A::drain_wbuf, conn_fx::charge};
+            case S::closing_eof_RCW:
+                return {S::closing_eof_RCW, A::drain_wbuf, conn_fx::charge};
+            case S::closing_eof_RP:
+                return {S::closing_eof_RP, A::none, conn_fx::charge};
+            case S::closing_eof_RPW:
+                return {S::closing_eof_RPW, A::none, conn_fx::charge};
+            default: break;
+            }
+            break;
+        case guard::idle_owed:
+            switch (s) {
+            case S::draining_act: return {S::draining_act_C, A::defer_park, 0};
+            case S::draining_act_W:
+                return {S::draining_act_CW, A::defer_park, 0};
+            case S::draining_act_C:
+                return {S::draining_act_C, A::drain_wbuf, 0};
+            case S::draining_act_CW:
+                return {S::draining_act_CW, A::drain_wbuf, 0};
+            case S::draining_act_R:
+                return {S::draining_act_RC, A::defer_park, 0};
+            case S::draining_act_RW:
+                return {S::draining_act_RCW, A::defer_park, 0};
+            case S::draining_act_RC:
+                return {S::draining_act_RC, A::drain_wbuf, 0};
+            case S::draining_act_RCW:
+                return {S::draining_act_RCW, A::drain_wbuf, 0};
+            case S::draining_pau: return {S::draining_pau_C, A::defer_park, 0};
+            case S::draining_pau_W:
+                return {S::draining_pau_CW, A::defer_park, 0};
+            case S::draining_pau_C:
+                return {S::draining_pau_C, A::drain_wbuf, 0};
+            case S::draining_pau_CW:
+                return {S::draining_pau_CW, A::drain_wbuf, 0};
+            case S::draining_eof: return {S::draining_eof_C, A::defer_park, 0};
+            case S::draining_eof_W:
+                return {S::draining_eof_CW, A::defer_park, 0};
+            case S::draining_eof_C:
+                return {S::draining_eof_C, A::drain_wbuf, 0};
+            case S::draining_eof_CW:
+                return {S::draining_eof_CW, A::drain_wbuf, 0};
+            case S::draining_eof_R:
+                return {S::draining_eof_RC, A::defer_park, 0};
+            case S::draining_eof_RW:
+                return {S::draining_eof_RCW, A::defer_park, 0};
+            case S::draining_eof_RC:
+                return {S::draining_eof_RC, A::drain_wbuf, 0};
+            case S::draining_eof_RCW:
+                return {S::draining_eof_RCW, A::drain_wbuf, 0};
+            case S::closing_act: return {S::closing_act_C, A::defer_park, 0};
+            case S::closing_act_W: return {S::closing_act_CW, A::defer_park, 0};
+            case S::closing_act_C: return {S::closing_act_C, A::drain_wbuf, 0};
+            case S::closing_act_CW:
+                return {S::closing_act_CW, A::drain_wbuf, 0};
+            case S::closing_act_R: return {S::closing_act_RC, A::defer_park, 0};
+            case S::closing_act_RW:
+                return {S::closing_act_RCW, A::defer_park, 0};
+            case S::closing_act_RC:
+                return {S::closing_act_RC, A::drain_wbuf, 0};
+            case S::closing_act_RCW:
+                return {S::closing_act_RCW, A::drain_wbuf, 0};
+            case S::closing_eof: return {S::closing_eof_C, A::defer_park, 0};
+            case S::closing_eof_W: return {S::closing_eof_CW, A::defer_park, 0};
+            case S::closing_eof_C: return {S::closing_eof_C, A::drain_wbuf, 0};
+            case S::closing_eof_CW:
+                return {S::closing_eof_CW, A::drain_wbuf, 0};
+            case S::closing_eof_R: return {S::closing_eof_RC, A::defer_park, 0};
+            case S::closing_eof_RW:
+                return {S::closing_eof_RCW, A::defer_park, 0};
+            case S::closing_eof_RC:
+                return {S::closing_eof_RC, A::drain_wbuf, 0};
+            case S::closing_eof_RCW:
+                return {S::closing_eof_RCW, A::drain_wbuf, 0};
+            default: break;
+            }
+            break;
+        case guard::idle_clear:
+            switch (s) {
+            case S::draining_act: return {S::draining_act, A::drain_wbuf, 0};
+            case S::draining_act_W:
+                return {S::draining_act_W, A::drain_wbuf, 0};
+            case S::draining_act_C:
+                return {S::draining_act_C, A::drain_wbuf, 0};
+            case S::draining_act_CW:
+                return {S::draining_act_CW, A::drain_wbuf, 0};
+            case S::draining_act_R:
+                return {S::draining_act_R, A::drain_wbuf, 0};
+            case S::draining_act_RW:
+                return {S::draining_act_RW, A::drain_wbuf, 0};
+            case S::draining_act_RC:
+                return {S::draining_act_RC, A::drain_wbuf, 0};
+            case S::draining_act_RCW:
+                return {S::draining_act_RCW, A::drain_wbuf, 0};
+            case S::draining_pau: return {S::draining_pau, A::drain_wbuf, 0};
+            case S::draining_pau_W:
+                return {S::draining_pau_W, A::drain_wbuf, 0};
+            case S::draining_pau_C:
+                return {S::draining_pau_C, A::drain_wbuf, 0};
+            case S::draining_pau_CW:
+                return {S::draining_pau_CW, A::drain_wbuf, 0};
+            case S::draining_eof: return {S::draining_eof, A::drain_wbuf, 0};
+            case S::draining_eof_W:
+                return {S::draining_eof_W, A::drain_wbuf, 0};
+            case S::draining_eof_C:
+                return {S::draining_eof_C, A::drain_wbuf, 0};
+            case S::draining_eof_CW:
+                return {S::draining_eof_CW, A::drain_wbuf, 0};
+            case S::draining_eof_R:
+                return {S::draining_eof_R, A::drain_wbuf, 0};
+            case S::draining_eof_RW:
+                return {S::draining_eof_RW, A::drain_wbuf, 0};
+            case S::draining_eof_RC:
+                return {S::draining_eof_RC, A::drain_wbuf, 0};
+            case S::draining_eof_RCW:
+                return {S::draining_eof_RCW, A::drain_wbuf, 0};
+            case S::closing_act: return {S::closing_act, A::drain_wbuf, 0};
+            case S::closing_act_W: return {S::closing_act_W, A::drain_wbuf, 0};
+            case S::closing_act_C: return {S::closing_act_C, A::drain_wbuf, 0};
+            case S::closing_act_CW:
+                return {S::closing_act_CW, A::drain_wbuf, 0};
+            case S::closing_act_R: return {S::closing_act_R, A::drain_wbuf, 0};
+            case S::closing_act_RW:
+                return {S::closing_act_RW, A::drain_wbuf, 0};
+            case S::closing_act_RC:
+                return {S::closing_act_RC, A::drain_wbuf, 0};
+            case S::closing_act_RCW:
+                return {S::closing_act_RCW, A::drain_wbuf, 0};
+            case S::closing_eof: return {S::closing_eof, A::drain_wbuf, 0};
+            case S::closing_eof_W: return {S::closing_eof_W, A::drain_wbuf, 0};
+            case S::closing_eof_C: return {S::closing_eof_C, A::drain_wbuf, 0};
+            case S::closing_eof_CW:
+                return {S::closing_eof_CW, A::drain_wbuf, 0};
+            case S::closing_eof_R: return {S::closing_eof_R, A::drain_wbuf, 0};
+            case S::closing_eof_RW:
+                return {S::closing_eof_RW, A::drain_wbuf, 0};
+            case S::closing_eof_RC:
+                return {S::closing_eof_RC, A::drain_wbuf, 0};
+            case S::closing_eof_RCW:
+                return {S::closing_eof_RCW, A::drain_wbuf, 0};
+            default: break;
+            }
+            break;
+        default: break;
+        }
+        break;
+    case conn_event::input_defer_failed:
+        switch (s) {
+        case S::draining_act: return {S::draining_act_C, A::defer_park, 0};
+        case S::draining_act_W: return {S::draining_act_CW, A::defer_park, 0};
+        case S::draining_act_C: return {S::draining_act_C, A::drain_wbuf, 0};
+        case S::draining_act_CW: return {S::draining_act_CW, A::drain_wbuf, 0};
+        case S::draining_act_R: return {S::draining_act_RC, A::defer_park, 0};
+        case S::draining_act_RW: return {S::draining_act_RCW, A::defer_park, 0};
+        case S::draining_act_RC: return {S::draining_act_RC, A::drain_wbuf, 0};
+        case S::draining_act_RCW:
+            return {S::draining_act_RCW, A::drain_wbuf, 0};
+        case S::draining_pau: return {S::draining_pau_C, A::defer_park, 0};
+        case S::draining_pau_W: return {S::draining_pau_CW, A::defer_park, 0};
+        case S::draining_pau_C: return {S::draining_pau_C, A::drain_wbuf, 0};
+        case S::draining_pau_CW: return {S::draining_pau_CW, A::drain_wbuf, 0};
+        case S::draining_eof: return {S::draining_eof_C, A::defer_park, 0};
+        case S::draining_eof_W: return {S::draining_eof_CW, A::defer_park, 0};
+        case S::draining_eof_C: return {S::draining_eof_C, A::drain_wbuf, 0};
+        case S::draining_eof_CW: return {S::draining_eof_CW, A::drain_wbuf, 0};
+        case S::draining_eof_R: return {S::draining_eof_RC, A::defer_park, 0};
+        case S::draining_eof_RW: return {S::draining_eof_RCW, A::defer_park, 0};
+        case S::draining_eof_RC: return {S::draining_eof_RC, A::drain_wbuf, 0};
+        case S::draining_eof_RCW:
+            return {S::draining_eof_RCW, A::drain_wbuf, 0};
+        case S::closing_act: return {S::closing_act_C, A::defer_park, 0};
+        case S::closing_act_W: return {S::closing_act_CW, A::defer_park, 0};
+        case S::closing_act_C: return {S::closing_act_C, A::drain_wbuf, 0};
+        case S::closing_act_CW: return {S::closing_act_CW, A::drain_wbuf, 0};
+        case S::closing_act_R: return {S::closing_act_RC, A::defer_park, 0};
+        case S::closing_act_RW: return {S::closing_act_RCW, A::defer_park, 0};
+        case S::closing_act_RC: return {S::closing_act_RC, A::drain_wbuf, 0};
+        case S::closing_act_RCW: return {S::closing_act_RCW, A::drain_wbuf, 0};
+        case S::closing_eof: return {S::closing_eof_C, A::defer_park, 0};
+        case S::closing_eof_W: return {S::closing_eof_CW, A::defer_park, 0};
+        case S::closing_eof_C: return {S::closing_eof_C, A::drain_wbuf, 0};
+        case S::closing_eof_CW: return {S::closing_eof_CW, A::drain_wbuf, 0};
+        case S::closing_eof_R: return {S::closing_eof_RC, A::defer_park, 0};
+        case S::closing_eof_RW: return {S::closing_eof_RCW, A::defer_park, 0};
+        case S::closing_eof_RC: return {S::closing_eof_RC, A::drain_wbuf, 0};
+        case S::closing_eof_RCW: return {S::closing_eof_RCW, A::drain_wbuf, 0};
+        case S::fin_sent_act: return {S::fin_sent_act_C, A::defer_park, 0};
+        case S::fin_sent_act_W: return {S::fin_sent_act_CW, A::defer_park, 0};
+        case S::fin_sent_act_C: return {S::fin_sent_act_C, A::drain_wbuf, 0};
+        case S::fin_sent_act_CW: return {S::fin_sent_act_CW, A::drain_wbuf, 0};
+        case S::fin_sent_act_R: return {S::fin_sent_act_RC, A::defer_park, 0};
+        case S::fin_sent_act_RW: return {S::fin_sent_act_RCW, A::defer_park, 0};
+        case S::fin_sent_act_RC: return {S::fin_sent_act_RC, A::drain_wbuf, 0};
+        case S::fin_sent_act_RCW:
+            return {S::fin_sent_act_RCW, A::drain_wbuf, 0};
+        case S::fin_sent_eof: return {S::fin_sent_eof_C, A::defer_park, 0};
+        case S::fin_sent_eof_W: return {S::fin_sent_eof_CW, A::defer_park, 0};
+        case S::fin_sent_eof_C: return {S::fin_sent_eof_C, A::drain_wbuf, 0};
+        case S::fin_sent_eof_CW: return {S::fin_sent_eof_CW, A::drain_wbuf, 0};
+        case S::fin_sent_eof_R: return {S::fin_sent_eof_RC, A::defer_park, 0};
+        case S::fin_sent_eof_RW: return {S::fin_sent_eof_RCW, A::defer_park, 0};
+        case S::fin_sent_eof_RC: return {S::fin_sent_eof_RC, A::drain_wbuf, 0};
+        case S::fin_sent_eof_RCW:
+            return {S::fin_sent_eof_RCW, A::drain_wbuf, 0};
+        case S::closed_act: return {S::closed_act_C, A::defer_park, 0};
+        case S::closed_act_C: return {S::closed_act_C, A::drain_wbuf, 0};
+        case S::closed_eof: return {S::closed_eof_C, A::defer_park, 0};
+        case S::closed_eof_C: return {S::closed_eof_C, A::drain_wbuf, 0};
+        default: break;
+        }
+        break;
+    case conn_event::peer_fin:
+        switch (g) {
+        case guard::wbuf_busy:
+            switch (s) {
+            default: break;
+            }
+            break;
+        case guard::owed:
+            switch (s) {
+            case S::open_eof: return {S::open_eof_P, A::defer_peer_closed, 0};
+            case S::open_eof_W:
+                return {S::open_eof_PW, A::defer_peer_closed, 0};
+            case S::open_eof_P: return {S::open_eof_P, A::close_graceful, 0};
+            case S::open_eof_PW: return {S::open_eof_PW, A::close_graceful, 0};
+            case S::draining_eof:
+                return {S::draining_eof_P, A::defer_peer_closed, 0};
+            case S::draining_eof_W:
+                return {S::draining_eof_PW, A::defer_peer_closed, 0};
+            case S::draining_eof_C:
+                return {S::draining_eof_P, A::defer_peer_closed, 0};
+            case S::draining_eof_CW:
+                return {S::draining_eof_PW, A::defer_peer_closed, 0};
+            case S::draining_eof_P:
+                return {S::draining_eof_P, A::close_graceful, 0};
+            case S::draining_eof_PW:
+                return {S::draining_eof_PW, A::close_graceful, 0};
+            case S::draining_eof_R:
+                return {S::draining_eof_RP, A::defer_peer_closed, 0};
+            case S::draining_eof_RW:
+                return {S::draining_eof_RPW, A::defer_peer_closed, 0};
+            case S::draining_eof_RC:
+                return {S::draining_eof_RP, A::defer_peer_closed, 0};
+            case S::draining_eof_RCW:
+                return {S::draining_eof_RPW, A::defer_peer_closed, 0};
+            case S::draining_eof_RP:
+                return {S::draining_eof_RP, A::close_graceful, 0};
+            case S::draining_eof_RPW:
+                return {S::draining_eof_RPW, A::close_graceful, 0};
+            case S::closing_eof: return {S::closing_eof, A::send_fin, 0};
+            case S::closing_eof_W: return {S::closing_eof_W, A::send_fin, 0};
+            case S::closing_eof_C: return {S::closing_eof_C, A::send_fin, 0};
+            case S::closing_eof_CW: return {S::closing_eof_CW, A::send_fin, 0};
+            case S::closing_eof_P: return {S::closing_eof_P, A::send_fin, 0};
+            case S::closing_eof_PW: return {S::closing_eof_PW, A::send_fin, 0};
+            case S::closing_eof_R: return {S::closing_eof_R, A::send_fin, 0};
+            case S::closing_eof_RW: return {S::closing_eof_RW, A::send_fin, 0};
+            case S::closing_eof_RC: return {S::closing_eof_RC, A::send_fin, 0};
+            case S::closing_eof_RCW:
+                return {S::closing_eof_RCW, A::send_fin, 0};
+            case S::closing_eof_RP: return {S::closing_eof_RP, A::send_fin, 0};
+            case S::closing_eof_RPW:
+                return {S::closing_eof_RPW, A::send_fin, 0};
+            case S::fin_sent_eof:
+                return {S::fin_sent_eof, A::close_graceful, 0};
+            case S::fin_sent_eof_W:
+                return {S::fin_sent_eof_W, A::close_graceful, 0};
+            case S::fin_sent_eof_C:
+                return {S::fin_sent_eof_C, A::close_graceful, 0};
+            case S::fin_sent_eof_CW:
+                return {S::fin_sent_eof_CW, A::close_graceful, 0};
+            case S::fin_sent_eof_P:
+                return {S::fin_sent_eof_P, A::close_graceful, 0};
+            case S::fin_sent_eof_PW:
+                return {S::fin_sent_eof_PW, A::close_graceful, 0};
+            case S::fin_sent_eof_R:
+                return {S::fin_sent_eof_R, A::close_graceful, 0};
+            case S::fin_sent_eof_RW:
+                return {S::fin_sent_eof_RW, A::close_graceful, 0};
+            case S::fin_sent_eof_RC:
+                return {S::fin_sent_eof_RC, A::close_graceful, 0};
+            case S::fin_sent_eof_RCW:
+                return {S::fin_sent_eof_RCW, A::close_graceful, 0};
+            case S::fin_sent_eof_RP:
+                return {S::fin_sent_eof_RP, A::close_graceful, 0};
+            case S::fin_sent_eof_RPW:
+                return {S::fin_sent_eof_RPW, A::close_graceful, 0};
+            default: break;
+            }
+            break;
+        case guard::clear:
+            switch (s) {
+            case S::open_eof: return {S::open_eof, A::close_graceful, 0};
+            case S::open_eof_W: return {S::open_eof_W, A::close_graceful, 0};
+            case S::open_eof_P: return {S::open_eof_P, A::close_graceful, 0};
+            case S::open_eof_PW: return {S::open_eof_PW, A::close_graceful, 0};
+            case S::draining_eof:
+                return {S::draining_eof, A::close_graceful, 0};
+            case S::draining_eof_W:
+                return {S::draining_eof_W, A::close_graceful, 0};
+            case S::draining_eof_C:
+                return {S::draining_eof_C, A::close_graceful, 0};
+            case S::draining_eof_CW:
+                return {S::draining_eof_CW, A::close_graceful, 0};
+            case S::draining_eof_P:
+                return {S::draining_eof_P, A::close_graceful, 0};
+            case S::draining_eof_PW:
+                return {S::draining_eof_PW, A::close_graceful, 0};
+            case S::draining_eof_R:
+                return {S::draining_eof_R, A::close_graceful, 0};
+            case S::draining_eof_RW:
+                return {S::draining_eof_RW, A::close_graceful, 0};
+            case S::draining_eof_RC:
+                return {S::draining_eof_RC, A::close_graceful, 0};
+            case S::draining_eof_RCW:
+                return {S::draining_eof_RCW, A::close_graceful, 0};
+            case S::draining_eof_RP:
+                return {S::draining_eof_RP, A::close_graceful, 0};
+            case S::draining_eof_RPW:
+                return {S::draining_eof_RPW, A::close_graceful, 0};
+            case S::closing_eof: return {S::closing_eof, A::send_fin, 0};
+            case S::closing_eof_W: return {S::closing_eof_W, A::send_fin, 0};
+            case S::closing_eof_C: return {S::closing_eof_C, A::send_fin, 0};
+            case S::closing_eof_CW: return {S::closing_eof_CW, A::send_fin, 0};
+            case S::closing_eof_P: return {S::closing_eof_P, A::send_fin, 0};
+            case S::closing_eof_PW: return {S::closing_eof_PW, A::send_fin, 0};
+            case S::closing_eof_R: return {S::closing_eof_R, A::send_fin, 0};
+            case S::closing_eof_RW: return {S::closing_eof_RW, A::send_fin, 0};
+            case S::closing_eof_RC: return {S::closing_eof_RC, A::send_fin, 0};
+            case S::closing_eof_RCW:
+                return {S::closing_eof_RCW, A::send_fin, 0};
+            case S::closing_eof_RP: return {S::closing_eof_RP, A::send_fin, 0};
+            case S::closing_eof_RPW:
+                return {S::closing_eof_RPW, A::send_fin, 0};
+            case S::fin_sent_eof:
+                return {S::fin_sent_eof, A::close_graceful, 0};
+            case S::fin_sent_eof_W:
+                return {S::fin_sent_eof_W, A::close_graceful, 0};
+            case S::fin_sent_eof_C:
+                return {S::fin_sent_eof_C, A::close_graceful, 0};
+            case S::fin_sent_eof_CW:
+                return {S::fin_sent_eof_CW, A::close_graceful, 0};
+            case S::fin_sent_eof_P:
+                return {S::fin_sent_eof_P, A::close_graceful, 0};
+            case S::fin_sent_eof_PW:
+                return {S::fin_sent_eof_PW, A::close_graceful, 0};
+            case S::fin_sent_eof_R:
+                return {S::fin_sent_eof_R, A::close_graceful, 0};
+            case S::fin_sent_eof_RW:
+                return {S::fin_sent_eof_RW, A::close_graceful, 0};
+            case S::fin_sent_eof_RC:
+                return {S::fin_sent_eof_RC, A::close_graceful, 0};
+            case S::fin_sent_eof_RCW:
+                return {S::fin_sent_eof_RCW, A::close_graceful, 0};
+            case S::fin_sent_eof_RP:
+                return {S::fin_sent_eof_RP, A::close_graceful, 0};
+            case S::fin_sent_eof_RPW:
+                return {S::fin_sent_eof_RPW, A::close_graceful, 0};
+            default: break;
+            }
+            break;
+        default: break;
+        }
+        break;
+    case conn_event::fin_sent:
+        switch (s) {
+        case S::closing_act: return {S::fin_sent_act, A::none, 0};
+        case S::closing_act_W: return {S::fin_sent_act_W, A::none, 0};
+        case S::closing_act_C: return {S::fin_sent_act_C, A::none, 0};
+        case S::closing_act_CW: return {S::fin_sent_act_CW, A::none, 0};
+        case S::closing_act_R: return {S::fin_sent_act_R, A::none, 0};
+        case S::closing_act_RW: return {S::fin_sent_act_RW, A::none, 0};
+        case S::closing_act_RC: return {S::fin_sent_act_RC, A::none, 0};
+        case S::closing_act_RCW: return {S::fin_sent_act_RCW, A::none, 0};
+        case S::closing_eof: return {S::fin_sent_eof, A::none, 0};
+        case S::closing_eof_W: return {S::fin_sent_eof_W, A::none, 0};
+        case S::closing_eof_C: return {S::fin_sent_eof_C, A::none, 0};
+        case S::closing_eof_CW: return {S::fin_sent_eof_CW, A::none, 0};
+        case S::closing_eof_P: return {S::fin_sent_eof_P, A::none, 0};
+        case S::closing_eof_PW: return {S::fin_sent_eof_PW, A::none, 0};
+        case S::closing_eof_R: return {S::fin_sent_eof_R, A::none, 0};
+        case S::closing_eof_RW: return {S::fin_sent_eof_RW, A::none, 0};
+        case S::closing_eof_RC: return {S::fin_sent_eof_RC, A::none, 0};
+        case S::closing_eof_RCW: return {S::fin_sent_eof_RCW, A::none, 0};
+        case S::closing_eof_RP: return {S::fin_sent_eof_RP, A::none, 0};
+        case S::closing_eof_RPW: return {S::fin_sent_eof_RPW, A::none, 0};
+        default: break;
+        }
+        break;
+    case conn_event::closed:
+        switch (s) {
+        case S::open_act: return {S::closed_act, A::none, 0};
+        case S::open_act_W: return {S::closed_act, A::none, 0};
+        case S::open_pau: return {S::closed_act, A::none, 0};
+        case S::open_pau_W: return {S::closed_act, A::none, 0};
+        case S::open_eof: return {S::closed_eof, A::none, 0};
+        case S::open_eof_W: return {S::closed_eof, A::none, 0};
+        case S::open_eof_P: return {S::closed_eof_P, A::none, 0};
+        case S::open_eof_PW: return {S::closed_eof_P, A::none, 0};
+        case S::draining_act: return {S::closed_act, A::none, 0};
+        case S::draining_act_W: return {S::closed_act, A::none, 0};
+        case S::draining_act_C: return {S::closed_act_C, A::none, 0};
+        case S::draining_act_CW: return {S::closed_act_C, A::none, 0};
+        case S::draining_act_R: return {S::closed_act, A::none, 0};
+        case S::draining_act_RW: return {S::closed_act, A::none, 0};
+        case S::draining_act_RC: return {S::closed_act_C, A::none, 0};
+        case S::draining_act_RCW: return {S::closed_act_C, A::none, 0};
+        case S::draining_pau: return {S::closed_act, A::none, 0};
+        case S::draining_pau_W: return {S::closed_act, A::none, 0};
+        case S::draining_pau_C: return {S::closed_act_C, A::none, 0};
+        case S::draining_pau_CW: return {S::closed_act_C, A::none, 0};
+        case S::draining_eof: return {S::closed_eof, A::none, 0};
+        case S::draining_eof_W: return {S::closed_eof, A::none, 0};
+        case S::draining_eof_C: return {S::closed_eof_C, A::none, 0};
+        case S::draining_eof_CW: return {S::closed_eof_C, A::none, 0};
+        case S::draining_eof_P: return {S::closed_eof_P, A::none, 0};
+        case S::draining_eof_PW: return {S::closed_eof_P, A::none, 0};
+        case S::draining_eof_R: return {S::closed_eof, A::none, 0};
+        case S::draining_eof_RW: return {S::closed_eof, A::none, 0};
+        case S::draining_eof_RC: return {S::closed_eof_C, A::none, 0};
+        case S::draining_eof_RCW: return {S::closed_eof_C, A::none, 0};
+        case S::draining_eof_RP: return {S::closed_eof_P, A::none, 0};
+        case S::draining_eof_RPW: return {S::closed_eof_P, A::none, 0};
+        case S::closing_act: return {S::closed_act, A::none, 0};
+        case S::closing_act_W: return {S::closed_act, A::none, 0};
+        case S::closing_act_C: return {S::closed_act_C, A::none, 0};
+        case S::closing_act_CW: return {S::closed_act_C, A::none, 0};
+        case S::closing_act_R: return {S::closed_act, A::none, 0};
+        case S::closing_act_RW: return {S::closed_act, A::none, 0};
+        case S::closing_act_RC: return {S::closed_act_C, A::none, 0};
+        case S::closing_act_RCW: return {S::closed_act_C, A::none, 0};
+        case S::closing_eof: return {S::closed_eof, A::none, 0};
+        case S::closing_eof_W: return {S::closed_eof, A::none, 0};
+        case S::closing_eof_C: return {S::closed_eof_C, A::none, 0};
+        case S::closing_eof_CW: return {S::closed_eof_C, A::none, 0};
+        case S::closing_eof_P: return {S::closed_eof_P, A::none, 0};
+        case S::closing_eof_PW: return {S::closed_eof_P, A::none, 0};
+        case S::closing_eof_R: return {S::closed_eof, A::none, 0};
+        case S::closing_eof_RW: return {S::closed_eof, A::none, 0};
+        case S::closing_eof_RC: return {S::closed_eof_C, A::none, 0};
+        case S::closing_eof_RCW: return {S::closed_eof_C, A::none, 0};
+        case S::closing_eof_RP: return {S::closed_eof_P, A::none, 0};
+        case S::closing_eof_RPW: return {S::closed_eof_P, A::none, 0};
+        case S::fin_sent_act: return {S::closed_act, A::none, 0};
+        case S::fin_sent_act_W: return {S::closed_act, A::none, 0};
+        case S::fin_sent_act_C: return {S::closed_act_C, A::none, 0};
+        case S::fin_sent_act_CW: return {S::closed_act_C, A::none, 0};
+        case S::fin_sent_act_R: return {S::closed_act, A::none, 0};
+        case S::fin_sent_act_RW: return {S::closed_act, A::none, 0};
+        case S::fin_sent_act_RC: return {S::closed_act_C, A::none, 0};
+        case S::fin_sent_act_RCW: return {S::closed_act_C, A::none, 0};
+        case S::fin_sent_eof: return {S::closed_eof, A::none, 0};
+        case S::fin_sent_eof_W: return {S::closed_eof, A::none, 0};
+        case S::fin_sent_eof_C: return {S::closed_eof_C, A::none, 0};
+        case S::fin_sent_eof_CW: return {S::closed_eof_C, A::none, 0};
+        case S::fin_sent_eof_P: return {S::closed_eof_P, A::none, 0};
+        case S::fin_sent_eof_PW: return {S::closed_eof_P, A::none, 0};
+        case S::fin_sent_eof_R: return {S::closed_eof, A::none, 0};
+        case S::fin_sent_eof_RW: return {S::closed_eof, A::none, 0};
+        case S::fin_sent_eof_RC: return {S::closed_eof_C, A::none, 0};
+        case S::fin_sent_eof_RCW: return {S::closed_eof_C, A::none, 0};
+        case S::fin_sent_eof_RP: return {S::closed_eof_P, A::none, 0};
+        case S::fin_sent_eof_RPW: return {S::closed_eof_P, A::none, 0};
+        default: break;
+        }
+        break;
+    }
+    return {s, A::none, 0};
+}
+// ===== END GENERATED =====
+
+// The payloads a state carries: data, not part of which state it is, and
+// structurally absent where the state cannot have it.
+//   stamp_ms  One slot, read two ways, because the two uses never coexist (a
+//             paused connection is never closing). In a read=paused state: when
+//             EPOLLIN was dropped. In closing/fin_sent: when the close was
+//             parked. Everywhere else it is zero.
+//   budget    The input a graceful close still owes the peer: the bytes
+//             buffered and unserved when the close was first requested,
+//             measured once.
+//             open has none (there is no close to owe it to), draining always
+//             has one, closing/fin_sent/closed may. Negative means "not
+//             measured yet".
+struct conn_state {
+    conn_state_id id = conn_state_id::open_act;
+    int64_t       stamp_ms = 0;
+    int64_t       budget = -1;
+
+    conn_phase  phase() const noexcept { return phase_of(id); }
+    read_mode   read() const noexcept { return read_of(id); }
+    bool        write_armed() const noexcept { return write_armed_of(id); }
+    // A drain_input_then_close() serving round is on the stack. Read-side
+    // backpressure does not apply inside one: pausing there is what made a
+    // close requested while the connection was read-paused serve nothing, park,
+    // and FIN over the requests already sitting in rbuf.
+    bool        in_round() const noexcept { return in_round_of(id); }
+    close_round round() const noexcept { return round_of(id); }
+
+    // The paused payload: when EPOLLIN was dropped (zero unless paused).
+    int64_t paused_at_ms() const noexcept {
+        return read() == read_mode::paused ? stamp_ms : 0;
+    }
+    // The close-phase payload: when the close was parked (zero before that).
+    int64_t close_started_at_ms() const noexcept {
+        const conn_phase p = phase();
+        const bool closing = p == conn_phase::closing ||
+                             p == conn_phase::fin_sent;
+        return closing ? stamp_ms : 0;
+    }
+    // The budget, readable from draining onward; open has no budget to read.
+    std::optional<int64_t> close_input_bytes() const noexcept {
+        if (phase() == conn_phase::open || budget < 0) return std::nullopt;
+        return budget;
+    }
+};
+
+// What a transition's effects may need from the world.
+struct conn_inputs {
+    int64_t now = 0;
+    int64_t rbuf_readable = 0;   // bytes buffered in rbuf (measures the budget)
+    int64_t dealt = 0;           // bytes a serving round took off the budget
+};
+
 namespace conn_sm {
 
 inline bool is_closing(const conn_state& s) noexcept {
-    return s.phase == conn_phase::closing || s.phase == conn_phase::fin_sent;
+    const conn_phase p = s.phase();
+    return p == conn_phase::closing || p == conn_phase::fin_sent;
 }
 // Nothing left to park: FIN is out, or the connection is gone.
 inline bool is_done(const conn_state& s) noexcept {
-    return s.phase == conn_phase::fin_sent || s.phase == conn_phase::closed;
+    const conn_phase p = s.phase();
+    return p == conn_phase::fin_sent || p == conn_phase::closed;
 }
 // Whether read-side backpressure may act: not once a close is parked, and not
 // inside a serving round.
 inline bool backpressure_applies(const conn_state& s) noexcept {
-    return (s.phase == conn_phase::open || s.phase == conn_phase::draining) &&
-           !s.in_round;
+    const conn_phase p = s.phase();
+    const bool may_pause = p == conn_phase::open ||
+                           p == conn_phase::draining;
+    return may_pause && !s.in_round();
+}
+// Whether a state carries the stamp payload.
+inline bool carries_stamp(conn_state_id id) noexcept {
+    const conn_phase p = phase_of(id);
+    return read_of(id) == read_mode::paused || p == conn_phase::closing ||
+           p == conn_phase::fin_sent;
 }
 
-// The invariant every transition preserves, as the name of the first clause a
-// state breaks (nullptr when it breaks none). Anything this names is a
-// combination of fields that no sequence of events can produce.
-inline const char* violation(const conn_state& s) noexcept {
-    const conn_phase ph = s.phase;
-    if ((s.read == read_mode::paused) != (s.paused_at_ms != 0))
-        return "paused <=> pause timestamp";
-    if (s.read == read_mode::paused &&
-        ((ph != conn_phase::open && ph != conn_phase::draining) || s.in_round))
-        return "paused only in open/draining, outside a serving round";
-    if (ph == conn_phase::closed &&
-        (s.write_armed || s.in_round || s.read == read_mode::paused))
-        return "closed is terminal and normalised";
-    if (s.in_round && ph == conn_phase::open)
-        return "a serving round needs a requested close";
-    if (ph == conn_phase::open && s.close_input_bytes >= 0)
-        return "open has no measured input budget";
-    if (ph == conn_phase::draining && s.close_input_bytes < 0)
-        return "draining has a measured input budget";
-    if (is_closing(s) && s.close_started_at_ms == 0)
-        return "the close clock runs while parked";
-    if ((ph == conn_phase::open || ph == conn_phase::draining) &&
-        s.close_started_at_ms != 0)
-        return "the close clock is off before parking";
-    if (s.round == close_round::close && ph == conn_phase::open)
-        return "a close-owned round needs a requested close";
-    if (s.round == close_round::peer_closed && s.read != read_mode::eof)
-        return "a peer-owned round needs the peer's FIN";
-    return nullptr;
-}
-inline bool valid(const conn_state& s) noexcept {
-    return violation(s) == nullptr;
+// Apply one cell of the generated table and its payload effects. The table
+// decides whether a payload moves; this decides what it moves to.
+inline conn_step step(conn_state& s, conn_event e, guard g,
+                      const conn_inputs& in,
+                      read_resume* resumed = nullptr) noexcept {
+    const conn_step t = transition(s.id, e, g);
+    // The common answer, on the per-frame path: nothing moves and nothing is
+    // owed. Every such cell is inert in the table, so skipping the payload
+    // bookkeeping below changes nothing but the cost.
+    if (t.next == s.id && t.fx == 0) return t;
+    const int64_t old_stamp = s.stamp_ms;
+    s.id = t.next;
+    if (!carries_stamp(s.id)) s.stamp_ms = 0;
+    if ((t.fx & conn_fx::resume) != 0 && resumed != nullptr) {
+        resumed->resumed = true;
+        resumed->paused_for_ms = old_stamp != 0 ? in.now - old_stamp : 0;
+    }
+    if ((t.fx & conn_fx::stamp) != 0) s.stamp_ms = in.now != 0 ? in.now : 1;
+    if ((t.fx & conn_fx::measure) != 0 && s.budget < 0)
+        s.budget = in.rbuf_readable;
+    // Clamped at zero, never negative: negative is the "not measured yet"
+    // sentinel, and an exhausted budget that read as unmeasured let a later
+    // close request re-measure it and hand a peer that keeps sending a fresh
+    // budget -- the very thing the budget exists to prevent.
+    if ((t.fx & conn_fx::charge) != 0 && in.dealt > 0)
+        s.budget = std::max<int64_t>(0, s.budget - in.dealt);
+    return t;
 }
 
 // ----- read side -----
@@ -745,26 +2272,22 @@ inline bool valid(const conn_state& s) noexcept {
 // Take EPOLLIN away. False when it may not (already paused, peer FIN seen,
 // closed, parked, or inside a serving round): the caller does nothing.
 inline bool on_pause(conn_state& s, int64_t now) noexcept {
-    if (s.read != read_mode::active || !backpressure_applies(s)) return false;
-    s.read = read_mode::paused;
-    s.paused_at_ms = now != 0 ? now : 1;
-    return true;
+    conn_inputs in; in.now = now;
+    const conn_state_id before = s.id;
+    step(s, conn_event::pause, guard::none, in);
+    return s.id != before;
 }
 
 inline read_resume on_resume(conn_state& s, int64_t now) noexcept {
+    conn_inputs in; in.now = now;
     read_resume r;
-    if (s.read != read_mode::paused) return r;
-    s.read = read_mode::active;
-    r.resumed = true;
-    r.paused_for_ms = s.paused_at_ms != 0 ? now - s.paused_at_ms : 0;
-    s.paused_at_ms = 0;
+    step(s, conn_event::resume, guard::none, in, &r);
     return r;
 }
 
 // recv() returned 0.
 inline void on_eof(conn_state& s) noexcept {
-    s.read = read_mode::eof;
-    s.paused_at_ms = 0;
+    step(s, conn_event::eof, guard::none, conn_inputs{});
 }
 
 // ----- write side -----
@@ -772,16 +2295,21 @@ inline void on_eof(conn_state& s) noexcept {
 // Target-state, not a toggle. False when nothing changed (or the connection is
 // gone, where write interest means nothing).
 inline bool on_set_write(conn_state& s, bool armed) noexcept {
-    if (s.phase == conn_phase::closed || s.write_armed == armed) return false;
-    s.write_armed = armed;
-    return true;
+    // The flag already says what the caller wants -- the answer on all but the
+    // first send of a burst -- so skip the table lookup. (Both cells are
+    // inert.)
+    if (s.write_armed() == armed) return false;
+    const conn_state_id before = s.id;
+    const conn_event e = armed ? conn_event::write_on : conn_event::write_off;
+    step(s, e, guard::none, conn_inputs{});
+    return s.id != before;
 }
 
 // The epoll interest set this state asks for. The only place it is derived.
 inline uint32_t interest(const conn_state& s) noexcept {
     uint32_t ev = 0;
-    if (s.read == read_mode::active) ev |= EPOLLIN;
-    if (s.write_armed) ev |= EPOLLOUT;
+    if (s.read() == read_mode::active) ev |= EPOLLIN;
+    if (s.write_armed()) ev |= EPOLLOUT;
     return ev;
 }
 
@@ -791,33 +2319,24 @@ inline uint32_t interest(const conn_state& s) noexcept {
 // Idempotent: once closed or FINed there is nothing left to park. Entering
 // closing resumes a paused connection -- the combination is not a state.
 inline close_step on_graceful(conn_state& s, int64_t now) noexcept {
+    conn_inputs in; in.now = now;
     close_step st;
-    if (is_done(s)) return st;
-    if (s.phase != conn_phase::closing) {
-        s.phase = conn_phase::closing;
-        s.close_started_at_ms = now != 0 ? now : 1;
-        st.resume = on_resume(s, now);
-    }
-    st.action = close_action::drain_wbuf;
+    st.action = step(s, conn_event::graceful, guard::none, in,
+                     &st.resume).action;
     return st;
 }
 
 // A public close (close_connection / stop_gracefully): serve buffered input
 // first, so answers to already-arrived requests still reach the peer. Resumes
-// a paused connection, because serving the backlog is the whole point. The
-// budget is rbuf occupancy at this moment and nothing else -- bytes still in
-// the kernel receive buffer are not counted, and the drain's own round is the
-// only thing that brings any of them in (see drain_input_then_close for what
-// that does and does not promise).
+// a paused connection, because serving the backlog is the whole point.
 inline close_step on_request(conn_state& s, const conn_facts& f,
                              int64_t now) noexcept {
+    conn_inputs in;
+    in.now = now;
+    in.rbuf_readable = static_cast<int64_t>(f.rbuf_readable);
     close_step st;
-    if (is_done(s)) return st;
-    if (s.close_input_bytes < 0)
-        s.close_input_bytes = static_cast<int64_t>(f.rbuf_readable);
-    if (s.phase == conn_phase::open) s.phase = conn_phase::draining;
-    st.resume = on_resume(s, now);
-    st.action = close_action::drain_input;
+    st.action = step(s, conn_event::request, guard::none, in,
+                     &st.resume).action;
     return st;
 }
 
@@ -825,51 +2344,38 @@ inline close_step on_request(conn_state& s, const conn_facts& f,
 // cannot exist.
 inline void on_round_begin(conn_state& s) noexcept {
     // requires: reads are not paused -- on_request resumed them.
-    assert(s.read != read_mode::paused);
-    if (s.phase == conn_phase::draining || s.phase == conn_phase::closing)
-        s.in_round = true;
+    assert(s.read() != read_mode::paused);
+    step(s, conn_event::round_begin, guard::none, conn_inputs{});
 }
-inline void on_round_end(conn_state& s) noexcept { s.in_round = false; }
-
-// The park decision shared by on_input_drained and on_input_defer_failed:
-// peer_closed owns the round; an already-close round (or a round that served
-// nothing) parks now; otherwise defer one park round.
-inline close_action park_decision(conn_state& s, int served) noexcept {
-    if (s.round == close_round::peer_closed) return close_action::none;
-    if (served == 0 || s.round == close_round::close)
-        return close_action::drain_wbuf;
-    s.round = close_round::close;
-    return close_action::defer_park;
+inline void on_round_end(conn_state& s) noexcept {
+    step(s, conn_event::round_end, guard::none, conn_inputs{});
 }
 
 // A serving round finished. served is the frame count, dealt the bytes this
-// round took off the close_input_bytes budget.
+// round took off the budget.
 inline close_action on_input_drained(conn_state& s, const conn_facts& f,
-                                     int served, int64_t dealt) noexcept {
-    if (is_done(s)) return close_action::none;
+                                     int served,
+                                     int64_t dealt) noexcept {
     // requires: a close was requested (on_request measured the budget).
-    assert(s.close_input_bytes >= 0);
-    // Clamped at zero, not allowed to go negative: negative is the "not
-    // measured yet" sentinel, and an exhausted budget that read as unmeasured
-    // let a later close request re-measure it and hand a peer that keeps
-    // sending a fresh budget -- the very thing the budget exists to prevent.
-    if (served > 0 && dealt > 0)
-        s.close_input_bytes = std::max<int64_t>(0, s.close_input_bytes - dealt);
-    if (served > 0 && !f.rbuf_empty && s.close_input_bytes > 0)
-        return close_action::defer_drain_input;
-    if (served == 0 && s.round == close_round::none && f.pending > 0) {
-        s.round = close_round::close;
-        return close_action::defer_park;
-    }
-    return park_decision(s, served);
+    assert(is_done(s) || s.budget >= 0);
+    // The guard needs the budget as this round leaves it; the table's `charge`
+    // effect then applies the same subtraction to the payload.
+    const bool charge = served > 0 && dealt > 0;
+    const int64_t left =
+        charge ? std::max<int64_t>(0, s.budget - dealt) : s.budget;
+    const guard g =
+        input_guard(served > 0, !f.rbuf_empty, left > 0, f.pending > 0);
+    conn_inputs in; in.dealt = dealt;
+    return step(s, conn_event::input_drained, g, in).action;
 }
 
 // Re-decide after the input-defer hand-off failed: drain_input is off the table
 // and served was > 0, so what remains is the park decision.
 inline close_action on_input_defer_failed(conn_state& s) noexcept {
     // requires: on_input_drained just answered defer_drain_input.
-    assert(s.close_input_bytes >= 0);
-    return park_decision(s, 1);
+    assert(s.budget >= 0);
+    return step(s, conn_event::input_defer_failed, guard::none,
+                conn_inputs{}).action;
 }
 
 // What to do after a wbuf drain. dead/error end the connection; stalled leaves
@@ -887,36 +2393,23 @@ inline close_action on_drain_result(drain_outcome r) noexcept {
 // defer_peer_closed spends the one allowed queue round waiting for replies to
 // land; otherwise FIN (if we are closing) or tear down.
 inline close_action on_peer_fin(conn_state& s, const conn_facts& f) noexcept {
-    assert(s.read == read_mode::eof);
-    if (s.phase == conn_phase::closed) return close_action::none;
-    if (!f.wbuf_empty) return close_action::none;
-    if (!is_closing(s) && f.pending > 0 &&
-        s.round != close_round::peer_closed) {
-        s.round = close_round::peer_closed;
-        return close_action::defer_peer_closed;
-    }
-    if (s.phase == conn_phase::closing) return close_action::send_fin;
-    return close_action::close_graceful;
+    assert(s.read() == read_mode::eof);
+    const guard g = peer_guard(f.wbuf_empty, f.pending > 0);
+    return step(s, conn_event::peer_fin, g, conn_inputs{}).action;
 }
 
 // shutdown(SHUT_WR) succeeded.
 inline void on_fin_sent(conn_state& s) noexcept {
-    assert(s.phase == conn_phase::closing);
-    s.phase = conn_phase::fin_sent;
+    assert(s.phase() == conn_phase::closing);
+    step(s, conn_event::fin_sent, guard::none, conn_inputs{});
 }
 
 // Teardown. True the first time only. Normalises everything a dead connection
 // must not claim: no write interest, no round, no pause.
 inline bool on_closed(conn_state& s) noexcept {
-    if (s.phase == conn_phase::closed) return false;
-    s.phase = conn_phase::closed;
-    s.write_armed = false;
-    s.in_round = false;
-    if (s.read == read_mode::paused) {
-        s.read = read_mode::active;
-        s.paused_at_ms = 0;
-    }
-    return true;
+    const bool first = s.phase() != conn_phase::closed;
+    step(s, conn_event::closed, guard::none, conn_inputs{});
+    return first;
 }
 
 }  // namespace conn_sm
@@ -989,18 +2482,22 @@ class conn_machine {
     // ---- reactor thread only ----
 
     const conn_state& state() const noexcept { return st_; }
-    bool fin_sent() const noexcept { return st_.phase == conn_phase::fin_sent; }
-    bool read_paused() const noexcept { return st_.read == read_mode::paused; }
+    bool fin_sent() const noexcept {
+        return st_.phase() == conn_phase::fin_sent;
+    }
+    bool read_paused() const noexcept {
+        return st_.read() == read_mode::paused;
+    }
     // The peer's FIN has been seen (recv returned 0). Set once, in handle_read;
     // handle_write consults it to finish a parked close deterministically the
     // moment the drain completes, instead of waiting for a spurious EPOLLIN.
-    bool peer_closed() const noexcept { return st_.read == read_mode::eof; }
-    bool write_armed() const noexcept { return st_.write_armed; }
+    bool peer_closed() const noexcept { return st_.read() == read_mode::eof; }
+    bool write_armed() const noexcept { return st_.write_armed(); }
     bool backpressure_applies() const noexcept {
         return conn_sm::backpressure_applies(st_);
     }
     int64_t close_started_at_ms() const noexcept {
-        return st_.close_started_at_ms;
+        return st_.close_started_at_ms();
     }
     bool wbuf_empty() const noexcept { return !wbuf_ || wbuf_->empty(); }
     uint32_t interest() const noexcept { return conn_sm::interest(st_); }
@@ -1073,26 +2570,12 @@ class conn_machine {
                         ? pending_bytes_->load(std::memory_order_relaxed) : 0;
         return f;
     }
-    // Every transition ends here: the invariant holds, and the phase other
-    // threads read is the one the reactor now has.
+    // Every transition ends here: the phase other threads read is the one the
+    // reactor now has. There is nothing else to check -- a state the machine
+    // cannot be in has no enumerator.
     void commit() noexcept {
-#ifndef NDEBUG
-        if (const char* why = conn_sm::violation(st_)) {
-            std::fprintf(stderr,
-                "[fatal] conn_machine invariant broken: %s "
-                "(phase=%d read=%d write_armed=%d in_round=%d round=%d "
-                "close_input_bytes=%" PRId64 " close_started_at_ms=%" PRId64
-                " paused_at_ms=%" PRId64 ")\n",
-                why, static_cast<int>(st_.phase), static_cast<int>(st_.read),
-                static_cast<int>(st_.write_armed),
-                static_cast<int>(st_.in_round), static_cast<int>(st_.round),
-                static_cast<int64_t>(st_.close_input_bytes),
-                static_cast<int64_t>(st_.close_started_at_ms),
-                static_cast<int64_t>(st_.paused_at_ms));
-            std::abort();
-        }
-#endif
-        pub_.store(static_cast<uint8_t>(st_.phase), std::memory_order_release);
+        pub_.store(static_cast<uint8_t>(st_.phase()),
+                   std::memory_order_release);
     }
 
     conn_state              st_;
@@ -1130,10 +2613,9 @@ struct connection {
     // refresh it, so the deadline derived from it (this field plus
     // frame_assembly_timeout_ms, see do_tick) measures how long the frame has
     // been incomplete, not how long the peer has been quiet. Paused intervals
-    // are added back on resume (see conn_machine::on_resume), so it
-    // measures the time the
-    // peer had to complete the frame, not the time the server spent not
-    // reading it.
+    // are added back on resume (see conn_machine::on_resume), so it measures
+    // the time the peer had to complete the frame, not the time the server
+    // spent not reading it.
     int64_t    frame_started_at_ms = 0;
     // Inbound bytes that have arrived but not been parsed: a partial frame plus
     // whatever complete frames came in the same read. Reactor-thread-only.
@@ -2952,9 +4434,11 @@ inline int sub_reactor::handle_read(connection* c) noexcept {
         // stop before the syscall, which is what lets TCP push back. The
         // close's own drain round is exempt for the same reason as
         // parse_frames: the close budget bounds it (see conn_state::in_round).
-        if (c->sm.backpressure_applies() &&
-            c->pending_bytes.load(std::memory_order_relaxed) >=
-                server_->cfg_.resolved_read_high_watermark_bytes()) {
+        // Cheap test first: almost every frame is below the mark, and the state
+        // predicate (two generated accessors) is only worth asking past it.
+        if (c->pending_bytes.load(std::memory_order_relaxed) >=
+                server_->cfg_.resolved_read_high_watermark_bytes() &&
+            c->sm.backpressure_applies()) {
             pause_read(c);
             return dispatched();
         }
@@ -3163,8 +4647,8 @@ inline void sub_reactor::finish_peer_closed(connection* c) noexcept {
         // Parked with the write side still productive. Read interest is dropped
         // for the rest of the drain (see the header comment): the only thing a
         // read could deliver is the FIN we have already seen. apply_interest
-        // derives that from the machine's read mode (eof), and still
-        // recovers an ENOENT
+        // derives that from the machine's read mode (eof), and still recovers
+        // an ENOENT
         // registration with ADD -- without that recovery the socket goes
         // silent and the drain never resumes (measured: 3MB of 16MB, then
         // nothing). A registration the kernel will not accept ends the
@@ -3224,13 +4708,15 @@ inline void sub_reactor::parse_frames(connection* c,
         // still untouched, so the frame can be retried intact after resume. A
         // graceful close overrides it: close_input_bytes and close_linger_ms
         // are what bound input during a close. The machine's in_round flag
-        // marks the
-        // narrow window where the close is serving that backlog; without it
+        // marks the narrow window where the close is serving that backlog;
+        // without it
         // the pause reapplies before the first frame and the drain parks over
         // exactly what it was asked to answer.
-        if (c->sm.backpressure_applies() &&
-            c->pending_bytes.load(std::memory_order_relaxed) >=
-                server_->cfg_.resolved_read_high_watermark_bytes()) {
+        // Cheap test first: almost every frame is below the mark, and the state
+        // predicate (two generated accessors) is only worth asking past it.
+        if (c->pending_bytes.load(std::memory_order_relaxed) >=
+                server_->cfg_.resolved_read_high_watermark_bytes() &&
+            c->sm.backpressure_applies()) {
             pause_read(c);
             return;
         }
@@ -5417,3 +6903,4 @@ inline std::vector<uint64_t> multi_reactor_server::connection_ids() const {
 }
 
 }  // namespace industrial
+#endif  // INDUSTRIAL_CONN_FSM_VOCABULARY_ONLY
