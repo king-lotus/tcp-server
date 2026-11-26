@@ -681,7 +681,7 @@ struct close_step {
 #else
 // ===== BEGIN GENERATED (tools/gen_conn_fsm.cpp; do not edit by hand) =====
 // Source of truth: tools/conn_fsm_spec.h (the rules) -> tools/gen_conn_fsm.cpp
-// (this text, verify/conn_fsm_cases.inc, docs/conn-fsm.md).
+// (this text, verify/suites/conn_fsm_cases.inc, docs/conn-fsm.md).
 // Regenerate; do not edit.
 //
 // A state is one value of conn_state_id: a closed enum of the 77 legal

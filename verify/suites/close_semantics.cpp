@@ -1,4 +1,4 @@
-// verify/close_semantics.cpp -- what the peer actually observes at close time.
+// verify/suites/close_semantics.cpp -- what the peer actually observes at close time.
 //
 // This is the runtime counterpart to the compile-only check: it asserts on wire
 // behaviour that a compiler cannot see, and that P1-4 changed.
@@ -37,7 +37,7 @@
 //      happened to absorb.
 //
 // Build (Linux only):
-//   g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semantics
+//   g++ -std=c++17 -Wall -Wextra -pthread verify/suites/close_semantics.cpp -o close_semantics
 //
 // Exit code 0 = all cases passed.
 #include <arpa/inet.h>

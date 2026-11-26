@@ -1,4 +1,4 @@
-// verify/config_budget.cpp -- what a default config costs, and what it must
+// verify/suites/config_budget.cpp -- what a default config costs, and what it must
 // still be able to do.
 //
 // The write buffer is allocated when a connection is accepted, so

@@ -1,4 +1,4 @@
-// verify/bench_floor.cpp -- the wire without the library.
+// verify/bench/floor.cpp -- the wire without the library.
 //
 // bench_rx measures this server. This measures the same shape of traffic with
 // nothing in between: accept one connection, recv into a buffer, throw the

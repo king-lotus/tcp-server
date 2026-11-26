@@ -1,4 +1,4 @@
-// verify/hardening.cpp -- the admission and identity guarantees added by the
+// verify/suites/hardening.cpp -- the admission and identity guarantees added by the
 // architecture-hardening pass.
 //
 //   A. connection ids are never reused, and the id-keyed event dispatch never

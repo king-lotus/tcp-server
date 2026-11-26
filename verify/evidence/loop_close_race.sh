@@ -40,7 +40,7 @@ HDR_AFTER=include/tcp-server-mt.h
 git show "$BEFORE_REF:$HDR_BEFORE" > /tmp/cfr_before/tcp-server-mt.h || exit 9
 git show "$BEFORE_REF":verify/close_semantics.cpp > /tmp/cfr_before/verify/close_semantics.cpp || exit 9
 cp "$PROJ/$HDR_AFTER"                 /tmp/cfr_after/tcp-server-mt.h
-cp "$PROJ/verify/close_semantics.cpp" /tmp/cfr_after/verify/close_semantics.cpp
+cp "$PROJ/verify/suites/close_semantics.cpp" /tmp/cfr_after/verify/close_semantics.cpp
 
 FLAGS=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -g
        -fsanitize=thread -fno-omit-frame-pointer)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Is ThreadSanitizer lying about a condition variable here?
 #
-# verify/backpressure.cpp holds a worker inside a callback using the ordinary
+# verify/suites/backpressure.cpp holds a worker inside a callback using the ordinary
 # handshake -- unique_lock, wait_for with a predicate, the other side sets the
 # flag under the lock and notifies. ThreadSanitizer reports "double lock of a
 # mutex" at the setter followed by a data race on the flag "synchronized via

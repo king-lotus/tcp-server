@@ -1,4 +1,4 @@
-// verify/ping_pong.cpp -- the read path's most conditional branch, executed.
+// verify/suites/ping_pong.cpp -- the read path's most conditional branch, executed.
 //
 // parse_frames() answers PING itself: a reservation CAS loop against
 // max_pending_bytes, a refusal that tears the connection down, and a "we are
@@ -19,11 +19,11 @@
 //      as frames_dropped_on_close. Answering it would put a frame out past the FIN,
 //      which is the thing the whole close sequence exists to prevent.
 //
-// The client half now goes through verify/harness.h: this file used to carry
+// The client half now goes through verify/support/harness.h: this file used to carry
 // its own pick_port/connect_to/send_all/frame/readFrame, like nine others.
 //
 // Build (Linux only):
-//   g++ -std=c++17 -Wall -Wextra -pthread -Iinclude verify/ping_pong.cpp -o ping_pong
+//   g++ -std=c++17 -Wall -Wextra -pthread -Iinclude verify/suites/ping_pong.cpp -o ping_pong
 //
 // Exit code 0 = the PING branch answers, counts, and stays behind the FIN.
 

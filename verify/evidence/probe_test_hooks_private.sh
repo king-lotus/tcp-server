@@ -9,7 +9,7 @@
 #   1. any code holding a server reference that touches a switch directly must
 #      be refused by the compiler, with "private" in the diagnostic -- not by a
 #      comment asking people not to;
-#   2. the friend accessor in verify/harness.h must reach them, or the
+#   2. the friend accessor in verify/support/harness.h must reach them, or the
 #      fault-injection suite stops compiling and the switches lose their only
 #      consumer.
 #
@@ -41,7 +41,7 @@ void fire(industrial::multi_reactor_server& s) {
 }
 EOF
 
-flags=(-std=c++17 -Iinclude -Iverify -fsyntax-only)
+flags=(-std=c++17 -Iinclude -Iverify/support -fsyntax-only)
 
 if g++ "${flags[@]}" "$tmp/direct.cpp" 2> "$tmp/direct.log"; then
     echo "  [FAIL] a switch is reachable from arbitrary code: the direct write compiled"

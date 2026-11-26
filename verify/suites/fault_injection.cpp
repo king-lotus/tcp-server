@@ -1,4 +1,4 @@
-// verify/fault_injection.cpp -- what a worker dying is supposed to look like.
+// verify/suites/fault_injection.cpp -- what a worker dying is supposed to look like.
 //
 // The fault switches these cases flip are private members of the server,
 // reachable through industrial::test_access (see harness.h). A switch nobody
@@ -52,12 +52,12 @@
 //      while the surviving reactor keeps the server running.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
-//   g++ -std=c++17 -Wall -Wextra -pthread verify/fault_injection.cpp -o fault_injection
+//   g++ -std=c++17 -Wall -Wextra -pthread verify/suites/fault_injection.cpp -o fault_injection
 //
 // No -D any more. The switches used to live behind INDUSTRIAL_TCP_TESTING,
 // which made the class definition depend on a build flag -- an ODR hazard, and
 // the reason they became unconditional members. They are now private members
-// reachable only through industrial::test_access (verify/harness.h), so there
+// reachable only through industrial::test_access (verify/support/harness.h), so there
 // is nothing left for the macro to unlock and the file builds like every other
 // suite.
 //

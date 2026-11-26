@@ -42,7 +42,7 @@ ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh # 全都要
 
 ```bash
 # 只能在 Linux 上跑
-g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semantics && ./close_semantics
+g++ -std=c++17 -Wall -Wextra -pthread verify/suites/close_semantics.cpp -o close_semantics && ./close_semantics
 
 CS_REACTORS=1 ./close_semantics     # 所有客户端落到同一个 reactor
 ```
@@ -72,7 +72,7 @@ worker 上的故障会被平均掉** —— 两个 reactor 时表现为"每隔�
 
 ```bash
 g++ -std=c++17 -Wall -Wextra -pthread \
-    verify/fault_injection.cpp -o fault_injection && ./fault_injection
+    verify/suites/fault_injection.cpp -o fault_injection && ./fault_injection
 ```
 
 这些开关现在是服务器的**私有成员**：类定义不再随宏变化（两个编译单元对同一个
@@ -186,7 +186,7 @@ tick sweep。
 
 `backpressure.cpp` 要扣住 worker，最自然的写法是 mutex + `condition_variable`。早期开发机
 （g++ 11.4）的 ThreadSanitizer 会对此报 **double lock of a mutex**，紧接着报"同时被
-这把锁保护着"的标志量有 data race —— 而 **`verify/probe_tsan_condvar.sh` 里那段不含服务端、
+这把锁保护着"的标志量有 data race —— 而 **`verify/evidence/probe_tsan_condvar.sh` 里那段不含服务端、
 不含套接字的标准握手，报的是完全一样的两种错**。也就是说这是库/平台的性质。
 
 处理方式不是加 suppression：那等于让代码库永久地与 sanitizer 争执。改成在原子量上轮询并带

@@ -1,4 +1,4 @@
-// verify/harness.h -- the test-side peer, behind one seam.
+// verify/support/harness.h -- the test-side peer, behind one seam.
 //
 // Before this file every suite taught itself the same interface: connect_to()
 // was defined in ten translation units, <arpa/inet.h> included in twelve, and

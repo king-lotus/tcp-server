@@ -1,4 +1,4 @@
-// verify/watermark.cpp -- read-side backpressure.
+// verify/suites/watermark.cpp -- read-side backpressure.
 //
 // Before the watermarks, the reactor read and dispatched regardless of how
 // much output was already waiting for the peer. A client that pipelined

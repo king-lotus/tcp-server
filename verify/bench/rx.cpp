@@ -1,4 +1,4 @@
-// verify/bench_rx.cpp -- how many bytes a reactor can take off the socket and
+// verify/bench/rx.cpp -- how many bytes a reactor can take off the socket and
 // hand to a no-op handler, and whether more reactors buy more of it.
 //
 //   bench_rx <reactors> <clientThreads> <seconds>

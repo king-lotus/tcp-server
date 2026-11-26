@@ -1,6 +1,6 @@
-// verify/harness_selftest.cpp -- tests the test harness.
+// verify/suites/harness_selftest.cpp -- tests the test harness.
 //
-// Every suite runs its assertions through verify/harness.h. If peer's framing,
+// Every suite runs its assertions through verify/support/harness.h. If peer's framing,
 // timeout or FIN-versus-RST judgement is wrong, every suite that uses it is
 // wrong in the same direction and reports green while doing it -- which is the
 // one failure mode this project has paid for repeatedly.

@@ -55,7 +55,7 @@ base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
 # conn_machine from the working tree and the close_fsm it replaced, kept as a
 # checked-in oracle at the branch point (8d55d8f). #pragma once is path-based,
 # so the two files can coexist inside separate namespaces.
-fsm_flags=("${base_flags[@]}" -Iverify
+fsm_flags=("${base_flags[@]}" -Iverify/support
            -DNEWH='"tcp-server-mt.h"' -DOLDH='"tcp-server-mt.prev.h"')
 
 # The test uses the same switches to build, so both must agree on the macro or
@@ -64,19 +64,19 @@ fsm_flags=("${base_flags[@]}" -Iverify
 build() {
     local label="$1"; shift
     echo "== building [$label] =="
-    g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o "$out/close_semantics"
-    g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o "$out/idle_semantics"
-    g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o "$out/ping_pong"
-    g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o "$out/send_results"
-    g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o "$out/backpressure"
-    g++ "${base_flags[@]}" "$@" verify/fault_injection.cpp \
+    g++ "${base_flags[@]}" "$@" verify/suites/close_semantics.cpp -o "$out/close_semantics"
+    g++ "${base_flags[@]}" "$@" verify/suites/idle_semantics.cpp -o "$out/idle_semantics"
+    g++ "${base_flags[@]}" "$@" verify/suites/ping_pong.cpp -o "$out/ping_pong"
+    g++ "${base_flags[@]}" "$@" verify/suites/send_results.cpp -o "$out/send_results"
+    g++ "${base_flags[@]}" "$@" verify/suites/backpressure.cpp -o "$out/backpressure"
+    g++ "${base_flags[@]}" "$@" verify/suites/fault_injection.cpp \
         -o "$out/fault_injection"
-    g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o "$out/reactor_spread"
-    g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o "$out/config_budget"
-    g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o "$out/harness_selftest"
-    g++ "${base_flags[@]}" "$@" verify/watermark.cpp -o "$out/watermark"
-    g++ "${base_flags[@]}" "$@" verify/hardening.cpp -o "$out/hardening"
-    g++ "${fsm_flags[@]}" "$@" verify/tcp_server_fsm_test.cpp \
+    g++ "${base_flags[@]}" "$@" verify/suites/reactor_spread.cpp -o "$out/reactor_spread"
+    g++ "${base_flags[@]}" "$@" verify/suites/config_budget.cpp -o "$out/config_budget"
+    g++ "${base_flags[@]}" "$@" verify/suites/harness_selftest.cpp -o "$out/harness_selftest"
+    g++ "${base_flags[@]}" "$@" verify/suites/watermark.cpp -o "$out/watermark"
+    g++ "${base_flags[@]}" "$@" verify/suites/hardening.cpp -o "$out/hardening"
+    g++ "${fsm_flags[@]}" "$@" verify/suites/tcp_server_fsm_test.cpp \
         -o "$out/tcp_server_fsm_test"
 }
 
@@ -242,7 +242,7 @@ cat <<EOF
     in tools/conn_fsm_spec.h, and runs 40x20000 random walks against the
     close_fsm it replaced. Test 7 is the one intentional difference -- a drained
     budget is clamped at zero so a second close request cannot re-measure it.
-    The checked-in verify/tcp-server-mt.prev.h is the branch-point oracle; the
+    The checked-in verify/support/tcp-server-mt.prev.h is the branch-point oracle; the
     generator, tools/gen_conn_fsm.cpp, rewrites docs/conn-fsm.md.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'

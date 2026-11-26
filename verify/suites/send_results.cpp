@@ -1,4 +1,4 @@
-// verify/send_results.cpp -- send_to()'s five answers, two counters, and the
+// verify/suites/send_results.cpp -- send_to()'s five answers, two counters, and the
 // optional handler offload pool, asserted.
 //
 // send_to() is the whole of how an application puts bytes on a connection, and
@@ -42,7 +42,7 @@
 //      throwing task is swallowed without taking its worker with it.
 //
 // Build (Linux only):
-//   g++ -std=c++17 -Wall -Wextra -pthread verify/send_results.cpp -o send_results
+//   g++ -std=c++17 -Wall -Wextra -pthread verify/suites/send_results.cpp -o send_results
 //
 // Exit code 0 = every answer is the documented one. A [SKIP] is not a pass: it
 // names what was asked and what the machine answered.

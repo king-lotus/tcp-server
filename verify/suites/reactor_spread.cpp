@@ -1,4 +1,4 @@
-// verify/reactor_spread.cpp
+// verify/suites/reactor_spread.cpp
 //
 // What this covers that nothing else did: pick_reactor() hands accepted
 // connections out round-robin, and until this file existed no case in the tree
@@ -25,7 +25,7 @@
 // configuration rather than a constant: the runner takes it down to two.
 //
 // Build (Linux only):
-//   g++ -std=c++17 -Wall -Wextra -pthread -Iinclude verify/reactor_spread.cpp
+//   g++ -std=c++17 -Wall -Wextra -pthread -Iinclude verify/suites/reactor_spread.cpp
 
 #include <algorithm>
 #include <atomic>

@@ -6,8 +6,8 @@
 # rather than on a regression. These numbers are worth having when they are
 # compared against numbers taken on the same machine minutes earlier.
 #
-#   bash verify/bench.sh            # 5 repetitions, medians
-#   REPS=3 bash verify/bench.sh     # quicker, noisier
+#   bash verify/bench/run.sh            # 5 repetitions, medians
+#   REPS=3 bash verify/bench/run.sh     # quicker, noisier
 #
 # What it measures, and why each one:
 #   rss     -- resident memory per idle connection. Buffers are allocated when a
@@ -34,9 +34,9 @@ raw="$(mktemp)"
 trap 'rm -f "$raw"' EXIT
 
 echo "== building =="
-g++ "${flags[@]}" verify/bench_rss.cpp  -o /tmp/bench_rss
-g++ "${flags[@]}" verify/bench_rx.cpp   -o /tmp/bench_rx
-g++ "${flags[@]}" verify/bench_send.cpp -o /tmp/bench_send
+g++ "${flags[@]}" verify/bench/rss.cpp  -o /tmp/bench_rss
+g++ "${flags[@]}" verify/bench/rx.cpp   -o /tmp/bench_rx
+g++ "${flags[@]}" verify/bench/send.cpp -o /tmp/bench_send
 g++ --version | head -1
 echo "   cores: $(nproc)"
 

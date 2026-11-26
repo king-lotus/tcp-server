@@ -1,4 +1,4 @@
-// verify/backpressure.cpp -- what one round of replies costs a single reactor.
+// verify/suites/backpressure.cpp -- what one round of replies costs a single reactor.
 //
 // The task queue cap used to be a flat 8192, per reactor, and nothing said so.
 // A broadcast is the shape that notices: every connection the server owns gets a
@@ -20,7 +20,7 @@
 //     race between the producer and the consumer.
 //
 // Build (Linux only):
-//   g++ -std=c++17 -Wall -Wextra -pthread verify/backpressure.cpp -o backpressure
+//   g++ -std=c++17 -Wall -Wextra -pthread verify/suites/backpressure.cpp -o backpressure
 //
 // Exit code 0 = the fan-out fit.
 
@@ -87,7 +87,7 @@ int main() {
     // ThreadSanitizer mis-models std::condition_variable::wait_for and reports
     // "double lock of a mutex" followed by a race on the flag guarded by that
     // mutex, with no server in the process at all -- see
-    // verify/probe_tsan_condvar.sh. Suppressing it would leave the codebase
+    // verify/evidence/probe_tsan_condvar.sh. Suppressing it would leave the codebase
     // arguing with a sanitizer, so wait on an atomic with a deadline instead.
     // Same property being tested, nothing left to mis-model.
     harness::fixture server(

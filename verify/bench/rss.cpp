@@ -1,4 +1,4 @@
-// verify/bench_rss.cpp -- resident memory per idle connection.
+// verify/bench/rss.cpp -- resident memory per idle connection.
 //
 // The question a server's config answers for you: "max_connections = 10000" is
 // a promise about descriptors, and this says what else it costs. Buffers are

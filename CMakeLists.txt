@@ -46,23 +46,23 @@ if(TCP_BUILD_SUITES)
         hardening)
 
     foreach(suite IN LISTS TCP_SUITES)
-        add_executable(${suite} verify/${suite}.cpp)
+        add_executable(${suite} verify/suites/${suite}.cpp)
         target_link_libraries(${suite} PRIVATE tcp_server_mt)
     endforeach()
 
     # No test-only define any more. The fault switches are unconditional
     # private members (a class definition that varies with a macro is an ODR
     # hazard) and reachable only through the friend accessor in the harness.
-    add_executable(fault_injection verify/fault_injection.cpp)
+    add_executable(fault_injection verify/suites/fault_injection.cpp)
     target_link_libraries(fault_injection PRIVATE tcp_server_mt)
 
     # Differential FSM suite: the working-tree header and the close_fsm it
-    # replaced (checked in as verify/tcp-server-mt.prev.h at the branch point)
+    # replaced (checked in as verify/support/tcp-server-mt.prev.h at the branch point)
     # are included under different paths, hence into different namespaces.
-    add_executable(tcp_server_fsm_test verify/tcp_server_fsm_test.cpp)
+    add_executable(tcp_server_fsm_test verify/suites/tcp_server_fsm_test.cpp)
     target_link_libraries(tcp_server_fsm_test PRIVATE tcp_server_mt)
     target_include_directories(tcp_server_fsm_test PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/verify")
+        "${CMAKE_CURRENT_SOURCE_DIR}/verify/support")
     target_compile_definitions(tcp_server_fsm_test PRIVATE
         NEWH='"tcp-server-mt.h"' OLDH='"tcp-server-mt.prev.h"')
 
@@ -124,11 +124,11 @@ if(TCP_BUILD_SUITES)
 endif()
 
 if(TCP_BUILD_BENCH)
-    foreach(bench bench_rss bench_rx bench_send bench_floor)
-        add_executable(${bench} verify/${bench}.cpp)
-        target_link_libraries(${bench} PRIVATE tcp_server_mt)
+    foreach(bench rss rx send floor)
+        add_executable(bench_${bench} verify/bench/${bench}.cpp)
+        target_link_libraries(bench_${bench} PRIVATE tcp_server_mt)
         if(NOT MSVC)
-            target_compile_options(${bench} PRIVATE -O2)
+            target_compile_options(bench_${bench} PRIVATE -O2)
         endif()
     endforeach()
 endif()

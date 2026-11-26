@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Cross the two knobs that decide what the ingest number actually means.
 #
-#   bash verify/bench_matrix.sh
-#   REPS=1 SECS=2 bash verify/bench_matrix.sh     # quicker, noisier
+#   bash verify/bench/matrix.sh
+#   REPS=1 SECS=2 bash verify/bench/matrix.sh     # quicker, noisier
 #
 # Row dimension 1: the per-connection write buffer (BENCH_WBUF_KB). It is what
 # per-connection RSS is made of, and it also caps what a reactor can queue, so
@@ -26,9 +26,9 @@ SECS="${SECS:-3}"
 flags=(-std=c++17 -O2 -pthread -Iinclude)
 
 echo "== building =="
-g++ "${flags[@]}" verify/bench_rss.cpp  -o /tmp/m_rss
-g++ "${flags[@]}" verify/bench_rx.cpp   -o /tmp/m_rx
-g++ "${flags[@]}" verify/bench_send.cpp -o /tmp/m_send
+g++ "${flags[@]}" verify/bench/rss.cpp  -o /tmp/m_rss
+g++ "${flags[@]}" verify/bench/rx.cpp   -o /tmp/m_rx
+g++ "${flags[@]}" verify/bench/send.cpp -o /tmp/m_send
 g++ --version | head -1
 echo "   cores: $(nproc)   affinity: $(taskset -cp $$ 2>/dev/null | sed 's/.*list: //')"
 

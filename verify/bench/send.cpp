@@ -1,4 +1,4 @@
-// verify/bench_send.cpp -- round-trip cost of the reply path, in microseconds.
+// verify/bench/send.cpp -- round-trip cost of the reply path, in microseconds.
 //
 //   bench_send <messagesPerClient> <payloadBytes> [clients] [reactors]
 //

@@ -24,11 +24,11 @@
 // There is no "valid after every transition" test: a state the machine cannot
 // be in has no enumerator.
 //
-// Build: verify/run.sh compiles this file with -Iinclude -Iverify and
+// Build: verify/run.sh compiles this file with -Iinclude -Iverify/support and
 //   -DNEWH='"tcp-server-mt.h"' -DOLDH='"tcp-server-mt.prev.h"', so the machine
 //   under test and the branch-point oracle live in one binary.
 #include NEWH
-#include "../tools/conn_fsm_model.h"
+#include "../../tools/conn_fsm_model.h"
 namespace legacy {
 #include OLDH
 }

@@ -1,4 +1,4 @@
-// verify/idle_semantics.cpp -- what "idle" is measured in.
+// verify/suites/idle_semantics.cpp -- what "idle" is measured in.
 //
 // An idle timeout is a promise about silence: if the peer is still sending, the
 // deadline must not fire. This case pins down what counts as silence, because
@@ -32,7 +32,7 @@
 // frame-assembly timeout, not an idle one.
 //
 // Build (Linux only):
-//   g++ -std=c++17 -Wall -Wextra -pthread verify/idle_semantics.cpp -o idle_semantics
+//   g++ -std=c++17 -Wall -Wextra -pthread verify/suites/idle_semantics.cpp -o idle_semantics
 //
 // Exit code 0 = the deadline means no bytes arrived.
 
