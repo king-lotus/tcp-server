@@ -48,6 +48,8 @@ if(TCP_BUILD_SUITES)
     foreach(suite IN LISTS TCP_SUITES)
         add_executable(${suite} verify/suites/${suite}.cpp)
         target_link_libraries(${suite} PRIVATE tcp_server_mt)
+        target_include_directories(${suite} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/verify/support")
     endforeach()
 
     # No test-only define any more. The fault switches are unconditional
@@ -55,6 +57,8 @@ if(TCP_BUILD_SUITES)
     # hazard) and reachable only through the friend accessor in the harness.
     add_executable(fault_injection verify/suites/fault_injection.cpp)
     target_link_libraries(fault_injection PRIVATE tcp_server_mt)
+    target_include_directories(fault_injection PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/verify/support")
 
     # Differential FSM suite: the working-tree header and the close_fsm it
     # replaced (checked in as verify/support/tcp-server-mt.prev.h at the branch point)

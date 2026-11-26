@@ -48,14 +48,15 @@ fi
 g++ --version | head -1
 
 # Every build below runs from the project root, so `include` resolves against
-# it. Sources include the header by bare name; the ../.. arithmetic that used
-# to sit in twenty files was the thing that made any move expensive.
-base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
+# it. Sources include the header and harness by bare name; the ../.. arithmetic
+# that used to sit in twenty files was the thing that made any move expensive.
+base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude
+            -Iverify/support)
 # The FSM suite links two versions of the header into one binary: the new
 # conn_machine from the working tree and the close_fsm it replaced, kept as a
 # checked-in oracle at the branch point (8d55d8f). #pragma once is path-based,
 # so the two files can coexist inside separate namespaces.
-fsm_flags=("${base_flags[@]}" -Iverify/support
+fsm_flags=("${base_flags[@]}"
            -DNEWH='"tcp-server-mt.h"' -DOLDH='"tcp-server-mt.prev.h"')
 
 # The test uses the same switches to build, so both must agree on the macro or
