@@ -24,7 +24,9 @@ it with assertions, CI calls that script in its own step, and
 `ENABLE_SLOW=1 bash verify/run.sh` adds it to a local run. It is deliberately
 outside the three-configuration matrix: the claim is about accept-queue
 behaviour under a low descriptor ceiling, not about sanitizers. A host that
-never reaches EMFILE prints `[SKIP]` instead of a pass.
+never reaches EMFILE prints `[SKIP]` instead of a pass; locally that still
+exits 0, while CI's step rejects the line because the runner is expected to
+reach the ceiling.
 
 `verify/suites/tcp_server_fsm_test.cpp` is the exception to the socket-based pattern.
 It includes two headers under different paths and namespaces: the working-tree
