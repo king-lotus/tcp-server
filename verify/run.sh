@@ -104,6 +104,12 @@ run_all() {
     fi
     echo "---- running [$label] ----"
 
+    # Plain runs are the fast path; sanitizer builds are several times slower,
+    # and a 180s bound that a healthy suite only just fits is a flaky gate, not
+    # a hang detector. The per-run bound only matters when something is stuck.
+    local run_timeout=180
+    [ "$label" = "plain" ] || run_timeout=300
+
     for attempt in "close_semantics, default reactors:$out/close_semantics" \
                    "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 $out/close_semantics" \
                    "idle_semantics:$out/idle_semantics" \
@@ -125,7 +131,7 @@ run_all() {
         local cmd="${attempt#*:}"
         local rc=0
         # A bounded run: a hang has to present as a failure, not as a long coffee.
-        timeout 180 "${launcher[@]}" bash -c "$cmd" || rc=$?
+        timeout "$run_timeout" "${launcher[@]}" bash -c "$cmd" || rc=$?
         echo "   [$label] $name -> rc=$rc"
         [ "$rc" -eq 0 ] || failed=1
     done
@@ -170,10 +176,27 @@ run_cpplint() {
     fi
     echo "  control: $control findings, as expected"
 
-    out=$(python3 -m cpplint --quiet include/tcp-server-mt.h 2>&1)
+    if [ ! -r include/tcp-server-mt.h ]; then
+        echo "  [FAIL] include/tcp-server-mt.h is not readable"
+        return 1
+    fi
+    # Not --quiet: cpplint 2.x suppresses its "Done processing" line under
+    # --quiet, and that line is what distinguishes a clean file from one the
+    # tool never opened.
+    out=$(python3 -m cpplint include/tcp-server-mt.h 2>&1)
     case "$out" in
         *Traceback*|*"No such file"*|*"command not found"*)
             echo "  [FAIL] cpplint did not run:"
+            printf '%s\n' "$out" | tail -5
+            return 1 ;;
+    esac
+    # "No findings" and "never looked at the file" both leave `total` empty.
+    # cpplint prints this line whenever it actually processed the file, so its
+    # absence is the only thing that tells the two apart.
+    case "$out" in
+        *"Done processing include/tcp-server-mt.h"*) ;;
+        *)
+            echo "  [FAIL] cpplint did not process include/tcp-server-mt.h:"
             printf '%s\n' "$out" | tail -5
             return 1 ;;
     esac
@@ -184,6 +207,31 @@ run_cpplint() {
 }
 
 run_cpplint || overall=1
+echo
+
+# ---- generated state machine --------------------------------------------
+# The FSM table in the header, the test cases and docs/conn-fsm.md are all
+# generated from tools/conn_fsm_spec.h. A stale copy is a gate failure, not a
+# documentation detail, so every run re-derives the three and compares them.
+run_generator_check() {
+    echo "== generated state machine =="
+    g++ -std=c++17 -O1 -Iinclude -Iverify/support \
+        tools/gen_conn_fsm.cpp -o "$out/gen_conn_fsm" || return 1
+    "$out/gen_conn_fsm" --check \
+        --header include/tcp-server-mt.h \
+        --cases verify/suites/conn_fsm_cases.inc \
+        --doc docs/conn-fsm.md
+}
+run_generator_check || overall=1
+echo
+
+# ---- test-hook privacy -------------------------------------------------
+# The fault switches are always-present private members reached only through
+# the harness friend. This is a compile-only probe, cheap enough to keep in the
+# gate rather than in evidence/, where nobody would run it.
+if ! bash verify/evidence/probe_test_hooks_private.sh; then
+    overall=1
+fi
 echo
 
 build "plain"

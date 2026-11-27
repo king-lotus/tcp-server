@@ -29,11 +29,11 @@ flowchart LR
         A["ASan + UBSan"]
         T["TSan under setarch -R"]
     end
-    P --> R["run.sh<br/>11 runs each"]
+    P --> R["run.sh<br/>17 runs each"]
     A --> R
     T --> R
     R --> H["harness.h<br/>peer-side client"]
-    H --> S["9 suites<br/>each with main"]
+    H --> S["15 suites<br/>each with main"]
     R --> L["cpplint<br/>control run, then header"]
 ```
 
@@ -41,7 +41,7 @@ flowchart LR
 
 | File | Role |
 |---|---|
-| `verify/run.sh` | The gate: builds each configuration, runs every case with a 180 s timeout, runs cpplint |
+| `verify/run.sh` | The gate: builds each configuration, runs every case with a 180 s (plain) / 300 s (sanitizer) timeout, runs cpplint and the FSM generator check |
 | `verify/support/harness.h` | Peer side shared by all suites: connect, send, split writes, expect a frame, FIN/RST, raw sockets |
 | `verify/suites/*.cpp` | Fifteen suites |
 | `verify/bench/*.cpp` | Four benchmarks |

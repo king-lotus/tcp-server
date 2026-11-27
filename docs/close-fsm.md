@@ -278,11 +278,12 @@ connection can be torn down while still paused, EPOLLOUT can stay armed just
 after our own FIN, and a handler can tear a connection down while a close drain
 round is still on the stack.
 
-`verify/state_invariants.cpp` locks this down in three layers: a table of
-legal and illegal combinations (including the exact reason strings), a table
-of close decisions whose reactor-side effects must leave a legal combination,
-and a forked child proving the debug guard really aborts. The action-only
-transition table for `close_fsm` stays in `close_semantics.cpp`.
+The closed-enum machine makes an illegal combination unrepresentable rather
+than merely rejected: every state has an enumerator and nothing else does.
+`verify/suites/tcp_server_fsm_test.cpp` checks the 77 states, every generated
+cell, the payload plumbing, the oracle, and the previous implementation; the
+action-only transition table for `close_fsm` stays in
+`verify/suites/close_semantics.cpp`.
 
 ## Tests
 

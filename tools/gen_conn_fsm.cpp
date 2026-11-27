@@ -502,6 +502,16 @@ int main(int argc, char** argv) {
         else if (a == "--check") check = true;
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
+    // A --check with nothing to compare is not a pass: every path is skipped,
+    // stale stays 0, and the tool exits 0 without having looked at a file.
+    // CI or a pre-commit hook written that way would report green forever.
+    if (check && header.empty() && cases.empty() && doc.empty() &&
+        fragment.empty()) {
+        std::fprintf(stderr,
+                     "generator: --check needs at least one of --header, "
+                     "--cases, --doc or --fragment; refusing a vacuous check\n");
+        return 2;
+    }
     Table t;
     t.d = derive_all<SpecOracle>();
     for (const auto& c : t.d.cells) t.by_key[std::make_tuple(c.from, static_cast<int>(c.e), static_cast<int>(c.g))] = &c;

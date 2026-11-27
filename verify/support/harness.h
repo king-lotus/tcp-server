@@ -348,6 +348,9 @@ public:
     // so a second call would relabel a reset connection as a clean one.
     status expect_close(close_kind want, int timeout_ms = 1000) {
         if (fd_ < 0) return failed("expect_close: not connected");
+        // rx_buf_ may hold bytes expect_frame() over-read. They are payload,
+        // not an ending, and this call only judges the ending; they stay
+        // buffered so a later read_to_end() can return them.
         if (close_seen_) return closed_as(want, close_kind_);
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(timeout_ms);
@@ -380,6 +383,15 @@ public:
         if (out != nullptr) out->clear();
         if (end != nullptr) *end = close_kind::any;
         if (fd_ < 0) return failed("read_to_end: not connected");
+
+        // expect_frame() may have over-read: it keeps the bytes after the
+        // frame it returned in rx_buf_. Those bytes arrived before the close
+        // this call is about to observe, so they belong at the front of the
+        // stream -- dropping them here is how a later byte-count assertion
+        // fails on data the peer really did send.
+        if (out != nullptr)
+            out->insert(out->end(), rx_buf_.begin(), rx_buf_.end());
+        rx_buf_.clear();
 
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(timeout_ms);
@@ -423,6 +435,13 @@ public:
             fd_ = -1;
         }
         rx_buf_.clear();
+        // The remembered ending belongs to the descriptor that just went away.
+        // connect() calls close() before opening the next one, so leaving these
+        // set made a reused peer answer the next expect_close() from the
+        // previous connection -- a FIN from the old socket could be reported as
+        // the RST of a new one, or vice versa.
+        close_seen_ = false;
+        close_kind_ = close_kind::any;
     }
 
 private:

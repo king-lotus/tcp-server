@@ -26,6 +26,18 @@ out="$out_dir/$(basename "$src" .cpp)"
 flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -O1
        -Iinclude -Iverify/support)
 
+# Two suites select their build at the source level, exactly as run.sh does:
+# the FSM test includes the working header and the branch-point oracle under
+# two macros, and the seam suite picks its policy in this translation unit.
+case "$src" in
+    *tcp_server_fsm_test.cpp)
+        flags+=(-DNEWH='"tcp-server-mt.h"' -DOLDH='"tcp-server-mt.prev.h"')
+        ;;
+    *syscall_seam.cpp)
+        flags+=(-DTCP_SERVER_SYSCALL_POLICY=industrial::seam_policy)
+        ;;
+esac
+
 g++ "${flags[@]}" "$src" -o "$out" || { echo "build failed"; exit 2; }
 "$out" "$@"
 rc=$?

@@ -14,7 +14,7 @@ ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 51 configurations
 
 Each run is a separate build: ASan and TSan cannot be linked into one binary, and
 a suite that only passes under a sanitizer is a different claim from one that
-passes without. A hang is bounded by `timeout 180`; a failure is a non-zero exit,
+passes without. A hang is bounded by `timeout 180` (plain) or `timeout 300` (sanitizers); a failure is a non-zero exit,
 which is the only thing the runner reads.
 
 The suites live in `verify/suites/`. Most probes under `verify/evidence/` are not part
@@ -67,7 +67,7 @@ per-server state.
 
 A test binary may replace the whole policy by defining
 `TCP_SERVER_SYSCALL_POLICY` before any include of `tcp-server-mt.h`.
-`verify/syscall_seam.cpp` does that with `verify/syscall_seam_policy.h`, whose
+`verify/suites/syscall_seam.cpp` does that with `verify/support/syscall_seam_policy.h`, whose
 knobs are one-shot errnos consumed with `exchange(0)` on the reactor thread.
 That turns five failure paths into ordinary assertions, with no fork, no
 lowered `RLIMIT_NOFILE` and no attempt to manufacture a real EPIPE window:
@@ -101,7 +101,7 @@ so the suite tests the injection path rather than the loopback socket.
 `handler_duration_us` and `queue_wait_us` — stay empty by default, so a server
 that never enables the flag pays nothing for them. Bucket edges are fixed
 powers of two in microseconds, with a final `>=1024us` bucket for the long
-tail. `verify/latency_histograms.cpp` asserts the flag-off case (all three
+tail. `verify/suites/latency_histograms.cpp` asserts the flag-off case (all three
 empty), a sleeping handler's recorded duration, and queue-wait growth while
 the reactor is blocked.
 
@@ -192,7 +192,7 @@ after a reset has been reported once, `recv()` returns 0, which is
 indistinguishable from an orderly FIN, so a second `expect_close(fin)` relabelled a
 reset connection as a clean one. `peer` now remembers what it observed.
 
-running the full 48 configurations -- not only the suites that were touched --
+running the full 51 configurations -- not only the suites that were touched --
 caught the other: `port_is_listening` closed its probe descriptor twice when the
 connect succeeded, and the second close could land on a descriptor number the
 accept loop had just handed out. TSan reported it once, in a suite the change had

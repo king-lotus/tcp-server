@@ -23,12 +23,15 @@ cd "$proj"
 
 REPS="${REPS:-3}"
 SECS="${SECS:-3}"
-flags=(-std=c++17 -O2 -pthread -Iinclude)
+flags=(-std=c++17 -O2 -g -pthread -Iinclude)
+# Same output directory as the verification gate and bench/run.sh.
+out="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
+mkdir -p "$out"
 
 echo "== building =="
-g++ "${flags[@]}" verify/bench/rss.cpp  -o /tmp/m_rss
-g++ "${flags[@]}" verify/bench/rx.cpp   -o /tmp/m_rx
-g++ "${flags[@]}" verify/bench/send.cpp -o /tmp/m_send
+g++ "${flags[@]}" verify/bench/rss.cpp  -o "$out/m_rss"
+g++ "${flags[@]}" verify/bench/rx.cpp   -o "$out/m_rx"
+g++ "${flags[@]}" verify/bench/send.cpp -o "$out/m_send"
 g++ --version | head -1
 echo "   cores: $(nproc)   affinity: $(taskset -cp $$ 2>/dev/null | sed 's/.*list: //')"
 
@@ -43,23 +46,23 @@ row() {
     [ "$mode" = "fork" ] && envs+=("BENCH_CLIENT_FORK=1")
 
     local tmp; tmp=$(mktemp)
-    for _ in $(seq "$REPS"); do env "${envs[@]}" /tmp/m_rss 1000  >>"$tmp"; done
+    for _ in $(seq "$REPS"); do env "${envs[@]}" "$out"/m_rss 1000  >>"$tmp"; done
     RSS1=$(grep '^rss' "$tmp" | field per_conn_kb | median)
 
     : >"$tmp"
-    for _ in $(seq "$REPS"); do env "${envs[@]}" /tmp/m_rx 1 1 "$SECS" >>"$tmp"; done
+    for _ in $(seq "$REPS"); do env "${envs[@]}" "$out"/m_rx 1 1 "$SECS" >>"$tmp"; done
     R1=$(grep '^ingest' "$tmp" | field kframes_per_s | median)
 
     : >"$tmp"
-    for _ in $(seq "$REPS"); do env "${envs[@]}" /tmp/m_rx 2 2 "$SECS" >>"$tmp"; done
+    for _ in $(seq "$REPS"); do env "${envs[@]}" "$out"/m_rx 2 2 "$SECS" >>"$tmp"; done
     R2=$(grep '^ingest' "$tmp" | field kframes_per_s | median)
 
     : >"$tmp"
-    for _ in $(seq "$REPS"); do env "${envs[@]}" /tmp/m_rx 4 4 "$SECS" >>"$tmp"; done
+    for _ in $(seq "$REPS"); do env "${envs[@]}" "$out"/m_rx 4 4 "$SECS" >>"$tmp"; done
     R4=$(grep '^ingest' "$tmp" | field kframes_per_s | median)
 
     : >"$tmp"
-    for _ in $(seq "$REPS"); do env "${envs[@]}" /tmp/m_send 2000 56 >>"$tmp"; done
+    for _ in $(seq "$REPS"); do env "${envs[@]}" "$out"/m_send 2000 56 >>"$tmp"; done
     P50=$(grep '^send' "$tmp" | field p50_us | median)
     P99=$(grep '^send' "$tmp" | field p99_us | median)
 

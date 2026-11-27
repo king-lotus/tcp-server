@@ -29,29 +29,33 @@ proj="$(dirname "$(dirname "$here")")"
 cd "$proj"
 
 REPS="${REPS:-5}"
-flags=(-std=c++17 -O2 -pthread -Iinclude)
-raw="$(mktemp)"
+flags=(-std=c++17 -O2 -g -pthread -Iinclude)
+# Same output directory as the verification gate: under the home cache by
+# default, not /tmp, so a sandbox that gates /tmp does not gate benchmarks.
+out="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
+mkdir -p "$out"
+raw="$(mktemp "$out/bench-raw.XXXXXX")"
 trap 'rm -f "$raw"' EXIT
 
 echo "== building =="
-g++ "${flags[@]}" verify/bench/rss.cpp  -o /tmp/bench_rss
-g++ "${flags[@]}" verify/bench/rx.cpp   -o /tmp/bench_rx
-g++ "${flags[@]}" verify/bench/send.cpp -o /tmp/bench_send
+g++ "${flags[@]}" verify/bench/rss.cpp  -o "$out/bench_rss"
+g++ "${flags[@]}" verify/bench/rx.cpp   -o "$out/bench_rx"
+g++ "${flags[@]}" verify/bench/send.cpp -o "$out/bench_send"
 g++ --version | head -1
 echo "   cores: $(nproc)"
 
 echo "== running (${REPS} reps per measurement) =="
 # One discarded run each, then the ones that count.
-/tmp/bench_rss  1000 >/dev/null
-/tmp/bench_rx   1 1 1 >/dev/null
-/tmp/bench_send 200 56 >/dev/null
+"$out/bench_rss"  1000 >/dev/null
+"$out/bench_rx"   1 1 1 >/dev/null
+"$out/bench_send" 200 56 >/dev/null
 
 for _ in $(seq "$REPS"); do
-    /tmp/bench_rss 1000 >>"$raw"
-    /tmp/bench_rx 1 1 3 >>"$raw"
-    /tmp/bench_rx 2 2 3 >>"$raw"
-    /tmp/bench_rx 4 4 3 >>"$raw"
-    /tmp/bench_send 2000 56 >>"$raw"
+    "$out/bench_rss" 1000 >>"$raw"
+    "$out/bench_rx" 1 1 3 >>"$raw"
+    "$out/bench_rx" 2 2 3 >>"$raw"
+    "$out/bench_rx" 4 4 3 >>"$raw"
+    "$out/bench_send" 2000 56 >>"$raw"
 done
 
 python3 - "$raw" <<'PY'

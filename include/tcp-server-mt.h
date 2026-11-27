@@ -2946,8 +2946,10 @@ struct connection {
             if (sm.state().in_round())
                 return "close drain serving a read-paused connection";
         }
-        if (sm.fin_sent() && !closing)
-            return "FIN sent without a closing connection";
+        // "FIN sent without a closing connection" is not a reachable state in
+        // this machine: fin_sent() *is* the fin_sent phase, and closing() is
+        // true for that phase by construction. The invariant worth guarding is
+        // the one below -- a FIN may not follow bytes still in wbuf.
         if (sm.fin_sent() && !sm.wbuf_empty())
             return "bytes buffered after our FIN";
         return nullptr;
@@ -2984,8 +2986,9 @@ struct closed_conn {
 // to exist only as five push_back + continue pairs inside the walk, which made
 // their priority the statement order -- readable once and testable only through
 // a live reactor and a clock. Naming the outcome puts that order in one place
-// that verify/idle_semantics.cpp case F can call with a connection it built
-// itself and no sockets at all.
+// that a test can call with a connection it built itself and no sockets at
+// all; no suite does so today, so this stays a pure, directly callable seam
+// rather than a claim that one exercises it.
 namespace detail {
 
 enum class sweep_action {

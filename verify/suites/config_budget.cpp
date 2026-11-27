@@ -103,7 +103,9 @@ int main() {
                     "per-IP limits and SO_REUSEPORT are opt-in", detail);
 
     // Values that can never be honoured are refused rather than clamped into a
-    // server that admits nothing.
+    // server that admits nothing. The two [error] lines below are the expected
+    // diagnostics from those refusals; the assertions are the !start() checks.
+    std::printf("  (the next two [error] lines are expected refusals)\n");
     {
         multi_reactor_server::config bad = cfg;
         bad.port = 0;

@@ -695,19 +695,19 @@ bool recv_frame(int fd, industrial::frame_type* type,
 
 ```bash
 bash verify/run.sh                               # plain 配置
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 33 个配置全跑
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 51 个配置全跑
 ```
 
-九个套件、每个配置 11 次运行（`close_semantics` 和 `reactor_spread` 各多跑一次
-不同 reactor 数），三种配置 `{plain, asan+ubsan, tsan}`，共 33 次。每次运行由
-`timeout 180` 兜底，非零退出即失败。
+十五个套件、每个配置 17 次运行（`close_semantics` 和 `reactor_spread` 各多跑一次
+不同 reactor 数），三种配置 `{plain, asan+ubsan, tsan}`，共 51 次。plain 每次运行由
+`timeout 180` 兜底，sanitizer 配置为 300 秒；非零退出即失败。
 
 ### 11.2 CMake
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure       # 11 个测试
+ctest --test-dir build --output-on-failure       # 17 个测试
 ```
 
 `-DTCP_SANITIZE=address,undefined` 或 `-DTCP_SANITIZE=thread` 切换 sanitizer；

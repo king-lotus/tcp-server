@@ -15,7 +15,8 @@
 # host they were not -- an aborted connection arrives as an ordinary FIN -- so
 # that case sat unexecuted through three review rounds. Here it runs and
 # asserts. The last step files the verdict, per configuration, where anyone can
-# read it back.
+# read it back, and fails the job if any case declined: on this runner a skip
+# means the gate did not assert, not that the kernel has an opinion.
 name: verify
 
 on:
@@ -27,8 +28,8 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
-    # Every run has a 180s timeout inside the script, so a hung case presents as
-    # a failure rather than as an idle job.
+    # verify/run.sh bounds each case at 180s (plain) or 300s (sanitizers), so a
+    # hung case presents as a failure rather than as an idle job.
     timeout-minutes: 60
 
     steps:
@@ -61,9 +62,21 @@ jobs:
           set -o pipefail
           bash verify/run.sh 2>&1 | tee /tmp/verify-run.log
 
+      # Keep the full matrix log when the job fails. The Actions log endpoint
+      # requires repository admin rights, and without the artifact the first
+      # thing a red run forces is a local reproduction; `always()` also keeps
+      # the log when the step above timed out or was cancelled.
+      - name: verify log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-run-log
+          path: /tmp/verify-run.log
+          if-no-files-found: ignore
+
       # Separate from the matrix above: this is one kernel-behaviour assertion,
       # not something that needs three sanitizer builds. It used to be possible
-      # for the spare-descriptor path to regress while all 39 runs stayed green,
+      # for the spare-descriptor path to regress while every suite stayed green,
       # because the probe lived in verify/evidence/ and nothing called it. The
       # probe lowers its own descriptor ceiling and fails if the victim waits,
       # is not reset, or the listener does not recover; a kernel that never
@@ -74,11 +87,12 @@ jobs:
       # Three reasons this exists, and the second one is why the first version
       # of it was not enough.
       #
-      # 1. A [SKIP] changes no exit code. "asserted and passed" and "asked the
-      #    kernel and declined" leave the suite looking exactly alike, so the
-      #    truth about hup/err -- the one case that could never execute locally
-      #    -- stayed buried in a log nobody opens. An annotation can be read back
-      #    off the checks API by anyone, signed into GitHub or not.
+      # 1. A [SKIP] used to leave the job green. "asserted and passed" and
+      #    "asked the kernel and declined" looked exactly alike, so the truth
+      #    about hup/err -- the one case that could never execute locally --
+      #    stayed buried in a log nobody opens. The step now names every
+      #    decline and fails the job; the annotation is readable off the
+      #    checks API whether or not the reader is signed in.
       # 2. A case is free to run under plain and decline under tsan. The first
       #    version read only the first hup/err paragraph, so a skip in any later
       #    configuration would have been reported as that first verdict -- the
@@ -88,8 +102,11 @@ jobs:
       #    in, because "1 case skipped" invites every reader to assume it was
       #    not theirs.
       #
-      # It stays a warning and not a failure on purpose: whether a kernel that
-      # declines is a kernel worth supporting is a judgement, not a CI policy.
+      # On this runner a declined case is a gate failure, not a judgement call:
+      # ubuntu-latest delivers EPOLLHUP|EPOLLERR, so the hup/err case is
+      # expected to run, and "skipped" would otherwise be indistinguishable
+      # from "passed" in the job's exit code. Local runs stay lenient because
+      # WSL kernels legitimately turn a reset into an ordinary FIN.
       - name: what this kernel was willing to tell us
         if: always()
         run: |
@@ -97,6 +114,20 @@ jobs:
           if [ ! -f "$log" ]; then
             echo "::warning title=skipped cases::the suite left no log to read"
             exit 0
+          fi
+
+          # Name the failing line and the run that produced it in the checks
+          # API. The suite step's exit code already fails the job; this is what
+          # makes the failure readable without downloading the artifact.
+          failures=$(grep -E '\[FAIL\]|-> rc=[1-9]' "$log" || true)
+          if [ -n "$failures" ]; then
+            echo "::group::failing lines"
+            printf '%s\n' "$failures"
+            echo "::endgroup::"
+            while IFS= read -r line; do
+              [ -n "$line" ] &&
+                  printf '::error title=suite failure::%s\n' "$line"
+            done <<< "$failures"
           fi
 
           # Every [SKIP] line with the pass it happened in. Each configuration
@@ -125,6 +156,11 @@ jobs:
               [ -n "$line" ] &&
                   printf '::notice title=case declined to assert::%s\n' "$line"
           done <<< "$report"
+          declined=0
+          if [ -n "$report" ]; then
+              echo "::error title=case declined to assert::at least one case did not run on this runner; a skipped assertion is not a pass"
+              declined=1
+          fi
 
           # One hup/err verdict per configuration: the paragraph opening with its
           # title, taken up to the blank line that closes it. A fixed number of
@@ -149,7 +185,7 @@ jobs:
           )
           if [ -z "$verdicts" ]; then
               echo "::warning title=hup/err::no such case in the suite output"
-              exit 0
+              exit "$declined"
           fi
           ran=$(printf '%s\n' "$verdicts" | grep -c '^ran' || true)
           skipped=$(printf '%s\n' "$verdicts" | grep -c '^skip' || true)
@@ -159,4 +195,6 @@ jobs:
               echo "::notice title=hup/err ran in $ran configuration(s)::$detail"
           else
               echo "::warning title=hup/err skipped in $skipped of $((ran + skipped)) configuration(s)::$detail"
+              declined=1
           fi
+          exit "$declined"

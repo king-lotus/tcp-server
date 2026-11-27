@@ -93,8 +93,8 @@ if(TCP_BUILD_SUITES)
         endif()
     endif()
 
-    # The same sixteen runs run.sh performs: fourteen suites, plus the two that
-    # run a second time at a different reactor count.
+    # The same seventeen runs run.sh performs: fifteen suites, plus the two
+    # that run a second time at a different reactor count.
     add_test(NAME close_semantics
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:close_semantics>)
     add_test(NAME close_semantics_1_reactor
@@ -134,15 +134,16 @@ if(TCP_BUILD_SUITES)
     add_test(NAME tcp_server_fsm_test
              COMMAND ${TCP_TEST_PREFIX} $<TARGET_FILE:tcp_server_fsm_test>)
 
-    # run.sh gives each case 180s so a hang presents as a failure; the same
-    # bound here keeps ctest from outliving the CI job.
+    # run.sh gives plain runs 180s and sanitizer runs 300s so a hang presents
+    # as a failure; ctest uses the looser bound so a sanitizer build is not
+    # failed by a slow runner.
     set_tests_properties(close_semantics close_semantics_1_reactor
                          idle_semantics ping_pong send_results backpressure
                          fault_injection reactor_spread
                          reactor_spread_2_reactors config_budget
                          harness_selftest watermark hardening frame_codec
                          tcp_server_fsm_test syscall_seam latency_histograms
-                         PROPERTIES TIMEOUT 180)
+                         PROPERTIES TIMEOUT 300)
 endif()
 
 if(TCP_BUILD_BENCH)
@@ -150,7 +151,7 @@ if(TCP_BUILD_BENCH)
         add_executable(bench_${bench} verify/bench/${bench}.cpp)
         target_link_libraries(bench_${bench} PRIVATE tcp_server_mt)
         if(NOT MSVC)
-            target_compile_options(bench_${bench} PRIVATE -O2)
+            target_compile_options(bench_${bench} PRIVATE -O2 -g)
         endif()
     endforeach()
 endif()

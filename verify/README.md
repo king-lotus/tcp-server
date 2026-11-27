@@ -18,7 +18,9 @@ The FSM suite is the one that opens no sockets. It compiles
 the working-tree `conn_machine` and the checked-in `tcp-server-mt.prev.h`
 (the `close_fsm` at the branch point) into different namespaces, then checks
 every admitted state, compares every close decision against the old machine,
-and runs 40x20000 random walks. `--table` regenerates `docs/conn-fsm.md`.
+and runs 40x20000 random walks. `tools/gen_conn_fsm.cpp` regenerates the
+header region, `verify/suites/conn_fsm_cases.inc` and `docs/conn-fsm.md`; its
+`--check` mode compares all three and is part of `verify/run.sh`.
 
 ## 不能验证什么
 
@@ -29,7 +31,7 @@ and runs 40x20000 random walks. `--table` regenerates `docs/conn-fsm.md`.
 ## 跑全套
 
 ```bash
-bash verify/run.sh                             # 默认配置（2 / 1 reactor 各一轮 + 故障注入）
+bash verify/run.sh                             # 全部套件；两个跨 reactor 用例各多跑一次
 ENABLE_ASAN=1 bash verify/run.sh               # 另跑一轮 ASan + UBSan
 ENABLE_TSAN=1 bash verify/run.sh               # 另跑一轮 TSan
 ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh # 全都要
@@ -80,7 +82,8 @@ g++ -std=c++17 -Wall -Wextra -pthread \
 类有不同定义是 ODR 违规），而"总是存在"不等于"谁都能碰"——只有 `harness.h` 里
 的 `industrial::test_access`（服务器声明的友元）能扳动它们。原来那个
 `INDUSTRIAL_TCP_TESTING` 宏因此失去意义，已删除；私有性本身由
-`verify/evidence/probe_test_hooks_private.sh` 守住（直接访问必须编译失败）。
+`verify/evidence/probe_test_hooks_private.sh` 守住（直接访问必须编译失败），
+`verify/run.sh` 每次都会执行它。
 
 | 用例 | 断言 |
 |------|------|

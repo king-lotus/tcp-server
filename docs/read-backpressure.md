@@ -1,7 +1,17 @@
 # Read-side backpressure — watermark design
 
 Status: **implemented** · design 2026-11-13 · landed in `33f0479`, together
-with the `EPOLLHUP|EPOLLERR` ordering fix it depended on.
+with the `EPOLLHUP|EPOLLERR` ordering fix it depended on. The implementation
+has since moved to the closed-enum `conn_machine`.
+
+> **The pseudo-code and field names below are the original proposal.** The
+> shipped state lives in `conn_state` (`conn_phase` / `read_mode` /
+> `write_armed`), not in `read_armed`, `c->fsm.closing` or `is_closed`; pause
+> and resume decisions are `conn_sm::on_pause` / `on_resume`; the interest mask
+> is applied by `apply_interest()`; the only new counter is `read_pauses`.
+> `on_pause` is stricter than the design's guard: it also refuses a peer-FIN
+> read mode and an in-round close drain. Do not implement against the snippets
+> below; they are kept for the rationale behind the shipped behaviour.
 
 Implementation note: the shipped configuration names are
 `read_high_watermark_bytes` / `read_low_watermark_bytes` (0 means 3/4 and 1/2

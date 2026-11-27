@@ -19,6 +19,15 @@ N=${1:-8}
 BEFORE_REF=${2:-HEAD}
 cd "$PROJ" || exit 9
 
+# TSan reserves a fixed shadow region and cannot start when the kernel hands
+# out high vm.mmap_rnd_bits (Ubuntu 24.04+). Without this, every run dies before
+# main(), the result line is missing, and the script counts it as a
+# reproduction -- the opposite of what happened.
+launcher=()
+if command -v setarch >/dev/null 2>&1; then
+  launcher=(setarch "$(uname -m)" -R)
+fi
+
 rm -rf /tmp/cfr_before /tmp/cfr_after
 mkdir -p /tmp/cfr_before/verify /tmp/cfr_after/verify
 
@@ -82,7 +91,8 @@ for label in before after; do
   clean=0
   for i in $(seq 1 "$N"); do
     rm -f /tmp/cfr_run.out
-    CS_REACTORS=1 timeout 300 /tmp/cfr_bin_$label > /tmp/cfr_run.out 2>/tmp/cfr_run.err
+    CS_REACTORS=1 timeout 300 "${launcher[@]}" /tmp/cfr_bin_$label \
+        > /tmp/cfr_run.out 2>/tmp/cfr_run.err
     rc=$?
     line=$(grep "of 20 rounds lost" /tmp/cfr_run.out || echo "no result line")
     echo "$label run $i rc=$rc :: $line"

@@ -70,13 +70,13 @@ predictable behaviour when a peer misbehaves:
 ```
 tcp-server/
 ├── include/
-│   └── tcp-server-mt.h          the single deliverable (3,445 lines)
+│   └── tcp-server-mt.h          the single deliverable (7,455 lines)
 ├── verify/
 │   ├── run.sh                   authoritative Linux gate
-│   ├── suites/                  12 standing suites
+│   ├── suites/                  15 standing suites
 │   ├── support/                 shared harness and the branch-point oracle
 │   ├── bench/                   4 benchmarks and their scripts
-│   └── evidence/                20 one-off probes, not part of CI
+│   └── evidence/                one-off probes and scripts, not part of CI
 ├── docs/
 │   ├── architecture-zh.md       design rationale, in Chinese
 │   ├── api-reference.md         the public surface, contract by contract

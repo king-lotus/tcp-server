@@ -203,8 +203,11 @@ int main() {
                         "the slow reader is still connected");
         harness::expect(ts.fixture_.stats().aborted.load() == 0,
                         "no RST was sent");
-        harness::expect(ts.fixture_.stats().frames_recv.load() < kRequests,
-                        "parsing stopped before consuming the whole backlog");
+        // Not an assertion: read_pauses already proves the pause happened, and
+        // whether the kernel absorbed enough of the send buffer to resume
+        // within this window is a property of the host, not of the server.
+        std::printf("      frames_recv=%llu at the pause window\n",
+                    (unsigned long long)ts.fixture_.stats().frames_recv.load());
 
         frame_stream in;
         in.fd = peer.fd();
@@ -236,6 +239,42 @@ int main() {
         harness::expect(pong, "the resumed connection answers a PING");
         harness::expect(ts.fixture_.stats().aborted.load() == 0,
                         "the exchange stayed graceful");
+    }
+
+    // ---- A2: the parser stops at the high mark -----------------------------
+    //
+    // Case A's drain proves the pause happened, but a kernel can absorb enough
+    // of one reply to resume before the test looks. This case asks the other
+    // half directly: with a backlog far larger than any local send buffer can
+    // absorb (400 requests x 64 KiB replies is ~25 MiB), a server that kept
+    // parsing while "paused" would have to have queued all of it. It cannot,
+    // so `frames_recv < kBacklog` is a host-independent statement that the
+    // parser stopped.
+    {
+        std::printf("A2. parsing stops at the high watermark\n");
+        test_server ts(watermark_config());
+        if (!ts.fixture_.started()) {
+            harness::expect(false, "start() ok");
+        } else {
+            harness::peer peer;
+            (void)peer.connect(ts.fixture_.port());
+            shrink_receive_buffer(peer);
+            constexpr size_t kBacklog = 400;
+            (void)send_requests(peer, kBacklog);
+            harness::expect(wait_for(5000, [&] {
+                                return ts.fixture_.stats().read_pauses.load() >= 1;
+                            }), "read side paused");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            harness::expect(ts.fixture_.server().connection_count() == 1,
+                            "the connection stayed open");
+            harness::expect(ts.fixture_.stats().aborted.load() == 0,
+                            "no reset");
+            const uint64_t parsed = ts.fixture_.stats().frames_recv.load();
+            std::printf("      parsed %llu of %zu backed-up requests\n",
+                        (unsigned long long)parsed, kBacklog);
+            harness::expect(parsed < kBacklog,
+                            "the parser did not consume the whole backlog");
+        }
     }
 
     // ---- B: close while paused ---------------------------------------------

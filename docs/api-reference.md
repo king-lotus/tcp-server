@@ -510,8 +510,8 @@ any include of the header. Omitting `wake_write` is a compile error, not a
 runtime fallback. Since the alias is part of the class definition's inline
 bodies, every translation unit in one binary must see the same policy; the
 verify runner compiles the injecting suite as its own target.
-`verify/syscall_seam_policy.h` is the reference implementation and
-`verify/syscall_seam.cpp` uses it to make EPIPE, short writes, a failed
+`verify/support/syscall_seam_policy.h` is the reference implementation and
+`verify/suites/syscall_seam.cpp` uses it to make EPIPE, short writes, a failed
 `shutdown`, a failed `epoll_ctl(MOD)` and `accept4` EMFILE deterministic tests.
 
 ## What the library does not do

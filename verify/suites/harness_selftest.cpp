@@ -15,8 +15,11 @@
 //   D. expect_close(rst) recognises a reset, and does not call it a FIN
 //   E. expect_frame() times out on silence and says so
 //   F. send_raw() writes the bytes it was given, unchanged
+//   G. a peer reused for a second connection does not remember the first
+//      connection's ending
+//   H. read_to_end() returns bytes expect_frame() over-read into its buffer
 //
-// Exit code 0 = the harness distinguishes all six.
+// Exit code 0 = the harness distinguishes all eight.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -231,6 +234,78 @@ void case_timeout() {
     peer.close();
 }
 
+void case_read_to_end_after_expect_frame() {
+    std::printf("H. read_to_end keeps bytes expect_frame over-read\n");
+    raw_server rs;
+    if (!rs.start()) { harness::expect(false, "raw listener bound"); return; }
+
+    harness::peer peer;
+    harness::expect(static_cast<bool>(peer.connect(rs.port_num)),
+                    "peer connected");
+    const int fd = rs.accept_one();
+    if (fd < 0) { harness::expect(false, "raw side accepted"); return; }
+
+    // Two small frames in one write: expect_frame() reads both into rx_buf_,
+    // returns the first, and leaves the second buffered.
+    uint8_t stream[2 * (industrial::FRAME_HEADER_SIZE + 1)];
+    industrial::encode_frame_into(stream, frame_type::DATA, "a", 1);
+    industrial::encode_frame_into(
+        stream + industrial::FRAME_HEADER_SIZE + 1, frame_type::DATA, "b", 1);
+    harness::expect(send_all(fd, stream, sizeof(stream)),
+                    "both frames sent");
+    ::close(fd);                                                  // FIN
+
+    harness::frame first;
+    harness::expect(static_cast<bool>(peer.expect_frame(&first, 1000)),
+                    "the first frame arrived");
+    std::vector<uint8_t> rest;
+    harness::close_kind end = harness::close_kind::any;
+    const harness::status st = peer.read_to_end(&rest, &end, 1000);
+    harness::expect(static_cast<bool>(st), "the stream ended", st.why);
+    harness::expect(end == harness::close_kind::fin, "the ending was a FIN");
+    harness::expect(rest.size() == industrial::FRAME_HEADER_SIZE + 1 &&
+                        rest[industrial::FRAME_HEADER_SIZE] == 'b',
+                    "the over-read second frame was not lost");
+    peer.close();
+}
+
+void case_reused_peer() {
+    std::printf("G. a reused peer forgets the previous connection's ending\n");
+    raw_server rs;
+    if (!rs.start()) { harness::expect(false, "raw listener bound"); return; }
+
+    harness::peer peer;
+
+    // First connection: an orderly FIN.
+    harness::expect(static_cast<bool>(peer.connect(rs.port_num)),
+                    "first connection");
+    int fd = rs.accept_one();
+    if (fd < 0) { harness::expect(false, "first accept"); return; }
+    ::close(fd);
+    harness::expect(static_cast<bool>(
+                        peer.expect_close(harness::close_kind::fin, 1000)),
+                    "the first ending is a FIN");
+
+    // Second connection through the same peer object: a reset. A stale
+    // close_seen_/close_kind_ would answer this from the first connection and
+    // report FIN, which is exactly the harness bug this case exists for.
+    harness::expect(static_cast<bool>(peer.connect(rs.port_num)),
+                    "second connection on the same peer");
+    fd = rs.accept_one();
+    if (fd < 0) { harness::expect(false, "second accept"); return; }
+    struct linger lg{};
+    lg.l_onoff  = 1;
+    lg.l_linger = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    ::close(fd);
+
+    const harness::status st = peer.expect_close(harness::close_kind::rst, 1000);
+    harness::expect(static_cast<bool>(st),
+                    "the second ending is the one reported, not the first",
+                    st.why);
+    peer.close();
+}
+
 void case_raw_bytes() {
     std::printf("F. send_raw() writes the bytes verbatim\n");
     raw_server rs;
@@ -263,6 +338,8 @@ int main() {
     case_rst();
     case_timeout();
     case_raw_bytes();
+    case_reused_peer();
+    case_read_to_end_after_expect_frame();
     std::printf("\n");
     return harness::finish();
 }

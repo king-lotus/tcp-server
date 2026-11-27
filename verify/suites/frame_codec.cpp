@@ -1,4 +1,4 @@
-// verify/frame_codec.cpp -- the header's decisions, off the reactor.
+// verify/suites/frame_codec.cpp -- the header's decisions, off the reactor.
 //
 // decode_header() is pure, so its whole input domain is eight bytes plus one
 // policy flag. Three layers check it here:
@@ -13,7 +13,7 @@
 //      in the ordinary suite and under clang's fuzzer.
 //
 // To run a real fuzzing session:
-//   clang++ -std=c++17 -Iinclude -DTCP_FUZZING=1 -fsanitize=fuzzer,address verify/frame_codec.cpp -o decode_header_fuzz
+//   clang++ -std=c++17 -Iinclude -DTCP_FUZZING=1 -fsanitize=fuzzer,address verify/suites/frame_codec.cpp -o decode_header_fuzz
 //   ./decode_header_fuzz -dict=verify/fuzz/decode_header.dict -max_len=12 -max_total_time=60
 //
 // Linux only when built with the suite driver (harness.h); the fuzz target

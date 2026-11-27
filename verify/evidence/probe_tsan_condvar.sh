@@ -52,9 +52,21 @@ echo "== building the minimal handshake under ThreadSanitizer =="
 g++ -std=c++17 -g -fsanitize=thread -pthread cv.cpp -o cv || exit 1
 
 echo "== running =="
-TSAN_OPTIONS=halt_on_error=0 ./cv > cv.out 2> cv.err
+# Same ASLR workaround as verify/run.sh: a TSan binary that never reaches
+# main() must not be read as a finding about the handshake.
+launcher=()
+if command -v setarch >/dev/null 2>&1; then
+  launcher=(setarch "$(uname -m)" -R)
+fi
+TSAN_OPTIONS=halt_on_error=0 "${launcher[@]}" ./cv > cv.out 2> cv.err
 rc=$?
 cat cv.out
+if grep -q "unexpected memory mapping" cv.err; then
+    echo
+    echo "!! ThreadSanitizer could not start on this kernel (ASLR/shadow layout)."
+    echo "   This run says nothing about the handshake; exiting 2."
+    exit 2
+fi
 if grep -q "ThreadSanitizer" cv.err; then
     echo
     echo "!! ThreadSanitizer complains about the bare handshake too:"

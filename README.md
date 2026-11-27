@@ -160,10 +160,11 @@ were only never executed locally. Two of the three have since been closed:
   against a break the host cannot produce would be asserting against the host.
   CI put it somewhere that can: on the runner, `send_results` reports hup/err as
   having run and asserted under plain, asan+ubsan and tsan alike, with no other
-  case in the suite declining. The verdict comes back as an annotation filed by
-  the step named "what this kernel was willing to tell us", not as an exit code,
-  because a `[SKIP]` leaves the exit code alone: nothing else in the output
-  separates "asserted and passed" from "never ran".
+  case in the suite declining. The verdict is filed as an annotation by the step
+  named "what this kernel was willing to tell us"; on that runner a `[SKIP]`
+  also fails the job, because a declined assertion is not a pass. Local runs
+  stay lenient: a WSL kernel that turns a reset into an ordinary FIN may
+  legitimately skip the same case.
 
 - **Which reactor a connection lands on -- closed, 2026-10-18.** The note here
   used to say that reactor-count-dependent behaviour had only been run with

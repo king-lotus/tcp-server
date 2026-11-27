@@ -210,8 +210,11 @@ void case_queue_wait_and_loop_lag() {
 
     // Wait for a few timer expiries rather than a fixed sleep: a fast machine
     // then cannot skip the assertion, and a slow one does not stall it.
+    // Five seconds, not one: the point is that expiries are sampled at all,
+    // and a loaded sanitizer runner can take longer than a second to produce
+    // three ticks. A real sampling regression still fails, just later.
     const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(1000);
+                          std::chrono::milliseconds(5000);
     while (samples(f.stats().loop_lag_us) < 3 &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
