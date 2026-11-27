@@ -67,12 +67,28 @@ if grep -q "unexpected memory mapping" cv.err; then
     echo "   This run says nothing about the handshake; exiting 2."
     exit 2
 fi
+# A launch failure (setarch denied by seccomp, missing binary) leaves no
+# completion line and no ThreadSanitizer text. Without this guard the script
+# would read that silence as "no TSan complaint" and draw the opposite
+# conclusion from a run that never happened. The completion line is the
+# evidence that the handshake actually ran; TSan's exit code 66 on a real
+# report is a valid outcome, not a launch failure.
+if ! grep -q "handshake completed: yes" cv.out; then
+    echo
+    echo "!! the probe did not complete (rc=$rc); inconclusive."
+    sed -n '1,5p' cv.err
+    exit 2
+fi
 if grep -q "ThreadSanitizer" cv.err; then
     echo
     echo "!! ThreadSanitizer complains about the bare handshake too:"
     grep -E "SUMMARY|WARNING" cv.err
     echo
     echo "=> the report is about this library/platform, not about the server."
+elif [ "$rc" -ne 0 ]; then
+    echo
+    echo "!! the probe exited rc=$rc without a ThreadSanitizer report; inconclusive."
+    exit 2
 else
     echo
     echo "no ThreadSanitizer output from the bare handshake."

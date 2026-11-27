@@ -13,6 +13,10 @@
 # Measured on this machine, 20 rounds per run, ThreadSanitizer, CS_REACTORS=1:
 #   before the drainInputThenClose fix: 4 of 8 runs reproduced
 #   after:                              0 of 8 runs reproduced
+#
+# A run that times out, fails to launch, or never prints the result line is
+# counted as invalid, not as a reproduction. Any invalid run makes the script
+# exit nonzero: a launch failure must not be read as evidence for the race.
 set -u
 PROJ=${PROJ:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 N=${1:-8}
@@ -77,6 +81,7 @@ cp "$PROJ/verify/support/harness.h"  /tmp/cfr_after/harness.h
 FLAGS=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -g
        -fsanitize=thread -fno-omit-frame-pointer)
 
+bad=0
 for label in before after; do
   build_args=("${FLAGS[@]}")
   src_dir=/tmp/cfr_$label
@@ -89,18 +94,37 @@ for label in before after; do
       -o /tmp/cfr_bin_$label ) || exit 9
   repro=0
   clean=0
+  invalid=0
   for i in $(seq 1 "$N"); do
     rm -f /tmp/cfr_run.out
     CS_REACTORS=1 timeout 300 "${launcher[@]}" /tmp/cfr_bin_$label \
         > /tmp/cfr_run.out 2>/tmp/cfr_run.err
     rc=$?
-    line=$(grep "of 20 rounds lost" /tmp/cfr_run.out || echo "no result line")
-    echo "$label run $i rc=$rc :: $line"
-    case "$line" in
-      "      0 of 20 rounds lost a reply they had produced") clean=$((clean+1)) ;;
-      *) repro=$((repro+1)) ;;
-    esac
+    if [ "$rc" -ne 0 ]; then
+      echo "$label run $i rc=$rc :: INVALID (no verdict; timeout or launch failure)"
+      invalid=$((invalid+1)); bad=1; continue
+    fi
+    line=$(grep -m1 "of 20 rounds lost" /tmp/cfr_run.out || true)
+    echo "$label run $i rc=$rc :: ${line:-INVALID (no result line)}"
+    if [ -z "$line" ]; then
+      invalid=$((invalid+1)); bad=1; continue
+    fi
+    # Parse the count, not a substring: "10 of 20 rounds lost" contains
+    # "0 of 20 rounds lost", so a pattern match would count a repro as clean.
+    lost=$(printf '%s\n' "$line" |
+           sed -n 's/^[[:space:]]*\([0-9][0-9]*\) of 20 rounds lost.*/\1/p')
+    if [ -z "$lost" ]; then
+      invalid=$((invalid+1)); bad=1
+    elif [ "$lost" -eq 0 ]; then
+      clean=$((clean+1))
+    else
+      repro=$((repro+1))
+    fi
   done
-  echo "== $label: clean=$clean repro_or_broken=$repro (of $N)"
+  echo "== $label: clean=$clean repro=$repro invalid=$invalid (of $N)"
   echo "   last trace retained at /tmp/cfr_run.err"
 done
+[ "$bad" -eq 0 ] || {
+  echo "one or more runs produced no verdict; the counts above are not a measurement" >&2
+}
+exit "$bad"

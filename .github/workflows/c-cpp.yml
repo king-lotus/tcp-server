@@ -62,27 +62,37 @@ jobs:
           set -o pipefail
           bash verify/run.sh 2>&1 | tee /tmp/verify-run.log
 
-      # Keep the full matrix log when the job fails. The Actions log endpoint
-      # requires repository admin rights, and without the artifact the first
-      # thing a red run forces is a local reproduction; `always()` also keeps
-      # the log when the step above timed out or was cancelled.
-      - name: verify log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: verify-run-log
-          path: /tmp/verify-run.log
-          if-no-files-found: ignore
-
       # Separate from the matrix above: this is one kernel-behaviour assertion,
       # not something that needs three sanitizer builds. It used to be possible
       # for the spare-descriptor path to regress while every suite stayed green,
       # because the probe lived in verify/evidence/ and nothing called it. The
       # probe lowers its own descriptor ceiling and fails if the victim waits,
-      # is not reset, or the listener does not recover; a kernel that never
-      # reaches EMFILE reports [SKIP] rather than a pass.
+      # is not reset, or the listener does not recover. A local host that never
+      # reaches EMFILE prints [SKIP]; on this runner that is a gate failure,
+      # because a skipped assertion is not a pass.
       - name: EMFILE probe
-        run: bash verify/evidence/run_emfile.sh
+        run: |
+          set -o pipefail
+          bash verify/evidence/run_emfile.sh 2>&1 | tee /tmp/emfile-probe.log
+          if grep -qE '^[[:space:]]*\[SKIP\]' /tmp/emfile-probe.log; then
+            echo "::error title=EMFILE probe skipped::the probe did not reach EMFILE on this runner"
+            exit 1
+          fi
+
+      # Keep the complete logs when the job fails. The Actions log endpoint
+      # requires repository admin rights, and without the artifact the first
+      # thing a red run forces is a local reproduction; `always()` also keeps
+      # the logs when a step timed out or was cancelled. This runs after the
+      # EMFILE probe so its output is included.
+      - name: verify log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-run-log
+          path: |
+            /tmp/verify-run.log
+            /tmp/emfile-probe.log
+          if-no-files-found: ignore
 
       # Three reasons this exists, and the second one is why the first version
       # of it was not enough.

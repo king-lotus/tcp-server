@@ -7,9 +7,11 @@
 # a kernel-behaviour probe, not a memory- or race-sanitizer claim. CI calls it
 # in a separate step; locally ENABLE_SLOW=1 bash verify/run.sh calls the same
 # script after the ordinary suites. A host that never reaches EMFILE prints
-# [SKIP] and does not fail the job -- the descriptor ceiling is lowered by the
-# probe itself, but what the accept queue does at that ceiling is up to the
-# kernel (WSL 1 dequeues and closes instead of leaving the connection queued).
+# [SKIP] and this script still exits 0, so a local WSL run stays usable -- the
+# descriptor ceiling is lowered by the probe itself, but what the accept queue
+# does at that ceiling is up to the kernel (WSL 1 dequeues and closes instead
+# of leaving the connection queued). CI's step treats the same [SKIP] as a
+# gate failure, because the runner is expected to reach the ceiling.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

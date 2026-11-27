@@ -6,8 +6,8 @@
 # rather than on a regression. These numbers are worth having when they are
 # compared against numbers taken on the same machine minutes earlier.
 #
-#   bash verify/bench/run.sh            # 5 repetitions, medians
-#   REPS=3 bash verify/bench/run.sh     # quicker, noisier
+#   bash verify/bench/run.sh            # 5 repetitions, 3s each, medians
+#   REPS=3 SECS=2 bash verify/bench/run.sh   # quicker, noisier
 #
 # What it measures, and why each one:
 #   rss     -- resident memory per idle connection. Buffers are allocated when a
@@ -29,6 +29,7 @@ proj="$(dirname "$(dirname "$here")")"
 cd "$proj"
 
 REPS="${REPS:-5}"
+SECS="${SECS:-3}"
 flags=(-std=c++17 -O2 -g -pthread -Iinclude)
 # Same output directory as the verification gate: under the home cache by
 # default, not /tmp, so a sandbox that gates /tmp does not gate benchmarks.
@@ -44,7 +45,7 @@ g++ "${flags[@]}" verify/bench/send.cpp -o "$out/bench_send"
 g++ --version | head -1
 echo "   cores: $(nproc)"
 
-echo "== running (${REPS} reps per measurement) =="
+echo "== running (${REPS} reps per measurement, ${SECS}s per ingest) =="
 # One discarded run each, then the ones that count.
 "$out/bench_rss"  1000 >/dev/null
 "$out/bench_rx"   1 1 1 >/dev/null
@@ -52,9 +53,9 @@ echo "== running (${REPS} reps per measurement) =="
 
 for _ in $(seq "$REPS"); do
     "$out/bench_rss" 1000 >>"$raw"
-    "$out/bench_rx" 1 1 3 >>"$raw"
-    "$out/bench_rx" 2 2 3 >>"$raw"
-    "$out/bench_rx" 4 4 3 >>"$raw"
+    "$out/bench_rx" 1 1 "$SECS" >>"$raw"
+    "$out/bench_rx" 2 2 "$SECS" >>"$raw"
+    "$out/bench_rx" 4 4 "$SECS" >>"$raw"
     "$out/bench_send" 2000 56 >>"$raw"
 done
 
