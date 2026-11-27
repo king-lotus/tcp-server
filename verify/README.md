@@ -12,6 +12,15 @@ bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加�
 - **运行时行为**：关闭语义、背压、空闲判定、故障注入、`send_to` 的每一种回答
 - race 与内存错误：ASan + UBSan、TSan 各跑一整套
 - 头文件被多个翻译单元包含时的 ODR/重复定义问题
+- syscall seam 的六条失败路径：用编译期 policy 一次性注入 `recv` / `sendmsg` / `shutdown` / `epoll_ctl` / `accept4` 的 errno，断言原有计数与 FIN/RST 行为，不再依赖 fork 或降 rlimit
+
+The FSM suite is the one that opens no sockets. It compiles
+the working-tree `conn_machine` and the checked-in `tcp-server-mt.prev.h`
+(the `close_fsm` at the branch point) into different namespaces, then checks
+every admitted state, compares every close decision against the old machine,
+and runs 40x20000 random walks. `tools/gen_conn_fsm.cpp` regenerates the
+header region, `verify/suites/conn_fsm_cases.inc` and `docs/conn-fsm.md`; its
+`--check` mode compares all three and is part of `verify/run.sh`.
 
 ## 不能验证什么
 
@@ -22,7 +31,7 @@ bash verify/run.sh        # 默认配置；ENABLE_ASAN=1 / ENABLE_TSAN=1 追加�
 ## 跑全套
 
 ```bash
-bash verify/run.sh                             # 默认配置（2 / 1 reactor 各一轮 + 故障注入）
+bash verify/run.sh                             # 全部套件；两个跨 reactor 用例各多跑一次
 ENABLE_ASAN=1 bash verify/run.sh               # 另跑一轮 ASan + UBSan
 ENABLE_TSAN=1 bash verify/run.sh               # 另跑一轮 TSan
 ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh # 全都要
@@ -36,7 +45,7 @@ ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh # 全都要
 
 ```bash
 # 只能在 Linux 上跑
-g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semantics && ./close_semantics
+g++ -std=c++17 -Wall -Wextra -pthread verify/suites/close_semantics.cpp -o close_semantics && ./close_semantics
 
 CS_REACTORS=1 ./close_semantics     # 所有客户端落到同一个 reactor
 ```
@@ -57,26 +66,38 @@ worker 上的故障会被平均掉** —— 两个 reactor 时表现为"每隔�
 >
 > 之后同一台机器上又抓到三个（P0-4 / P0-5 / P0-6），全都在**关闭路径与启动发布**上。
 
-## `fault_injection.cpp` —— 让 `INDUSTRIAL_TCP_TESTING` 有消费者
+## `fault_injection.cpp` —— 让故障开关有消费者
 
-`fail_worker_for_test` / `fail_accept_for_test` 是为"worker 从异常里退出以后该怎么办"准备的，
+`fail_worker_for_test` / `fail_accept_for_test`（以及按索引精确定位某个 reactor 的
+`fail_worker_reactor_for_test`）是为"worker 从异常里退出以后该怎么办"准备的，
 但在补这个文件之前，**没有任何代码翻动它们**：两个开关，零个消费者。
 没人去扳的开关，和被注释掉的断言一样，都不是测试。
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
-    verify/fault_injection.cpp -o fault_injection && ./fault_injection
+g++ -std=c++17 -Wall -Wextra -pthread \
+    verify/suites/fault_injection.cpp -o fault_injection && ./fault_injection
 ```
 
-没有那个宏时这个文件**编译不过**（`#error` 而不是静默少测一个用例——见下）。
+这些开关现在是服务器的**私有成员**：类定义不再随宏变化（两个编译单元对同一个
+类有不同定义是 ODR 违规），而"总是存在"不等于"谁都能碰"——只有 `harness.h` 里
+的 `industrial::test_access`（服务器声明的友元）能扳动它们。原来那个
+`INDUSTRIAL_TCP_TESTING` 宏因此失去意义，已删除；私有性本身由
+`verify/evidence/probe_test_hooks_private.sh` 守住（直接访问必须编译失败），
+`verify/run.sh` 每次都会执行它。
 
 | 用例 | 断言 |
 |------|------|
-| A | reactor 异常退出 → `is_running()` 转假、`reactor_failures` 计数、`stop()` 仍能正常返回 |
-| B | accept 线程异常退出 → 同上，且它把持的监听套接字被真正释放 |
+| A | reactor 异常退出 → 只死一个（failpoint 用 exchange 消费）、`reactor_failures` 恰好加一、`is_running()` 仍为真、幸存 reactor 应答 PING、`reactor_stats()` 标出 dead 槽位；再注入一次 → 最后一个 reactor 失败才停服；`stop()` 与重启均正常 |
+| B | accept 线程异常退出 → `is_running()` 转假、`accept_thread_failures` 计数（`reactor_failures` 不动），且它把持的监听套接字被真正释放 |
 | C | 12 轮「启动 → 注入故障 → stop → 再启动」→ 每次都留下一个还能重新起来的服务器 |
 | D | `close_linger_ms` / `backlog <= 0` 在 `start()` 被拒绝（否则 fd/准入泄漏或零长度 accept 队列） |
 | E | message handler 抛异常 → 被吞掉（与 R8-2 的 open state handler 同处理），连接继续分发 |
+| F | close 队列拒绝 → `close_wanted` 记录请求，tick sweep 在一拍内完成关闭 |
+| G | accept setup 在 spare fd 打开后失败 → 全部描述符（含 spare）释放；重试与析构均无泄漏 |
+| H | handler pool 启动失败（listen、reactor、accept 线程均已存在）→ 完整回滚、端口释放、重试成功 |
+| I | 第二个 reactor 启动失败 → 已启动的子集被停止、无 fd 泄漏、重试成功 |
+| J | 每 reactor 统计之和等于生命周期聚合值；重启后仍累计；resolved reactor 数收缩后多余槽位标记 `retired`、流量仍计入总和；失败启动保留已分配槽位；stop 后连接数归零；handler 卡住 → `reactor_stalls` 计数但不停服；timeout < `max(100, 2×tick_ms)` 被拒绝；watchdog 在发布 stalled 前被隔离抢占时，dead 槽位不残留 stalled、不误计 `reactor_stalls` |
+| K | 按 `reactor_stats()[i].connections` 定位连接所属 reactor，用索引 failpoint 精确隔离它 → close_handler 收到 `reactor failure`、对端看到 RST、另一个 reactor 继续服务 |
 
 `stop()` 一律包在带超时的 `within()` 里跑：恢复路径死锁时的表现只是"测试跑得久"，
 而退出码分不清那和一台慢机器有什么区别。
@@ -97,19 +118,25 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 8192 一帧不差 —— 卡住的位置正好是那条常量。它是故意先红着提交的（`f8a6523`）。
 
+队列现在还为控制任务保留 64 个槽位：`send_task` 在 `cap - 64` 停止入队，而
+close/drain/park/new-connection 仍可用满 cap。因此 case B 在数据队列已满时仍能把
+close 排进队列，`close_requests_dropped` 保持 0，而不是退回 `close_wanted` 的
+tick sweep。
+
 ## `send_results.cpp` —— send_to 的五种回答、两个计数器，外加 offload
 
 `send_to()` 是应用往连接上放字节的唯一入口，`send_result` 是它能拿回的全部信息。但第六轮之前，
 四个失败态（`not_connected` / `too_large` / `overloaded` / `invalid_argument`）**整个 verify/ 里没有任何
 一条断言碰过**。"正确但无人守护"是最糟的一种状态：任何一次编辑都能改掉它，而所有配置仍然全绿。
 
-覆盖的三件事：
+覆盖的用例：
 
 | 用例 | 断言 |
 |------|------|
 | 五种回答 | 每个值各一条，且都落在真正产生它的状态上；`overloaded` 用"帧大于 32 字节上限"达成，不去和排空赛跑 |
 | 关闭中发送 | `closed`，且不留 `queue_drops` / `bytes_dropped`（R6-3） |
 | `accept_errors` | 子进程把 `RLIMIT_NOFILE` 的**硬**限制压到 20，父进程连 40 个peer 撑爆它；拒绝的 accept 必须被计数 |
+| accept rescue | EMFILE 救援的重试判定：EINTR/ECONNABORTED 保留本轮，EAGAIN/EMFILE 停止本轮 |
 | handler offload | 两条同连接请求由 offload 任务返回，顺序与到达一致；任务睡眠期间另一连接的 PING 仍被 reactor 及时应答 |
 
 `accept_errors` 那条必须 fork：描述符上限是**每进程**的，得让"耗尽的一方"和"不停敲门的一方"是两个进程。
@@ -163,7 +190,7 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 `backpressure.cpp` 要扣住 worker，最自然的写法是 mutex + `condition_variable`。早期开发机
 （g++ 11.4）的 ThreadSanitizer 会对此报 **double lock of a mutex**，紧接着报"同时被
-这把锁保护着"的标志量有 data race —— 而 **`verify/probe_tsan_condvar.sh` 里那段不含服务端、
+这把锁保护着"的标志量有 data race —— 而 **`verify/evidence/probe_tsan_condvar.sh` 里那段不含服务端、
 不含套接字的标准握手，报的是完全一样的两种错**。也就是说这是库/平台的性质。
 
 处理方式不是加 suppression：那等于让代码库永久地与 sanitizer 争执。改成在原子量上轮询并带

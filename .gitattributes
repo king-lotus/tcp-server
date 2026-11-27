@@ -1,0 +1,8 @@
+# Store and check out every file with LF.
+#
+# The header is compiled on Linux and the scripts under verify/ are executed by
+# bash; a CRLF checkout turns `set -euo pipefail` into "pipefail: invalid option
+# name" and breaks every one of them. core.autocrlf is a per-clone setting, so a
+# repository-level attribute is the only way this tree can promise its own line
+# endings instead of inheriting whatever the machine happens to have.
+* text=auto eol=lf

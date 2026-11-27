@@ -1,6 +1,6 @@
 # Testing
 
-Nine suites, eleven runs, three configurations. `verify/run.sh` is the
+Fifteen suites, seventeen runs, three configurations. `verify/run.sh` is the
 authority; `CMakeLists.txt` mirrors it for `ctest`. What follows is how a suite
 is written, and why the client half of every one of them now lives in a single
 file.
@@ -9,21 +9,107 @@ file.
 
 ```
 bash verify/run.sh                               # plain only
-ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 33 configurations
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh   # 51 configurations
 ```
 
 Each run is a separate build: ASan and TSan cannot be linked into one binary, and
 a suite that only passes under a sanitizer is a different claim from one that
-passes without. A hang is bounded by `timeout 180`; a failure is a non-zero exit,
+passes without. A hang is bounded by `timeout 180` (plain) or `timeout 300` (sanitizers); a failure is a non-zero exit,
 which is the only thing the runner reads.
 
-The suites live in `verify/`. The twenty programs under
-`verify/evidence/` are not part of this: each settles one claim against a
-history that has since changed, and they are not wired into the runner.
+The suites live in `verify/suites/`. Most probes under `verify/evidence/` are not part
+of this: each settles one claim against a history that has since changed. The
+EMFILE probe is the exception — `verify/evidence/run_emfile.sh` builds and runs
+it with assertions, CI calls that script in its own step, and
+`ENABLE_SLOW=1 bash verify/run.sh` adds it to a local run. It is deliberately
+outside the three-configuration matrix: the claim is about accept-queue
+behaviour under a low descriptor ceiling, not about sanitizers. A host that
+never reaches EMFILE prints `[SKIP]` instead of a pass; locally that still
+exits 0, while CI's step rejects the line because the runner is expected to
+reach the ceiling.
+
+`verify/suites/tcp_server_fsm_test.cpp` is the exception to the socket-based pattern.
+It includes two headers under different paths and namespaces: the working-tree
+`tcp-server-mt.h` (the closed-enum `conn_machine`) and the checked-in
+`verify/support/tcp-server-mt.prev.h`, a copy at the branch point where `close_fsm`
+still existed. It re-derives the 77 states from the five rules, checks every
+generated cell against the shipped `transition()`, applies each cell through
+`conn_sm::step()` with real payloads, diffs the whole machine against the
+five-axis oracle in `tools/conn_fsm_spec.h`, and compares the close decisions
+with the old implementation over every state plus 40x20000 random walks. One
+difference is intentional and pinned as test 7: the drained input budget is
+clamped at zero, so a second close request cannot re-measure it from the
+receive buffer.
+
+`verify/suites/frame_codec.cpp` is the other socket-free suite. It checks
+`decode_header()` at every status boundary, cross-checks the extraction against
+the byte order the reactor used before it, and drives 200000 deterministic
+inputs through the fuzz entry point. `verify/fuzz/decode_header.dict` is the
+word list for running that same entry point under clang's libFuzzer.
+
+The machine is generated. `tools/conn_fsm_spec.h` holds the rules;
+`tools/gen_conn_fsm.cpp` derives the table and rewrites the header's generated
+region, `verify/suites/conn_fsm_cases.inc` and [`docs/conn-fsm.md`](conn-fsm.md) from
+the same run. `--check` exits non-zero when any of the three is stale:
+
+```bash
+g++ -std=c++17 -O1 tools/gen_conn_fsm.cpp -o gen
+./gen --header include/tcp-server-mt.h \
+      --cases verify/suites/conn_fsm_cases.inc --doc docs/conn-fsm.md
+```
+### The syscall seam
+
+Six calls — `recv`, `sendmsg`, `shutdown`, `epoll_ctl`, `accept4` and the
+reactor's eventfd wake write — go through `syscall_policy::` rather than `::`
+directly. Five exist to inject failures; the wake write exists so a test can
+count notifications without adding a production counter to every reactor. The
+production policy is static inline forwarders, so this is one
+direct call at `-O0` and less at `-O2`: no virtual, no pointer, no branch, no
+per-server state.
+
+A test binary may replace the whole policy by defining
+`TCP_SERVER_SYSCALL_POLICY` before any include of `tcp-server-mt.h`.
+`verify/suites/syscall_seam.cpp` does that with `verify/support/syscall_seam_policy.h`, whose
+knobs are one-shot errnos consumed with `exchange(0)` on the reactor thread.
+That turns five failure paths into ordinary assertions, with no fork, no
+lowered `RLIMIT_NOFILE` and no attempt to manufacture a real EPIPE window:
+
+- `recv` error → abort, not a spurious FIN;
+- `sendmsg` EPIPE → counter moves, no EPOLLOUT spin, peer sees RST;
+- short `sendmsg` → the remaining bytes reach the peer and the frame count is
+  still one; a five-byte write across three iovecs verifies the injection
+  helper walks every caller segment rather than indexing a fixed array;
+- `shutdown` failure → a parked close ends in RST rather than an unearned FIN;
+- `epoll_ctl(MOD)` failure → `epoll_ctl_errors` moves and the connection aborts;
+- `accept4` EMFILE → the reserved descriptor takes the queued victim, EMFILE is
+  counted, and the accept loop still serves the next client;
+- `accept4` EINTR → retried inside the same bounded round, and the admitted
+  connection is then served;
+- a non-EINTR `accept4` error → ends only that round; the thread survives and
+  the next readable listen event admits the queued connection. These two cases
+  pin the distinction that a bare `break` used to hide.
+- 512 queued sends while the reactor is blocked → at most one eventfd wake,
+  with all frames drained afterward. This tests coalescing rather than timing.
+
+The macro is a per-binary choice, not a per-file one. Every translation unit
+linked into a binary must see the same `syscall_policy` alias; `run.sh` and
+CMake compile this suite as its own target for that reason. Each case asserts
+both that its policy knob was consumed and that the observable result changed,
+so the suite tests the injection path rather than the loopback socket.
+
+### Latency histograms
+
+`config::latency_histograms` is opt-in: three histograms — `loop_lag_us`,
+`handler_duration_us` and `queue_wait_us` — stay empty by default, so a server
+that never enables the flag pays nothing for them. Bucket edges are fixed
+powers of two in microseconds, with a final `>=1024us` bucket for the long
+tail. `verify/suites/latency_histograms.cpp` asserts the flag-off case (all three
+empty), a sleeping handler's recorded duration, and queue-wait growth while
+the reactor is blocked.
 
 ## Writing a suite
 
-`verify/harness.h` is one header with four things in it:
+`verify/support/harness.h` is one header with four things in it:
 
 | | |
 |---|---|
@@ -108,7 +194,7 @@ after a reset has been reported once, `recv()` returns 0, which is
 indistinguishable from an orderly FIN, so a second `expect_close(fin)` relabelled a
 reset connection as a clean one. `peer` now remembers what it observed.
 
-running the full 33 configurations -- not only the suites that were touched --
+running the full 51 configurations -- not only the suites that were touched --
 caught the other: `port_is_listening` closed its probe descriptor twice when the
 connect succeeded, and the second close could land on a descriptor number the
 accept loop had just handed out. TSan reported it once, in a suite the change had

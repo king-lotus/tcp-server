@@ -66,3 +66,8 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Editor state, ignored by convention: .vscode/ here holds a 28 MB copy of the
+# Linux headers under sysroot/, which must not be committed by accident.
+# Machine-specific paths belong in .git/info/exclude, which Git never tracks.
+.vscode/

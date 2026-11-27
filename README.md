@@ -22,7 +22,7 @@ run it -- `verify/` is that machine.
   skips both.
 - **Closing is staged, not `close(fd)`.** A connection is marked `closing`
   first, drains the replies already queued, and only then FINs. That semantic is
-  where eight rounds of review landed most often and where the probes are
+  where ten rounds of review landed most often and where the probes are
   densest. `stop()` is the immediate exception: it aborts whatever is still
   open. `stop_gracefully(ms)` stops accepting, closes every connection
   gracefully, and waits up to `ms` before that same stop.
@@ -48,8 +48,8 @@ This project has no "just run it and see" position. Everything is settled by
 building and running it on Linux:
 
 ```bash
-# Nine suites, eleven runs per configuration -- two of them run twice, at
-# different reactor counts -- over {plain, asan+ubsan, tsan}: 33 configurations,
+# Fifteen suites, seventeen runs per configuration -- two of them run twice, at
+# different reactor counts -- over {plain, asan+ubsan, tsan}: 51 configurations,
 # cpplint included.
 ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run.sh
 ```
@@ -74,14 +74,14 @@ because the three configurations, cpplint and the ordering live there.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure     # the same ten runs
+ctest --test-dir build --output-on-failure     # the same seventeen runs
 ```
 
 `-DTCP_SANITIZE=address,undefined` (or `thread`) rebuilds the suites under one
 sanitizer set; the tsan configuration wraps every test in `setarch -R` for the
 same reason `run.sh` does. `-DTCP_BUILD_BENCH=ON` adds the four benchmarks.
 
-`verify/bench.sh` is the third kind of check, and it is deliberately not in CI:
+`verify/bench/run.sh` is the third kind of check, and it is deliberately not in CI:
 it measures resident memory per idle connection, ingest rate at one, two and
 four reactors, and the echo round trip at p50 and p99. A shared runner hands its
 cores to other tenants, so a threshold there would fail on someone else's load
@@ -124,7 +124,7 @@ attempts -- frame budget, read size, a `spans_view` struct more expensive than t
 memcpy it replaced, and a header fast path worth 0.6%. One profile named
 `clock_gettime` immediately.
 
-At 4KB batches the server now reaches what `verify/bench_floor.cpp` -- the same
+At 4KB batches the server now reaches what `verify/bench/floor.cpp` -- the same
 socket shape with nothing in between -- manages with the same client, so the read
 path is no longer where the remaining difference lives. At 2.8 GB/s it uses 0.83
 of 8 cores: it is waiting, not computing. What is left is in the kernel and in
@@ -135,13 +135,15 @@ shrinking; that one is open.
 
 ```
 include/tcp-server-mt.h   the only deliverable
-verify/                   runtime suites, the peer harness, one-off probes
+tools/                    state-machine rules and generator
+verify/                   run.sh + suites/, support/, bench/, evidence/
+docs/api-reference.md     the public surface: config, lifecycle, send/close, stats
 docs/testing.md           how a suite is written, and how the harness is tested
-docs/review/              nine rounds of review, with an index
+docs/review/              ten rounds of review, with an index
 CPPLINT.cfg               80 columns; nothing left in it but the copyright filter
 ```
 
-Those twenty probes under `verify/evidence/` are not a standing test suite. Each
+Those probes under `verify/evidence/` are not a standing test suite. Each
 one was written to settle a single claim, against a history that has since been
 fixed. Two of them read the header out of git at a given revision, so they accept
 either layout -- before or after the directory move on 2026-10-18.
@@ -158,10 +160,11 @@ were only never executed locally. Two of the three have since been closed:
   against a break the host cannot produce would be asserting against the host.
   CI put it somewhere that can: on the runner, `send_results` reports hup/err as
   having run and asserted under plain, asan+ubsan and tsan alike, with no other
-  case in the suite declining. The verdict comes back as an annotation filed by
-  the step named "what this kernel was willing to tell us", not as an exit code,
-  because a `[SKIP]` leaves the exit code alone: nothing else in the output
-  separates "asserted and passed" from "never ran".
+  case in the suite declining. The verdict is filed as an annotation by the step
+  named "what this kernel was willing to tell us"; on that runner a `[SKIP]`
+  also fails the job, because a declined assertion is not a pass. Local runs
+  stay lenient: a WSL kernel that turns a reset into an ordinary FIN may
+  legitimately skip the same case.
 
 - **Which reactor a connection lands on -- closed, 2026-10-18.** The note here
   used to say that reactor-count-dependent behaviour had only been run with
@@ -171,7 +174,7 @@ were only never executed locally. Two of the three have since been closed:
   belongs to one worker is averaged away and reads as a pass. What was really
   unasserted was narrower and worse -- nothing observed `pick_reactor()`'s
   round-robin, so returning the first reactor every time left all 21
-  configurations green. `verify/reactor_spread.cpp` asks it directly: eight
+  configurations green. `verify/suites/reactor_spread.cpp` asks it directly: eight
   connections over four reactors have to be handled by four distinct threads. It
   runs at four reactors and again at two, so the assertion is shown to follow the
   configuration rather than a constant, and both existing two-reactor suites were

@@ -14,6 +14,9 @@
 #                   proven fixed rather than merely not observed.
 #   ENABLE_TSAN=1   rebuild under ThreadSanitizer, which is what every published
 #                   race in this file ultimately needed.
+#   ENABLE_SLOW=1   also run the EMFILE probe, a separate kernel-behaviour
+#                   assertion with its own timeout. CI calls its script
+#                   directly instead of rerunning the matrix here.
 #
 # Both are separate configurations rather than one combined build: ASan and TSan
 # cannot be linked into the same binary, and a run under either is slow enough
@@ -29,6 +32,13 @@ cd "$proj"
 
 echo "== project: $proj =="
 
+# Build artifacts live under the home cache by default rather than /tmp, which
+# some sandboxes mount in a way that makes every compile ask for permission.
+# VERIFY_OUT_DIR overrides it.
+out="${VERIFY_OUT_DIR:-$HOME/.cache/tcp-server-verify}"
+mkdir -p "$out"
+echo "== build dir: $out =="
+
 # ---- toolchain ------------------------------------------------------------
 if ! command -v g++ >/dev/null 2>&1; then
     echo "== installing build-essential (needs network + your sudo password) =="
@@ -38,9 +48,16 @@ fi
 g++ --version | head -1
 
 # Every build below runs from the project root, so `include` resolves against
-# it. Sources include the header by bare name; the ../.. arithmetic that used
-# to sit in twenty files was the thing that made any move expensive.
-base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
+# it. Sources include the header and harness by bare name; the ../.. arithmetic
+# that used to sit in twenty files was the thing that made any move expensive.
+base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude
+            -Iverify/support)
+# The FSM suite links two versions of the header into one binary: the new
+# conn_machine from the working tree and the close_fsm it replaced, kept as a
+# checked-in oracle at the branch point (8d55d8f). #pragma once is path-based,
+# so the two files can coexist inside separate namespaces.
+fsm_flags=("${base_flags[@]}"
+           -DNEWH='"tcp-server-mt.h"' -DOLDH='"tcp-server-mt.prev.h"')
 
 # The test uses the same switches to build, so both must agree on the macro or
 # the harness silently compiles itself away. It cannot: fault_injection.cpp
@@ -48,16 +65,28 @@ base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
 build() {
     local label="$1"; shift
     echo "== building [$label] =="
-    g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o /tmp/close_semantics
-    g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o /tmp/idle_semantics
-    g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o /tmp/ping_pong
-    g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o /tmp/send_results
-    g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o /tmp/backpressure
-    g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
-        -o /tmp/fault_injection
-    g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o /tmp/reactor_spread
-    g++ "${base_flags[@]}" "$@" verify/config_budget.cpp -o /tmp/config_budget
-    g++ "${base_flags[@]}" "$@" verify/harness_selftest.cpp -o /tmp/harness_selftest
+    g++ "${base_flags[@]}" "$@" verify/suites/close_semantics.cpp -o "$out/close_semantics"
+    g++ "${base_flags[@]}" "$@" verify/suites/idle_semantics.cpp -o "$out/idle_semantics"
+    g++ "${base_flags[@]}" "$@" verify/suites/ping_pong.cpp -o "$out/ping_pong"
+    g++ "${base_flags[@]}" "$@" verify/suites/send_results.cpp -o "$out/send_results"
+    g++ "${base_flags[@]}" "$@" verify/suites/backpressure.cpp -o "$out/backpressure"
+    g++ "${base_flags[@]}" "$@" verify/suites/fault_injection.cpp \
+        -o "$out/fault_injection"
+    g++ "${base_flags[@]}" "$@" verify/suites/reactor_spread.cpp -o "$out/reactor_spread"
+    g++ "${base_flags[@]}" "$@" verify/suites/config_budget.cpp -o "$out/config_budget"
+    g++ "${base_flags[@]}" "$@" verify/suites/harness_selftest.cpp -o "$out/harness_selftest"
+    g++ "${base_flags[@]}" "$@" verify/suites/watermark.cpp -o "$out/watermark"
+    g++ "${base_flags[@]}" "$@" verify/suites/hardening.cpp -o "$out/hardening"
+    g++ "${base_flags[@]}" "$@" verify/suites/frame_codec.cpp -o "$out/frame_codec"
+    g++ "${fsm_flags[@]}" "$@" verify/suites/tcp_server_fsm_test.cpp \
+        -o "$out/tcp_server_fsm_test"
+    g++ "${base_flags[@]}" "$@" verify/suites/latency_histograms.cpp \
+        -o "$out/latency_histograms"
+    # The seam suite selects its policy in this TU only; a second
+    # policy in the same binary would be an ODR violation.
+    g++ "${base_flags[@]}" "$@" \
+        -DTCP_SERVER_SYSCALL_POLICY=industrial::seam_policy \
+        verify/suites/syscall_seam.cpp -o "$out/syscall_seam"
 }
 
 run_all() {
@@ -75,22 +104,34 @@ run_all() {
     fi
     echo "---- running [$label] ----"
 
-    for attempt in "close_semantics, default reactors:/tmp/close_semantics" \
-                   "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 /tmp/close_semantics" \
-                   "idle_semantics:/tmp/idle_semantics" \
-                   "ping_pong:/tmp/ping_pong" \
-                   "send_results:/tmp/send_results" \
-                   "backpressure:/tmp/backpressure" \
-                   "fault_injection:/tmp/fault_injection" \
-                   "reactor_spread, default reactors:/tmp/reactor_spread" \
-                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread" \
-                   "config_budget:/tmp/config_budget" \
-                   "harness_selftest:/tmp/harness_selftest"; do
+    # Plain runs are the fast path; sanitizer builds are several times slower,
+    # and a 180s bound that a healthy suite only just fits is a flaky gate, not
+    # a hang detector. The per-run bound only matters when something is stuck.
+    local run_timeout=180
+    [ "$label" = "plain" ] || run_timeout=300
+
+    for attempt in "close_semantics, default reactors:$out/close_semantics" \
+                   "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 $out/close_semantics" \
+                   "idle_semantics:$out/idle_semantics" \
+                   "ping_pong:$out/ping_pong" \
+                   "send_results:$out/send_results" \
+                   "backpressure:$out/backpressure" \
+                   "fault_injection:$out/fault_injection" \
+                   "reactor_spread, default reactors:$out/reactor_spread" \
+                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 $out/reactor_spread" \
+                   "config_budget:$out/config_budget" \
+                   "harness_selftest:$out/harness_selftest" \
+                   "watermark:$out/watermark" \
+                   "hardening:$out/hardening" \
+                   "frame_codec:$out/frame_codec" \
+                   "tcp_server_fsm_test:$out/tcp_server_fsm_test" \
+                   "latency_histograms:$out/latency_histograms" \
+                   "syscall_seam:$out/syscall_seam"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
         # A bounded run: a hang has to present as a failure, not as a long coffee.
-        timeout 180 "${launcher[@]}" bash -c "$cmd" || rc=$?
+        timeout "$run_timeout" "${launcher[@]}" bash -c "$cmd" || rc=$?
         echo "   [$label] $name -> rc=$rc"
         [ "$rc" -eq 0 ] || failed=1
     done
@@ -135,10 +176,27 @@ run_cpplint() {
     fi
     echo "  control: $control findings, as expected"
 
-    out=$(python3 -m cpplint --quiet include/tcp-server-mt.h 2>&1)
+    if [ ! -r include/tcp-server-mt.h ]; then
+        echo "  [FAIL] include/tcp-server-mt.h is not readable"
+        return 1
+    fi
+    # Not --quiet: cpplint 2.x suppresses its "Done processing" line under
+    # --quiet, and that line is what distinguishes a clean file from one the
+    # tool never opened.
+    out=$(python3 -m cpplint include/tcp-server-mt.h 2>&1)
     case "$out" in
         *Traceback*|*"No such file"*|*"command not found"*)
             echo "  [FAIL] cpplint did not run:"
+            printf '%s\n' "$out" | tail -5
+            return 1 ;;
+    esac
+    # "No findings" and "never looked at the file" both leave `total` empty.
+    # cpplint prints this line whenever it actually processed the file, so its
+    # absence is the only thing that tells the two apart.
+    case "$out" in
+        *"Done processing include/tcp-server-mt.h"*) ;;
+        *)
+            echo "  [FAIL] cpplint did not process include/tcp-server-mt.h:"
             printf '%s\n' "$out" | tail -5
             return 1 ;;
     esac
@@ -151,17 +209,54 @@ run_cpplint() {
 run_cpplint || overall=1
 echo
 
+# ---- generated state machine --------------------------------------------
+# The FSM table in the header, the test cases and docs/conn-fsm.md are all
+# generated from tools/conn_fsm_spec.h. A stale copy is a gate failure, not a
+# documentation detail, so every run re-derives the three and compares them.
+run_generator_check() {
+    echo "== generated state machine =="
+    g++ -std=c++17 -O1 -Iinclude -Iverify/support \
+        tools/gen_conn_fsm.cpp -o "$out/gen_conn_fsm" || return 1
+    "$out/gen_conn_fsm" --check \
+        --header include/tcp-server-mt.h \
+        --cases verify/suites/conn_fsm_cases.inc \
+        --doc docs/conn-fsm.md
+}
+run_generator_check || overall=1
+echo
+
+# ---- test-hook privacy -------------------------------------------------
+# The fault switches are always-present private members reached only through
+# the harness friend. This is a compile-only probe, cheap enough to keep in the
+# gate rather than in evidence/, where nobody would run it.
+if ! bash verify/evidence/probe_test_hooks_private.sh; then
+    overall=1
+fi
+echo
+
 build "plain"
 run_all "plain" || overall=1
 
 if [ "${ENABLE_ASAN:-0}" = "1" ]; then
-    build "asan+ubsan" -g -fsanitize=address,undefined -fno-omit-frame-pointer
+    # -fno-sanitize=vptr: the vptr check false-positives on make_shared's
+    # in-place control blocks under ASan -- it reports at the release, the copy
+    # and the construction site, while Valgrind finds no invalid access, ASan's
+    # own use-after-free tracking is silent, and TSan is silent. Evidence and
+    # reproduction: docs/emfile-test-checklist.md,
+    # verify/evidence/repro_ubsan_vptr.sh.
+    build "asan+ubsan" -g -fsanitize=address,undefined -fno-sanitize=vptr \
+          -fno-omit-frame-pointer
     run_all "asan+ubsan" || overall=1
 fi
 
 if [ "${ENABLE_TSAN:-0}" = "1" ]; then
     build "tsan" -g -fsanitize=thread -fno-omit-frame-pointer
     run_all "tsan" || overall=1
+fi
+
+if [ "${ENABLE_SLOW:-0}" = "1" ]; then
+    bash verify/evidence/run_emfile.sh || overall=1
+    echo
 fi
 
 cat <<EOF
@@ -201,11 +296,29 @@ cat <<EOF
     implementation that always returned the first reactor leaves every other
     suite green. It runs twice, at four reactors and at two, so the assertion is
     shown to follow the configuration rather than a constant in the test.
+  - frame_codec checks the eight header bytes without a socket: every status
+    at its boundary, equivalence against the byte order the reactor used
+    before the extraction, and 200000 deterministic inputs through the fuzz
+    entry point. verify/fuzz/decode_header.dict is the libFuzzer word list for
+    driving that same entry point under clang's fuzzer.
+  - tcp_server_fsm_test checks conn_machine directly: it re-derives the 77
+    states from the five rules, checks every generated cell against the
+    transition() the header ships, diffs the whole machine against the oracle
+    in tools/conn_fsm_spec.h, and runs 40x20000 random walks against the
+    close_fsm it replaced. Test 7 is the one intentional difference -- a drained
+    budget is clamped at zero so a second close request cannot re-measure it.
+    The checked-in verify/support/tcp-server-mt.prev.h is the branch-point oracle; the
+    generator, tools/gen_conn_fsm.cpp, rewrites docs/conn-fsm.md.
+  - latency_histograms checks the opt-in latency histograms for loop-lag,
+    handler-duration and queue-wait, including that they stay empty when the
+    config flag is off.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as
     an ordinary FIN: EPOLLHUP|EPOLLERR is then never delivered, so the branch
-    cannot be reached from there.
+    cannot be reached from there. The EMFILE probe can do the same when the
+    accept queue never reaches the descriptor ceiling; it runs only with
+    ENABLE_SLOW=1 or as verify/evidence/run_emfile.sh in CI.
 
  If a case fails, paste the whole output back -- first without CS_REACTORS, then
  with it.

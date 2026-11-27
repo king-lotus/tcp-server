@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Is ThreadSanitizer lying about a condition variable here?
+#
+# verify/suites/backpressure.cpp holds a worker inside a callback using the ordinary
+# handshake -- unique_lock, wait_for with a predicate, the other side sets the
+# flag under the lock and notifies. ThreadSanitizer reports "double lock of a
+# mutex" at the setter followed by a data race on the flag "synchronized via
+# sleep", while listing that very mutex as held by both sides.
+#
+# Either the handshake above is broken in a way three readings missed, or this
+# build of TSan mis-models std::condition_variable::wait_for on this machine.
+# Those two answers point in opposite directions, so this just asks: does the
+# same report appear with no server, no sockets and no shared library besides
+# libstdc++?
+set -u
+cd "$(mktemp -d)"
+
+cat > cv.cpp <<'EOF'
+#include <condition_variable>
+#include <cstdio>
+#include <mutex>
+#include <thread>
+
+std::mutex              m;
+std::condition_variable cv;
+bool                    released = false;
+bool                    reached  = false;
+
+int main() {
+    bool raced = false;
+    {
+        std::thread t([&] {
+            std::unique_lock<std::mutex> lk(m);
+            reached = true;
+            cv.wait_for(lk, std::chrono::seconds(20), [&] { return released; });
+        });
+        while (!reached) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        {
+            std::lock_guard<std::mutex> lk(m);
+            released = true;
+        }
+        cv.notify_all();
+        t.join();
+        raced = true;
+    }
+    std::printf("handshake completed: %s\n", raced ? "yes" : "no");
+    return 0;
+}
+EOF
+
+echo "== building the minimal handshake under ThreadSanitizer =="
+g++ -std=c++17 -g -fsanitize=thread -pthread cv.cpp -o cv || exit 1
+
+echo "== running =="
+# Same ASLR workaround as verify/run.sh: a TSan binary that never reaches
+# main() must not be read as a finding about the handshake.
+launcher=()
+if command -v setarch >/dev/null 2>&1; then
+  launcher=(setarch "$(uname -m)" -R)
+fi
+TSAN_OPTIONS=halt_on_error=0 "${launcher[@]}" ./cv > cv.out 2> cv.err
+rc=$?
+cat cv.out
+if grep -q "unexpected memory mapping" cv.err; then
+    echo
+    echo "!! ThreadSanitizer could not start on this kernel (ASLR/shadow layout)."
+    echo "   This run says nothing about the handshake; exiting 2."
+    exit 2
+fi
+# A launch failure (setarch denied by seccomp, missing binary) leaves no
+# completion line and no ThreadSanitizer text. Without this guard the script
+# would read that silence as "no TSan complaint" and draw the opposite
+# conclusion from a run that never happened. The completion line is the
+# evidence that the handshake actually ran; TSan's exit code 66 on a real
+# report is a valid outcome, not a launch failure.
+if ! grep -q "handshake completed: yes" cv.out; then
+    echo
+    echo "!! the probe did not complete (rc=$rc); inconclusive."
+    sed -n '1,5p' cv.err
+    exit 2
+fi
+if grep -q "ThreadSanitizer" cv.err; then
+    echo
+    echo "!! ThreadSanitizer complains about the bare handshake too:"
+    grep -E "SUMMARY|WARNING" cv.err
+    echo
+    echo "=> the report is about this library/platform, not about the server."
+elif [ "$rc" -ne 0 ]; then
+    echo
+    echo "!! the probe exited rc=$rc without a ThreadSanitizer report; inconclusive."
+    exit 2
+else
+    echo
+    echo "no ThreadSanitizer output from the bare handshake."
+    echo "=> whatever it saw in backpressure.cpp is real and still unexplained."
+fi
+exit 0
