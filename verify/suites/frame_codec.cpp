@@ -19,6 +19,7 @@
 // Linux only when built with the suite driver (harness.h); the fuzz target
 // itself needs nothing but the header.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -152,6 +153,42 @@ void check_table() {
     harness::expect(empty.status == header_status::need_more && empty.len == 0,
                     "a null pointer with zero bytes is safe");
 }
+
+void check_payload_spans() {
+    const std::array<uint8_t, 8> payload{{
+        0x00, 0x7F, 0x80, 0xFF, 0x10, 0x20, 0x30, 0x40}};
+    std::array<uint8_t, FRAME_HEADER_SIZE + payload.size()> frame{};
+    std::copy(payload.begin(), payload.end(),
+              frame.begin() + FRAME_HEADER_SIZE);
+
+    industrial::ring_buffer contiguous{16};
+    harness::expect(
+        contiguous.write(frame.data(), frame.size()) == frame.size(),
+        "the contiguous frame fits the ring");
+    contiguous.consume(FRAME_HEADER_SIZE);
+    const auto direct = contiguous.spans();
+    harness::expect(direct.n1 >= payload.size() &&
+                        std::equal(payload.begin(), payload.end(), direct.p1),
+                    "a contiguous payload is readable directly from the ring");
+
+    industrial::ring_buffer wrapped{16};
+    const std::array<uint8_t, 4> prefix{{1, 2, 3, 4}};
+    harness::expect(
+        wrapped.write(prefix.data(), prefix.size()) == prefix.size(),
+        "the wrap-positioning prefix fits the ring");
+    wrapped.consume(prefix.size());
+    harness::expect(wrapped.write(frame.data(), frame.size()) == frame.size(),
+                    "the wrapping frame fits the ring");
+    wrapped.consume(FRAME_HEADER_SIZE);
+    const auto split = wrapped.spans();
+    harness::expect(split.count == 2 && split.n1 == 4 && split.n2 == 4,
+                    "the payload crosses the ring boundary after its header");
+    std::array<uint8_t, payload.size()> scratch{};
+    const size_t copied = wrapped.peek(scratch.data(), scratch.size());
+    harness::expect(copied == scratch.size() && scratch == payload,
+                    "the wrapped copy path reconstructs every payload byte");
+}
+
 #endif  // TCP_FUZZING: the table and its helpers are not needed by libFuzzer
 
 // ---------------------------------------------------------------------------
@@ -315,6 +352,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 #ifndef TCP_FUZZING
 int main() {
     check_table();
+    check_payload_spans();
     check_random_inputs();
     return harness::finish();
 }

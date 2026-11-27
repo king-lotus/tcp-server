@@ -2904,30 +2904,24 @@ struct connection {
         }
     }
 
-    // -------- debug state axes --------
-    // The connection's state is several independent axes, not one enum:
-    //   interest  -- write_armed, read_paused, read_pending
-    //   transport -- fd, peer_closed
-    //   close     -- fsm.closing, fsm.fin_sent, fsm.deferred_round
-    //   activity  -- fsm.draining_input
-    // Collapsing them into one state would multiply out the legal combos and
-    // make the table unreadable; what is needed is the *set* of combos that
-    // must never be observed. These are the ones that have caused bugs here:
-    // a paused read left on the continuation list (spin), a peer FIN mistaken
-    // for "no reply owed" (FIN over answers), a FIN sent over buffered output
-    // (truncated stream), and interest/continuations left on a detached fd
-    // (stale events on a recycled descriptor).
+    // -------- debug state invariants --------
+    // conn_state_id carries the connection phase, read/write interest and close
+    // round in one closed enum. These checks cover its composition with state
+    // outside that enum: descriptor ownership, the reactor-only continuation
+    // links and wbuf. The illegal combinations are the ones that have caused
+    // bugs here: a paused read left on the continuation list (spin), a peer FIN
+    // mistaken for "no reply owed" (FIN over answers), a FIN sent over buffered
+    // output (truncated stream), and interest/continuations left on a detached
+    // fd (stale events on a recycled descriptor).
     //
-    // Pure: reads the axes, changes nothing, always compiled so a suite can
-    // assert on an illegal combo without depending on a debug build. A null
-    // return means legal. Note what is deliberately NOT illegal: a detached
-    // fd with is_closed still false (the rejected-connection rollback closes
-    // the descriptor before it marks the connection), a paused connection
-    // being torn down, EPOLLOUT still armed just after our own FIN, a close
-    // drain running while `closing` is already set by a second request, and
-    // a drain whose handler tore the connection down -- the flag is cleared
-    // in the caller after handle_read returns, so it is still true while the
-    // descriptor is gone. All five are real intermediate states, not bugs.
+    // Pure: reads the machine and those external fields, changes nothing, and
+    // stays compiled so a suite need not depend on a debug build. A null return
+    // means legal. Deliberately legal intermediates include a detached fd
+    // before the closed phase (rejected-connection rollback), a paused
+    // connection being torn down, EPOLLOUT still armed just after our FIN, a
+    // close drain whose second request has set closing, and a drain whose
+    // handler tore the connection down. In the last case in_round remains set
+    // until handle_read returns, even though the descriptor is already gone.
     const char* state_violation() const noexcept {
         const bool closing = sm.closing();
         if (fd < 0) {
@@ -3028,7 +3022,7 @@ inline sweep_action classify_sweep(const connection& c,
     if (close_claimed && !c.sm.closing()) return sweep_action::wanted;
     if (c.sm.closing()) {
         // One deadline for every stage a close can stall in, measured from the
-        // park that set `closing` (close_fsm::on_graceful): the peer has
+        // park that set `closing` (conn_sm::on_graceful): the peer has
         // nothing left to send, so last_recv_ms is useless here.
         //
         // fd >= 0 is a debug-asserted invariant rather than a condition
@@ -4732,7 +4726,7 @@ inline void sub_reactor::disarm_write(connection* c) noexcept {
     // already established there is nothing left to write. Leaving it to the
     // caller is what keeps this function a plain state transition.
     if (!c->sm.on_set_write(false)) return;
-    apply_interest(c, "epoll read registration failed");
+    apply_interest(c, "epoll write registration failed");
 }
 
 // Stop reading from the kernel: the peer has more requests than we are willing
@@ -5315,39 +5309,51 @@ inline void sub_reactor::parse_frames(connection* c,
             // DATA, or an unknown type the application opted into delivering
             // as DATA. The header check above rejected every other one, so no
             // further type test is needed here.
-            if (len > 0) {
-                // Unreachable, and kept: the alternative to having this branch
-                // is an out-of-bounds read, and "it cannot happen" is a claim
-                // about today's invariants, not about the next edit. The
-                // invariant is that frame_scratch_ is resized to
-                // MAX_FRAME_PAYLOAD in start() -- which fails outright if that
-                // allocation fails -- and len was clamped to MAX_FRAME_PAYLOAD
-                // above, so len <= frame_scratch_.size() always holds. It reads
-                // like a defence that fires. It does not.
-                if (len > frame_scratch_.size()) {
-                    close_conn(c, "scratch too small", false); return;
-                }
-                c->rbuf.peek(frame_scratch_.data(), len);
-            }
-            c->rbuf.consume(len);
             auto& mh = server_->msg_handler_ref();
-            if (mh) {
+            if (!mh) {
+                c->rbuf.consume(len);
+                continue;
+            }
+            const uint8_t* payload = frame_scratch_.data();
+            if (len > 0) {
+                const auto s = c->rbuf.spans();
+                if (s.n1 >= len) {
+                    // Borrowed from rbuf; connection destruction stays deferred
+                    // until this handler returns (see teardown_closed).
+                    payload = s.p1;
+                } else {
+                    // Unreachable, and kept: the alternative is an
+                    // out-of-bounds read. "It cannot happen" is a claim
+                    // about today's invariants, not about the next edit.
+                    // frame_scratch_ is resized to MAX_FRAME_PAYLOAD in
+                    // start(), which fails if that allocation fails, and len
+                    // was clamped above. It reads like a defence that fires.
+                    // It does not.
+                    if (len > frame_scratch_.size()) {
+                        close_conn(c, "scratch too small", false); return;
+                    }
+                    c->rbuf.peek(frame_scratch_.data(), len);
+                }
+            }
+            {
                 detail::latency_sample sample(
                     server_->latency_histograms_enabled()
                         ? &server_->stats_ref().handler_duration_us
                         : nullptr);
                 try {
-                    mh(c->id, frame_scratch_.data(), len);
+                    mh(c->id, payload, len);
                 } catch (...) {
-                    // The same contract violation the open state handler
-                    // absorbs (R8-2): the frame has been consumed, the
-                    // connection is healthy, and there is nothing to undo or
-                    // to count. Letting it cross parse_frames() -- noexcept --
-                    // would call std::terminate() and take every connection
-                    // with it, not just the one whose message it was.
-                    // The scoped sample still records the failed call.
+                    // The open state handler absorbs the same contract
+                    // violation (R8-2). If the connection remains open, the
+                    // frame is consumed below; there is nothing to undo or
+                    // count. Letting the exception cross noexcept
+                    // parse_frames() would terminate every connection, not
+                    // just the one whose message failed. The scoped sample
+                    // still records the failed call.
                 }
             }
+            if (c->sm.closed()) return;
+            c->rbuf.consume(len);
         }
     }
 
@@ -5568,7 +5574,7 @@ inline void sub_reactor::park_close(connection* c,
 // WHAT THE BUDGET DOES NOT COVER. Requests still in the kernel receive buffer
 // when the close was requested are not counted -- close_input_bytes is rbuf
 // occupancy, and at that moment the kernel's copy is invisible. The drain does
-// resume reads, and `draining_input` exempts this one round from the output
+// resume reads, and `conn_state::in_round()` exempts this round from the output
 // watermark, so it pulls up to one read budget (64 KiB / 256 frames) of them
 // into service while `closing` is still false. The connection's ordinary read
 // continuation may serve more before the park lands. Once the park sets
@@ -5680,6 +5686,9 @@ inline void sub_reactor::drain_input_then_close(connection* c) noexcept {
 
 // Unlist -> detach descriptor -> account -> queue deferred callbacks. Shared by
 // the graceful and abort exits so the two can never disagree on counters.
+// parse_frames may lend c->rbuf to a handler. Event dispatch must retain its
+// keep_alive until handle_read returns, and flush_close_callbacks() must stay
+// off the handler stack: those are payload-lifetime requirements.
 // `graceful=false` closes with SO_LINGER{on,0}: an explicit RST instead of the
 // FIN default, so a peer is never handed a truncated stream that looks
 // complete.

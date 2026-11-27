@@ -7,6 +7,10 @@
 //      up" pattern -- must deliver the reply and end with FIN. Before P1-4 the
 //      close could overtake the queued reply, leaving the client with RST and no
 //      payload.
+//   A2. A handler can borrow two consecutive payloads and then request a close
+//      without corrupting the second frame or the FIN exchange.
+//   A3. A payload split 2+14 bytes across the read-ring boundary reaches the
+//      handler intact and can be echoed from its borrowed pointer.
 //   B. close_connection() while the client still has an unread request in flight
 //      must not turn into RST just because input was pending (close() on a socket
 //      with unread data resets the connection).
@@ -506,6 +510,119 @@ int main() {
         expect(server.stats().aborted.load() == aborted_before,
                "the peer's FIN after our own is an orderly close, not an abort");
         dump_stats(server, "A.end");
+    }
+
+    // ---- A2: close requested by a handler after two borrowed payloads ------
+    {
+        std::printf("A2. close_connection inside the message handler\n");
+        multi_reactor_server::config close_cfg = harness::quiet_config(1);
+        close_cfg.close_linger_ms = 300;
+        std::atomic<multi_reactor_server*> closing_server{nullptr};
+        std::atomic<int> seen{0};
+        std::atomic<bool> payloads_ok{true};
+        std::atomic<bool> close_accepted{false};
+        harness::fixture closing(
+            close_cfg,
+            [&](uint64_t id, const uint8_t* p, size_t n) {
+                const int call = seen.fetch_add(1) + 1;
+                if (n != 3 ||
+                    (call == 1 && std::memcmp(p, "one", 3) != 0) ||
+                    (call == 2 && std::memcmp(p, "two", 3) != 0)) {
+                    payloads_ok.store(false);
+                }
+                if (call == 2) {
+                    close_accepted.store(
+                        closing_server.load()->close_connection(id));
+                }
+            });
+        closing_server.store(&closing.server());
+        if (!closing.started()) {
+            expect(false, "close-in-handler server started");
+        } else {
+            harness::peer peer;
+            expect(static_cast<bool>(peer.connect(closing.port())),
+                   "client connected");
+            uint8_t stream[2 * (industrial::FRAME_HEADER_SIZE + 3)];
+            industrial::encode_frame_into(stream, frame_type::DATA, "one", 3);
+            industrial::encode_frame_into(
+                stream + industrial::FRAME_HEADER_SIZE + 3,
+                frame_type::DATA, "two", 3);
+            expect(static_cast<bool>(peer.send_raw(stream, sizeof(stream))),
+                   "two frames sent together");
+            expect(wait_for(2000, [&] { return seen.load() == 2; }),
+                   "both payloads reached the handler exactly once");
+            expect(payloads_ok.load(), "both borrowed payloads stayed intact");
+            expect(close_accepted.load(), "the handler queued the close");
+            harness::close_kind end = harness::close_kind::any;
+            const harness::status st = peer.read_to_end(nullptr, &end, 2000);
+            peer.close();
+            expect(static_cast<bool>(st) && end == harness::close_kind::fin,
+                   "the handler-requested close ended with FIN");
+            expect(wait_for(2000, [&] {
+                       return closing.server().connection_count() == 0;
+                   }), "the closed connection was reclaimed");
+            expect(closing.stats().aborted.load() == 0,
+                   "the handler-requested close did not abort");
+        }
+    }
+
+    // ---- A3: a wrapped payload goes through parse_frames -------------------
+    {
+        std::printf("A3. wrapped payload reaches the handler intact\n");
+        multi_reactor_server::config wrap_cfg = harness::quiet_config(1);
+        wrap_cfg.rbuf_capacity = industrial::MAX_FRAME_SIZE;
+        const std::vector<uint8_t> filler(wrap_cfg.rbuf_capacity - 18, 0xA5);
+        const std::vector<uint8_t> wrapped{
+            0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF, 0x10, 0x20,
+            0x30, 0x40, 0x50, 0x60, 0x70, 0x55, 0xAA, 0x5A};
+        std::atomic<multi_reactor_server*> wrap_server{nullptr};
+        std::atomic<bool> first_seen{false};
+        std::atomic<bool> first_ok{false};
+        std::atomic<bool> wrapped_seen{false};
+        std::atomic<bool> wrapped_ok{false};
+        harness::fixture wrapping(
+            wrap_cfg,
+            [&](uint64_t id, const uint8_t* p, size_t n) {
+                if (n == filler.size()) {
+                    first_ok.store(p[0] == 0xA5 &&
+                                   p[filler.size() - 1] == 0xA5);
+                    first_seen.store(true);
+                    return;
+                }
+                if (n == wrapped.size()) {
+                    wrapped_ok.store(
+                        std::memcmp(p, wrapped.data(), wrapped.size()) == 0);
+                    wrapped_seen.store(true);
+                    (void)wrap_server.load()->send_to(id, p, n);
+                }
+            });
+        wrap_server.store(&wrapping.server());
+        if (!wrapping.started()) {
+            expect(false, "wrapped-payload server started");
+        } else {
+            harness::peer peer;
+            expect(static_cast<bool>(peer.connect(wrapping.port())),
+                   "client connected");
+            // The first wire frame occupies capacity - 10 bytes. Once consumed,
+            // the next frame's 8-byte header and two payload bytes occupy that
+            // tail; its other 14 payload bytes wrap to the start of the ring.
+            expect(static_cast<bool>(
+                       peer.send(frame_type::DATA, filler.data(), filler.size())),
+                   "the head-positioning frame was sent");
+            expect(wait_for(5000, [&] { return first_seen.load(); }),
+                   "the head-positioning frame was consumed");
+            expect(first_ok.load(), "the positioning payload stayed intact");
+            expect(static_cast<bool>(
+                       peer.send(frame_type::DATA, wrapped.data(), wrapped.size())),
+                   "the wrapped frame was sent");
+            harness::frame echo;
+            const harness::status st = peer.expect_frame(&echo, 5000);
+            expect(static_cast<bool>(st), "the wrapped payload was echoed");
+            expect(wrapped_seen.load() && wrapped_ok.load(),
+                   "parse_frames reconstructed all 16 wrapped bytes");
+            expect(echo.type == frame_type::DATA && echo.payload == wrapped,
+                   "the handler could echo the wrapped borrowed pointer");
+        }
     }
 
     // ---- B: close while the client still has data unread -------------------

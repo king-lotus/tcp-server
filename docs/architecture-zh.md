@@ -177,9 +177,10 @@ epoll LT EPOLLIN
 - **`frames_recv` 是批量发布的**：每个 reactor 先在本地 `frames_recv_local_` 累加，
   每轮循环（以及退出时）发布一次到共享原子量。空闲时是精确值；有流量时最多滞后
   一轮。
-- **handler 默认在 reactor 线程上同步执行**。`payload` 指向 reactor 自己的
-  `frame_scratch_`，只在本次回调期间有效；要保留必须自己拷贝。需要把慢工作移出
-  reactor 时，用可选的 handler 池（见 4.1）。
+- **handler 默认在 reactor 线程上同步执行**。连续 payload 直接指向连接的
+  `rbuf`，只有跨回绕时才复制到 reactor 的 `frame_scratch_`。两种指针都只在
+  本次回调期间有效；要保留必须自己拷贝。需要把慢工作移出 reactor 时，用可选的
+  handler 池（见 4.1）。
 
 ### 4.1 慢 handler 卸载（offload）
 
@@ -314,8 +315,9 @@ function-pointer table。发送仍分配 frame vector，owner 快路径两者都
 1. **先服务已经到达的请求**：`drain_input_then_close()` 读取并处理已经可读的输入。
    额度 `close_input_bytes` 是**关闭请求出队那一刻 `rbuf` 里的字节数**；它按
    `handle_read` 的预算可能分多轮，关闭后新到的数据不能无限延长关闭。
-   **这个额度不含内核接收缓冲里的字节。** drain 会临时恢复读取，`draining_input`
-   让这一轮不受输出水位约束，因此它最多再从内核取出一个读预算（64 KiB / 256 帧）；
+   **这个额度不含内核接收缓冲里的字节。** drain 会临时恢复读取，
+   `conn_state::in_round()` 标记这一轮并使其不受输出水位约束，因此它最多再从内核
+   取出一个读预算（64 KiB / 256 帧）；
    关闭落定（park）之前，连接的普通读续跑可能再多服务一些，但那条路径仍受高水位
    约束；落定之后 `closing` 会解除高水位检查，后续输入仍会被解析并交给 handler
    （应答被拒），直到对端 FIN 或 `close_linger_ms`。两者都不是承诺。读侧背压暂停中的连接差距最大——

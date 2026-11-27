@@ -364,15 +364,25 @@ int main() {
         cfg.num_reactors = 1;
         std::atomic<int> handled{0};
         std::atomic<int> threw{0};
+        std::atomic<bool> first_payload_ok{false};
+        std::atomic<bool> second_payload_ok{false};
 
         harness::fixture f(
             cfg,
-            [&](uint64_t, const uint8_t*, size_t) {
-                const int n = handled.fetch_add(
-                                  1, std::memory_order_relaxed) + 1;
-                if (n == 1) {
+            [&](uint64_t, const uint8_t* p, size_t n) {
+                const int seen = handled.fetch_add(
+                                     1, std::memory_order_relaxed) + 1;
+                if (seen == 1) {
+                    first_payload_ok.store(
+                        n == 3 && std::memcmp(p, "one", 3) == 0,
+                        std::memory_order_relaxed);
                     threw.fetch_add(1, std::memory_order_relaxed);
                     throw std::runtime_error("application message handler");
+                }
+                if (seen == 2) {
+                    second_payload_ok.store(
+                        n == 3 && std::memcmp(p, "two", 3) == 0,
+                        std::memory_order_relaxed);
                 }
             });
         harness::expect(f.started(), "start() ok");
@@ -385,6 +395,9 @@ int main() {
                         "first frame sent");
         harness::expect(wait_for(3000, [&] { return threw.load() == 1; }),
                         "the handler ran and threw");
+        harness::expect(first_payload_ok.load(std::memory_order_relaxed),
+                        "the throwing handler received the complete first "
+                        "payload");
         harness::expect(f.server().is_running(),
                         "the server still reports itself as running");
         harness::expect(f.stats().reactor_failures.load() == failures_before,
@@ -395,6 +408,9 @@ int main() {
                         "second frame sent on the same connection");
         harness::expect(wait_for(3000, [&] { return handled.load() >= 2; }),
                         "the connection kept dispatching after the throw");
+        harness::expect(second_payload_ok.load(std::memory_order_relaxed),
+                        "the next frame was consumed exactly once and stayed "
+                        "intact");
     }
 
     // ---- F: a refused close request is still honoured -----------------------

@@ -188,9 +188,11 @@ using close_handler      = std::function<void(uint64_t conn_id,
 ```
 
 - `message_handler` — one complete DATA frame (or any unknown type). `data`
-  points into library-owned scratch space and is borrowed for the call only; a
-  handler that needs it later must copy it. A throw from this handler is caught
-  and dropped; it does not close the connection.
+  points into a library-owned buffer (scratch space or the connection read
+  buffer) and is borrowed for the call only. The pointer becomes invalid when
+  the handler returns; a handler that needs the bytes later must copy them. A
+  throw from this handler is caught and dropped; it does not close the
+  connection.
 - `conn_state_handler` — called with `open == true` when a connection is
   admitted and with `false` when it is gone. `peer` is `"host:port"`, borrowed
   for the call.
